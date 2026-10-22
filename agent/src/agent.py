@@ -177,6 +177,10 @@ class SpeechSession:
             identity=identity,
         )
         await self.engine.push_audio(pcm16, MODEL_RATE, is_speech=is_speech)
+        if edge == "stop" and self.minicpm:
+            end = getattr(self.engine, "end_of_speech", None)
+            if callable(end):
+                await end()
         if edge:
             trace_dbg("speech", "audio.chunk", rms=self.vad.last_rms, edge=edge, bytes=len(pcm16), is_speech=is_speech)
 

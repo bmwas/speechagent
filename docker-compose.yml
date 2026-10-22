@@ -120,7 +120,7 @@ services:
     restart: "no"
 
   model-server:
-    image: vllm/vllm-omni:v0.28.0
+    image: vllm/vllm-omni:v0.30.0
     env_file: .env
     environment:
       HF_HOME: /models/hf

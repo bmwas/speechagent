@@ -148,6 +148,7 @@ class MiniCPMDuplexEngine:
         self._t_last_rx = 0.0
         self._out_rate = 24000
         self._last_is_speech = False
+        self._commit_pending = False
         self._delta_n = 0
         self._delta_bytes = 0
         self._turn_deltas = 0
@@ -507,6 +508,25 @@ class MiniCPMDuplexEngine:
             piece = bytes(self._buf[:chunk_bytes])
             del self._buf[:chunk_bytes]
             await self._append(piece, is_speech=is_speech)
+        # Speech ended: flush a leftover short chunk, then commit so the
+        # server closes the user turn (vllm-omni reference client always
+        # sends input_audio_buffer.commit after the last append).
+        if self._last_is_speech and not is_speech:
+            if self._buf:
+                piece = bytes(self._buf)
+                self._buf.clear()
+                await self._append(piece, is_speech=False)
+            else:
+                await self._commit_input()
+
+    async def _commit_input(self) -> None:
+        if self._ws is None or not self._ready.is_set():
+            return
+        if not self._commit_pending:
+            return
+        self._commit_pending = False
+        await self._send({"type": "input_audio_buffer.commit"})
+        trace_stream("speech", "duplex.commit", audio_end_ms=self._audio_end_ms)
 
     async def _append(self, pcm16: bytes, is_speech: bool = True) -> None:
         if self._ws is None:
@@ -535,6 +555,7 @@ class MiniCPMDuplexEngine:
         rms = pcm_rms(pcm16)
         if is_speech and not self._last_is_speech:
             self._t_user_speech = now
+            self._commit_pending = True
             trace_stream(
                 "speech",
                 "duplex.append_speech",
@@ -543,7 +564,10 @@ class MiniCPMDuplexEngine:
                 audio_end_ms=self._audio_end_ms,
                 video_attached=video_attached,
             )
+        speech_ended = self._last_is_speech and not is_speech
         self._last_is_speech = bool(is_speech)
+        if speech_ended:
+            await self._commit_input()
         self._append_meter.add(
             chunks=1,
             bytes=len(pcm16),
@@ -552,6 +576,15 @@ class MiniCPMDuplexEngine:
             is_speech=int(bool(is_speech)),
             video_attached=int(video_attached),
         )
+
+    async def end_of_speech(self) -> None:
+        """Flush leftover PCM and commit the user turn (VAD stop)."""
+        if self._buf:
+            piece = bytes(self._buf)
+            self._buf.clear()
+            await self._append(piece, is_speech=True)
+        await self._commit_input()
+        self._last_is_speech = False
 
     async def push_image(self, jpeg: bytes) -> None:
         if not jpeg:
