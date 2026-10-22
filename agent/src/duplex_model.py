@@ -14,7 +14,7 @@ from typing import Any
 import websockets
 
 from audio import MODEL_RATE, pcm_rms
-from trace import trace, trace_dbg, trace_exc
+from trace import trace, trace_exc
 
 LOG = logging.getLogger("duplex")
 CHUNK_MS = int(os.environ.get("AUDIO_CHUNK_MS", "100"))
@@ -214,14 +214,11 @@ class MiniCPMDuplexEngine:
             self._append_n = 0
             self._append_bytes = 0
             self._last_append = now
-        else:
-            trace_dbg("speech", "audio.chunk", bytes=len(pcm16), rms=pcm_rms(pcm16))
 
     async def push_image(self, jpeg: bytes) -> None:
         if not jpeg:
             return
         if self._speaking:
-            trace_dbg("speech", "video.chunk", bytes=len(jpeg), suppressed=True)
             return
         b64 = base64.b64encode(jpeg).decode("ascii")
         self._video_pending = f"data:image/jpeg;base64,{b64}"

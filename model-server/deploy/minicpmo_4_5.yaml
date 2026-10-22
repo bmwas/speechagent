@@ -1,0 +1,96 @@
+# MiniCPM-o 4.5 duplex on one 48 GB Ada GPU (cuda:0 in the container).
+# One live session. Explicit KV bytes skip the broken "profiling fallback"
+# path that was reporting 0.0 GiB and restart-looping StageEngineCoreProc.
+pipeline: minicpmo_4_5
+async_chunk: true
+session_mode: duplex
+duplex_session:
+  max_sessions: 1
+trust_remote_code: true
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      enable_hift_graph: false
+      enable_cfm_graph: false
+      token2wav_spk_cpu_reference: true
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 1
+    max_model_len: 2048
+    max_num_batched_tokens: 2048
+    gpu_memory_utilization: 0.42
+    kv_cache_memory_bytes: 2147483648
+    enforce_eager: true
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 16
+    limit_mm_per_prompt:
+      image: 8
+      audio: 8
+      video: 1
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 512
+      detokenize: true
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 1
+    max_model_len: 2048
+    max_num_batched_tokens: 2048
+    gpu_memory_utilization: 0.12
+    kv_cache_memory_bytes: 1073741824
+    enforce_eager: true
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.85
+      top_k: 25
+      repetition_penalty: 1.05
+      min_tokens: 50
+      max_tokens: 2048
+      detokenize: false
+
+  - stage_id: 2
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.14
+    enforce_eager: true
+    enable_chunked_prefill: false
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 4096
+      detokenize: true
+
+platforms:
+  cuda:
+    cuda_mps: false
+    stages:
+      - stage_id: 0
+        kv_cache_memory_bytes: 2147483648
+        gpu_memory_utilization: 0.42
+        enforce_eager: true
+      - stage_id: 1
+        kv_cache_memory_bytes: 1073741824
+        gpu_memory_utilization: 0.12
+        enforce_eager: true
+      - stage_id: 2
+        gpu_memory_utilization: 0.14
+        enforce_eager: true

@@ -82,6 +82,7 @@ hostname -I | awk '{print $1}'
 # HUGGINGFACE_TOKEN is already in ~/.bashrc — compose interpolates it.
 
 # 3. Start everything (images, builds, GPU, weights, TLS, logs)
+# gpu-free stops msestream llama.cpp / interviewer-engine on Ada first.
 docker compose up -d --build
 
 # 4. Watch first-boot weight download / CUDA init
@@ -98,9 +99,9 @@ Open from a **laptop on the LAN** (not `127.0.0.1` of the GPU box):
 - HTTP on the **same** `:6173` 308s to that HTTPS URL (never to 127.0.0.1, never drops the port)
 - LiveKit signaling is same-origin `wss://<MSE_LAN_IP>:6173/rtc`
 - Click **Connect**, allow camera + mic, headphones on, talk
-- Grafana: `http://<MSE_LAN_IP>:3300` (anonymous Admin)
-  - **Agent traces** — every `SA_TRACE` event
-  - **Agent logs** — raw service stdout
+- Grafana: `http://<MSE_LAN_IP>:3300` (anonymous Admin). **Not** msestream `:3000`.
+  - **Agent logs** (home dashboard) — model-server KV/CUDA errors + per-service stdout
+  - **Agent traces** — `SA_TRACE` events (`duplex.*`, barge-in, video.frame)
 
 msestream `/patient` stays at `:5173`. This agent is `:6173`.
 
@@ -114,7 +115,9 @@ docker compose down
 
 | Command | What it does |
 |---|---|
-| `docker compose up -d --build` | Build + start the full stack |
+| `docker compose up -d --build` | Build + start the full stack (`gpu-free` clears Ada first) |
+| `docker compose run --rm gpu-free` | Stop other Ada users without starting vLLM |
+| `FREE_ADA_GPU=0 docker compose up -d model-server` | Load vLLM without touching msestream |
 | `docker compose ps` | Service status |
 | `docker compose logs -f agent` | Agent stdout including `SA_TRACE` |
 | `docker compose logs -f model-server` | vLLM-Omni / weight download |
@@ -176,7 +179,9 @@ deploy:
           capabilities: [gpu]
 ```
 
-If `nvidia-smi -L` shows Ada at index 0 on your box, change `device_ids` to `["0"]`. Do **not** set `CUDA_VISIBLE_DEVICES` to the host index after `device_ids` has already selected one card.
+If `nvidia-smi -L` shows Ada at index 0 on your box, change `ADA_GPU_INDEX` in `.env`. Do **not** set `NVIDIA_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES` to the **host** index after `device_ids` has already selected one card — StageEngineCoreProc children then look for cuda:1, fall back to CPU, and die with `Available KV cache memory: 0.0 GiB`.
+
+MiniCPM-o 4.5 is three colocated stages and needs a **clear 48 GB Ada**. `gpu-free` runs before `model-server` and `docker stop`s other containers pinned to GPU 1 (msestream `interviewer-engine`, `observer-engine`, llama.cpp). Blackwell (`device_ids: ["0"]`, sglang) is not touched. `docker stop` is a manual stop, so MSE `restart: unless-stopped` stays down until you start those engines again. Set `FREE_ADA_GPU=0` to skip.
 
 ## Observability
 
@@ -207,7 +212,7 @@ Promtail parses the prefix, labels `agent` + `event`, and stores `session_id` / 
 | `voice.ref_loaded` | Which WAV / Qwen speaker |
 | `error.*` | Failures with traceback |
 
-`TRACE_DEBUG=1` (default) also emits per-chunk `audio.chunk` / `video.chunk` **metadata** (rms, bytes). Raw PCM and JPEG are never logged.
+`TRACE_DEBUG=1` (default) also emits VAD-edge debug traces. Dropped video frames and per-packet audio are not logged (they drowned Grafana). Raw PCM and JPEG are never logged.
 
 On `docker compose down`, `log-janitor` deletes `./logs/**` (Loki chunks + collector files). Docker json-file logs die with the containers. Weights in `./models` are kept.
 
@@ -231,6 +236,7 @@ speechagent/
   frontend/                   Vite + React + serve.mjs HTTPS mux (`/patient`)
   livekit/                    SFU config + entrypoint
   model-server/entrypoint.sh  MODEL_NAME → vllm serve --omni
+  model-server/deploy/        MiniCPM-o Ada KV/VRAM split YAML
   obs/                        Loki, Promtail, Grafana, janitor
 ```
 
@@ -254,12 +260,13 @@ See [`.env`](.env). Important knobs:
 |---|---|---|
 | `MSE_LAN_IP` | `192.168.1.34` | ICE/TURN advertise this address; TLS cert SAN; capture-ui `:6173/patient` |
 | `ADA_GPU_INDEX` | `1` | Host `nvidia-smi` index of the Ada 48 GB |
+| `FREE_ADA_GPU` | `1` | Stop other Ada GPU users before vLLM loads |
 | `MODEL_NAME` | `openbmb/MiniCPM-o-4_5` | Which omni weights to load |
 | `HUGGINGFACE_TOKEN` | bashrc | Hub auth for weight download. Read from the GPU-box shell, not `.env` |
 | `AUDIO_SOURCE_QUEUE_MS` | `120` | LiveKit speaker queue depth |
 | `VAD_STOP_SECS` | `0.80` | Silence before a Qwen turn ends |
 | `VIDEO_FPS` | `1` | Stills sent to the model |
-| `TRACE_DEBUG` | `1` | Per-chunk metadata traces |
+| `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
 | `REF_AUDIO_PATH` | empty | MiniCPM custom voice WAV |
 | `QWEN_SPEAKER` | `Chelsie` | Qwen built-in voice |
 
@@ -270,10 +277,11 @@ See [`.env`](.env). Important knobs:
 | Chrome: camera/mic blocked | Use **https://LAN:6173/patient**, accept the self-signed cert. Not `http://`, not GPU `127.0.0.1` from a laptop. |
 | Mic: `Could not start audio source` | Chrome Linux `"default"` device. Pick a real input in chrome://settings/content/microphone. |
 | Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
-| Silent agent | `docker compose logs -f model-server` — weights still downloading or CUDA OOM. Grafana `error.*` events. |
-| Grafana empty | Wait ~15 s for Promtail. Filter `{compose_project="speechagent"}`. |
+| Silent agent / `duplex.ws_retry` | Model-server restart loop. `docker compose logs -f model-server` on the **GPU box**. Look for `0.0 GiB` KV cache. |
+| `Available KV cache memory: 0.0 GiB` | GPU not visible in StageEngineCoreProc, or Ada full. Recreate `model-server` after pull. Confirm `runtime: nvidia` and `CUDA_VISIBLE_DEVICES=0`. Free Ada VRAM (`nvidia-smi` on the GPU box). |
+| Grafana empty / wrong stack | Open **http://192.168.1.34:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |
 | Logs still on disk after down | `docker compose logs log-janitor`. The janitor needs 20 s grace. Then `ls logs/`. |
-| Ada not used | `nvidia-smi` — compose `device_ids: ["1"]`. Inside the container `CUDA_VISIBLE_DEVICES=0`. |
+| Ada not used | `nvidia-smi` on the GPU box — compose `device_ids: ["1"]`. Inside the container `CUDA_VISIBLE_DEVICES=0`. |
 
 ## References
 

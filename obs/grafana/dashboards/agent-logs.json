@@ -3,12 +3,11 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": null,
   "links": [
     {
       "title": "Agent traces",
       "type": "link",
-      "url": "/d/agent-traces/agent-traces",
+      "url": "/d/speechagent-traces/agent-traces",
       "icon": "dashboard"
     }
   ],
@@ -17,7 +16,7 @@
       "id": 1,
       "title": "Log volume by service",
       "type": "timeseries",
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 0 },
+      "gridPos": { "h": 7, "w": 16, "x": 0, "y": 0 },
       "datasource": { "type": "loki", "uid": "loki" },
       "fieldConfig": { "defaults": { "unit": "cps" }, "overrides": [] },
       "targets": [
@@ -30,8 +29,40 @@
       ]
     },
     {
+      "id": 7,
+      "title": "Model-server errors (range)",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "model errors",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", service=\"model-server\"} |~ \"(?i)error|fatal|traceback|kv cache|no available memory|cuda\" [$__range]))"
+        }
+      ]
+    },
+    {
       "id": 2,
-      "title": "Errors / traceback / timeout",
+      "title": "Errors / traceback / KV cache / CUDA",
       "type": "logs",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 7 },
       "datasource": { "type": "loki", "uid": "loki" },
@@ -44,7 +75,7 @@
       },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\"} |~ \"(?i)error|fail|traceback|fatal|timeout|exception\"",
+          "expr": "{compose_project=\"speechagent\"} |~ \"(?i)error|fail|traceback|fatal|timeout|exception|kv cache|no available memory|cuda unavailable\"",
           "queryType": "range",
           "refId": "A"
         }
@@ -57,7 +88,7 @@
       "gridPos": { "h": 12, "w": 12, "x": 0, "y": 17 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
-      "targets": [{ "expr": "{service=\"agent\"}", "queryType": "range", "refId": "A" }]
+      "targets": [{ "expr": "{compose_project=\"speechagent\", service=\"agent\"}", "queryType": "range", "refId": "A" }]
     },
     {
       "id": 4,
@@ -66,7 +97,7 @@
       "gridPos": { "h": 12, "w": 12, "x": 12, "y": 17 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
-      "targets": [{ "expr": "{service=\"model-server\"}", "queryType": "range", "refId": "A" }]
+      "targets": [{ "expr": "{compose_project=\"speechagent\", service=\"model-server\"}", "queryType": "range", "refId": "A" }]
     },
     {
       "id": 5,
@@ -75,7 +106,7 @@
       "gridPos": { "h": 10, "w": 12, "x": 0, "y": 29 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
-      "targets": [{ "expr": "{service=\"livekit\"}", "queryType": "range", "refId": "A" }]
+      "targets": [{ "expr": "{compose_project=\"speechagent\", service=\"livekit\"}", "queryType": "range", "refId": "A" }]
     },
     {
       "id": 6,
@@ -84,14 +115,15 @@
       "gridPos": { "h": 10, "w": 12, "x": 12, "y": 29 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
-      "targets": [{ "expr": "{service=\"frontend\"}", "queryType": "range", "refId": "A" }]
+      "targets": [{ "expr": "{compose_project=\"speechagent\", service=\"frontend\"}", "queryType": "range", "refId": "A" }]
     }
   ],
+  "refresh": "5s",
   "schemaVersion": 39,
   "tags": ["speechagent"],
   "time": { "from": "now-15m", "to": "now" },
   "timezone": "browser",
   "title": "Agent logs",
-  "uid": "agent-logs",
+  "uid": "speechagent-logs",
   "version": 1
 }

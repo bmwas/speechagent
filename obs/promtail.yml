@@ -52,3 +52,5 @@ scrape_configs:
                 level:
                 trace_id:
                 session_id:
+            - output:
+                source: sa_trace

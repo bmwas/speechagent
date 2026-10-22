@@ -105,7 +105,11 @@ def trace(agent: str, event: str, **fields: Any) -> None:
             },
             separators=(",", ":"),
         )
-    _LOG.info(line)
+    # Entire stdout line is SA_TRACE + JSON so Promtail / Grafana `| json` works.
+    try:
+        print(line, flush=True)
+    except Exception:
+        _LOG.info(line)
 
 
 def trace_exc(agent: str, event: str, exc: BaseException | None = None, **fields: Any) -> None:

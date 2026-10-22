@@ -10,7 +10,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 
-from trace import trace, trace_dbg
+from trace import trace
 
 LOG = logging.getLogger("audio")
 
@@ -156,7 +156,6 @@ class ClockedPlayout:
         self._ring.extend(pcm)
         self._last_push = time.monotonic()
         self._active = True
-        trace_dbg("speech", "playout.push", bytes=len(pcm), ring_ms=round(self.ring_ms, 1))
 
     def clear(self) -> None:
         self._ring.clear()

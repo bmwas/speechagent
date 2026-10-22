@@ -3,12 +3,11 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": null,
   "links": [
     {
       "title": "Agent logs",
       "type": "link",
-      "url": "/d/agent-logs/agent-logs",
+      "url": "/d/speechagent-logs/agent-logs",
       "icon": "doc"
     }
   ],
@@ -22,7 +21,7 @@
       "fieldConfig": { "defaults": { "unit": "cps" }, "overrides": [] },
       "targets": [
         {
-          "expr": "sum by (event) (count_over_time({agent=~\"$agent\", event=~\"$event\", compose_project=\"speechagent\"}[1m]))",
+          "expr": "sum by (event) (count_over_time({compose_project=\"speechagent\", event=~\".+\"}[1m]))",
           "legendFormat": "{{event}}",
           "queryType": "range",
           "refId": "A"
@@ -33,7 +32,7 @@
       "id": 2,
       "title": "Barge-ins (range)",
       "type": "stat",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": {
         "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
@@ -45,7 +44,39 @@
         {
           "refId": "A",
           "legendFormat": "barge-in",
-          "expr": "sum(count_over_time({agent=~\"$agent\", event=\"turn.barge_in\"}[$__range]))"
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"turn.barge_in\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Model WS retries (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 4 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "duplex.ws_retry",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.ws_retry\"}[$__range]))"
         }
       ]
     },
@@ -60,12 +91,12 @@
         {
           "refId": "p50",
           "legendFormat": "p50",
-          "expr": "quantile_over_time(0.5, {agent=~\"$agent\", event=~\".*\\\\.end\"} | json | unwrap latency_ms [1m])"
+          "expr": "quantile_over_time(0.5, {compose_project=\"speechagent\", event=~\".+\"} | json | unwrap latency_ms | __error__=\"\" [1m])"
         },
         {
           "refId": "p95",
           "legendFormat": "p95",
-          "expr": "quantile_over_time(0.95, {agent=~\"$agent\", event=~\".*\\\\.end\"} | json | unwrap latency_ms [1m])"
+          "expr": "quantile_over_time(0.95, {compose_project=\"speechagent\", event=~\".+\"} | json | unwrap latency_ms | __error__=\"\" [1m])"
         }
       ]
     },
@@ -80,7 +111,7 @@
         {
           "refId": "A",
           "legendFormat": "{{event}}",
-          "expr": "avg_over_time({event=~\"qwen.first_audio|duplex.speak\"} | json | unwrap latency_ms [1m])"
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=~\"qwen.first_audio|duplex.speak\"} | json | unwrap latency_ms | __error__=\"\" [1m])"
         }
       ]
     },
@@ -99,42 +130,20 @@
       },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\", agent=~\"$agent\", event=~\"$event\"} |~ \"SA_TRACE \"",
+          "expr": "{compose_project=\"speechagent\", event=~\".+\"}",
           "queryType": "range",
           "refId": "A"
         }
       ]
     }
   ],
+  "refresh": "5s",
   "schemaVersion": 39,
   "tags": ["speechagent"],
-  "templating": {
-    "list": [
-      {
-        "name": "agent",
-        "type": "query",
-        "datasource": { "type": "loki", "uid": "loki" },
-        "query": "label_values({compose_project=\"speechagent\"}, agent)",
-        "includeAll": true,
-        "multi": true,
-        "current": { "text": "All", "value": "$__all" },
-        "allValue": ".+"
-      },
-      {
-        "name": "event",
-        "type": "query",
-        "datasource": { "type": "loki", "uid": "loki" },
-        "query": "label_values({compose_project=\"speechagent\"}, event)",
-        "includeAll": true,
-        "multi": true,
-        "current": { "text": "All", "value": "$__all" },
-        "allValue": ".+"
-      }
-    ]
-  },
+  "templating": { "list": [] },
   "time": { "from": "now-15m", "to": "now" },
   "timezone": "browser",
   "title": "Agent traces",
-  "uid": "agent-traces",
+  "uid": "speechagent-traces",
   "version": 1
 }

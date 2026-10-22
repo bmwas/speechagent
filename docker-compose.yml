@@ -45,6 +45,7 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_CHECK_FOR_UPDATES: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/agent-logs.json
     volumes:
       - ./obs/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./obs/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -101,6 +102,22 @@ services:
     logging: *default-logging
     restart: unless-stopped
 
+  gpu-free:
+    image: docker:27-cli
+    environment:
+      ADA_GPU_INDEX: "${ADA_GPU_INDEX:-1}"
+      FREE_ADA_GPU: "${FREE_ADA_GPU:-1}"
+      ADA_FREE_WAIT_SECS: "${ADA_FREE_WAIT_SECS:-45}"
+      ADA_FREE_MAX_USED_MB: "${ADA_FREE_MAX_USED_MB:-1024}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts/free-ada.sh:/free-ada.sh:ro
+    pid: host
+    privileged: true
+    command: ["sh", "/free-ada.sh"]
+    logging: *default-logging
+    restart: "no"
+
   model-server:
     image: vllm/vllm-omni:v0.28.0
     env_file: .env
@@ -112,21 +129,31 @@ services:
       HUGGING_FACE_HUB_TOKEN: ${HUGGINGFACE_TOKEN:-}
       MODEL_NAME: ${MODEL_NAME:-openbmb/MiniCPM-o-4_5}
       PORT: "${MODEL_PORT:-8199}"
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.85}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-2048}
       CUDA_DEVICE_ORDER: PCI_BUS_ID
+      # device_ids already selected host GPU 1; inside the container that card is cuda:0.
+      # Do not set NVIDIA_VISIBLE_DEVICES to the host index — StageEngineCoreProc
+      # children would look for cuda:1, fall back to CPU, and report 0.0 GiB KV.
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - ./models:/models
       - ./model-server/entrypoint.sh:/entrypoint.sh:ro
+      - ./model-server/deploy:/deploy:ro
     ports: ["${MODEL_PORT:-8199}:${MODEL_PORT:-8199}"]
     shm_size: "8gb"
     ipc: host
+    runtime: nvidia
     ulimits:
       memlock: -1
       stack: 67108864
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     logging: *default-logging
     restart: unless-stopped
+    depends_on:
+      gpu-free:
+        condition: service_completed_successfully
     deploy:
       resources:
         reservations:

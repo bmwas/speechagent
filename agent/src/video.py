@@ -9,7 +9,7 @@ import time
 
 from PIL import Image
 
-from trace import trace, trace_dbg
+from trace import trace
 
 LOG = logging.getLogger("video")
 VIDEO_FPS = float(os.environ.get("VIDEO_FPS", "1"))
@@ -55,7 +55,6 @@ class FrameSampler:
         self._size = size
         now = time.monotonic()
         if now - self._last < self.period:
-            trace_dbg("speech", "video.chunk", bytes=len(jpeg), w=size[0], h=size[1], dropped=True)
             return None
         self._last = now
         trace("speech", "video.frame", bytes=len(jpeg), w=size[0], h=size[1])

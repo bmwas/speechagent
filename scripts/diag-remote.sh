@@ -26,6 +26,11 @@ echo "===== nvidia ====="
 nvidia-smi -L 2>&1 | head
 echo "===== HUGGINGFACE_TOKEN in this shell? (value hidden) ====="
 if [ -n "${HUGGINGFACE_TOKEN:-}" ]; then echo "HUGGINGFACE_TOKEN=set len=${#HUGGINGFACE_TOKEN}"; else echo "HUGGINGFACE_TOKEN=UNSET"; fi
+echo "===== grafana :3300 (not msestream :3000) ====="
+curl -sS -m 5 http://127.0.0.1:3300/api/health || true
+echo
+curl -sS -m 5 http://127.0.0.1:3300/api/search || true
+echo
 echo "===== ports ====="
 ss -lntup 2>/dev/null | grep -E ':6173|:8860|:8880|:8199|:3300|:3310' || netstat -lntup 2>/dev/null | grep -E ':6173|:8860|:8880|:8199|:3300|:3310' || true
 echo "===== done ====="
