@@ -1,7 +1,7 @@
 FROM node:22-alpine
-RUN apk add --no-cache openssl
-ENV MEDIA_UPSTREAM=http://host.docker.internal:8860
-ENV LIVEKIT_UPSTREAM=http://host.docker.internal:8880
+RUN apk add --no-cache openssl iproute2
+ENV MEDIA_UPSTREAM=http://127.0.0.1:8860
+ENV LIVEKIT_UPSTREAM=http://127.0.0.1:8880
 ENV TLS_CERT_DIR=/app/certs
 WORKDIR /app
 COPY package.json package-lock.json ./

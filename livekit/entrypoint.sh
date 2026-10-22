@@ -11,6 +11,34 @@ LK_TURN="${LIVEKIT_TURN_PORT:-8882}"
 LK_RTC0="${LIVEKIT_RTC_PORT_START:-51000}"
 LK_RTC1="${LIVEKIT_RTC_PORT_END:-51100}"
 
+local_ips=""
+if command -v ip >/dev/null 2>&1; then
+  local_ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ') || true
+fi
+is_local_ip() {
+  echo " ${local_ips} " | grep -q " $1 "
+}
+
+if [ -n "$local_ips" ]; then
+  if [ -z "$NODE_IP" ] || ! is_local_ip "$NODE_IP"; then
+    if [ -n "$NODE_IP" ]; then
+      echo "livekit: NODE_IP=${NODE_IP} is not an address on this host (have:${local_ips}) — picking a local LAN IP" >&2
+    fi
+    NODE_IP=""
+    for ip in $local_ips; do
+      case "$ip" in
+        10.*) NODE_IP="$ip"; break ;;
+      esac
+    done
+    if [ -z "$NODE_IP" ]; then
+      for ip in $local_ips; do
+        case "$ip" in
+          192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) NODE_IP="$ip"; break ;;
+        esac
+      done
+    fi
+  fi
+fi
 if [ -z "$NODE_IP" ]; then
   NODE_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
 fi

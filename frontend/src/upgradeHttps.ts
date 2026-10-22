@@ -25,8 +25,9 @@ export function upgradeLanHttp(): boolean {
 }
 
 /**
- * LiveKit Room.connect URL. Prefer the page origin (capture-ui muxes /rtc)
- * whenever the token URL would be mixed-content or GPU loopback on a laptop.
+ * LiveKit Room.connect URL. Always same-origin so the capture-ui mux
+ * (`wss://<page>/rtc` → LiveKit :8880) is the only hop. A token URL that
+ * still points at the laptop IP or mixed-content ws:// is ignored.
  */
 export function livekitConnectUrl(
   page: { protocol: string; host: string; hostname: string },
@@ -42,14 +43,11 @@ export function livekitConnectUrl(
   } catch {
     return pageWs;
   }
+  if (u.hostname !== page.hostname) return pageWs;
   const givenSecure = u.protocol === "wss:" || u.protocol === "https:";
   if (wantSecure && !givenSecure) return pageWs;
   if (isLoopbackHostname(u.hostname) && !isLoopbackHostname(page.hostname)) return pageWs;
-  if (u.protocol === "http:" || u.protocol === "https:") {
-    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    return u.toString().replace(/\/$/, "");
-  }
-  return given.replace(/\/$/, "");
+  return pageWs;
 }
 
 export function isFailedToFetch(msg: string): boolean {

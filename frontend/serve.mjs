@@ -80,6 +80,18 @@ function isLivekitPath(pathname) {
   return pathname === "/rtc" || pathname.startsWith("/rtc/");
 }
 
+function livekitTarget() {
+  const raw = LIVEKIT.includes("://") ? LIVEKIT : `http://${LIVEKIT}`;
+  const u = new URL(raw);
+  const tls = u.protocol === "https:" || u.protocol === "wss:";
+  return {
+    hostname: u.hostname || "127.0.0.1",
+    port: Number(u.port) || (tls ? 443 : 8880),
+    tls,
+    host: u.host || `127.0.0.1:${u.port || 8880}`,
+  };
+}
+
 function send(res, status, body, headers = {}) {
   const buf = Buffer.from(body);
   res.writeHead(status, {
@@ -147,9 +159,9 @@ function proxyMedia(req, res) {
 function proxyLivekitHttp(req, res) {
   let target;
   try {
-    target = new URL(LIVEKIT);
-  } catch {
-    send(res, 502, "LIVEKIT_UPSTREAM is not a URL\n");
+    target = livekitTarget();
+  } catch (err) {
+    send(res, 502, `LIVEKIT_UPSTREAM is not a URL: ${err.message}\n`);
     return;
   }
   const headers = {};
@@ -158,13 +170,15 @@ function proxyLivekitHttp(req, res) {
     headers[k] = v;
   }
   headers.host = target.host;
-  const pReq = http.request(
+  const lib = target.tls ? https : http;
+  const pReq = lib.request(
     {
       hostname: target.hostname,
-      port: target.port || 8880,
+      port: target.port,
       path: req.url,
       method: req.method,
       headers,
+      timeout: 8000,
     },
     (pRes) => {
       const out = { ...pRes.headers };
@@ -174,9 +188,13 @@ function proxyLivekitHttp(req, res) {
     },
   );
   pReq.on("error", (err) => {
-    log("livekit proxy error", err.message);
+    log("livekit http proxy error", err.message, `${target.hostname}:${target.port}`, req.url);
     if (!res.headersSent) send(res, 502, `livekit proxy: ${err.message}\n`);
     else res.destroy();
+  });
+  pReq.on("timeout", () => {
+    log("livekit http proxy timeout", `${target.hostname}:${target.port}`, req.url);
+    pReq.destroy();
   });
   req.pipe(pReq);
 }
@@ -184,45 +202,173 @@ function proxyLivekitHttp(req, res) {
 function proxyLivekitUpgrade(req, socket, head) {
   let target;
   try {
-    target = new URL(LIVEKIT);
-  } catch {
+    target = livekitTarget();
+  } catch (err) {
+    log("livekit ws bad LIVEKIT_UPSTREAM", err.message);
     socket.destroy();
     return;
   }
-  const port = Number(target.port) || 8880;
-  const upstream = net.connect(port, target.hostname, () => {
-    const lines = [`${req.method} ${req.url} HTTP/1.1`];
-    for (const [k, v] of Object.entries(req.headers)) {
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (v == null) continue;
+    if (k.toLowerCase() === "host") continue;
+    headers[k] = v;
+  }
+  headers.host = target.host;
+  if (!headers.connection) headers.connection = "Upgrade";
+  if (!headers.upgrade) headers.upgrade = "websocket";
+  log("livekit ws upgrade", req.url, "→", `${target.hostname}:${target.port}`);
+  const lib = target.tls ? https : http;
+  const pReq = lib.request({
+    hostname: target.hostname,
+    port: target.port,
+    path: req.url || "/rtc",
+    method: req.method || "GET",
+    headers,
+    timeout: 8000,
+  });
+  pReq.on("upgrade", (pRes, pSocket, pHead) => {
+    const lines = [`HTTP/1.1 ${pRes.statusCode || 101} ${pRes.statusMessage || "Switching Protocols"}`];
+    for (const [k, v] of Object.entries(pRes.headers)) {
       if (v == null) continue;
       const val = Array.isArray(v) ? v.join(", ") : v;
-      if (k.toLowerCase() === "host") lines.push(`Host: ${target.host}`);
-      else lines.push(`${k}: ${val}`);
+      lines.push(`${k}: ${val}`);
     }
-    if (!req.headers.host) lines.push(`Host: ${target.host}`);
-    upstream.write(lines.join("\r\n") + "\r\n\r\n");
-    if (head && head.length) upstream.write(head);
-    socket.pipe(upstream);
-    upstream.pipe(socket);
-  });
-  upstream.on("error", (err) => {
-    log("livekit ws proxy error", err.message);
     try {
-      socket.destroy();
-    } catch {
-      /* already closed */
+      socket.write(lines.join("\r\n") + "\r\n\r\n");
+      if (pHead && pHead.length) socket.write(pHead);
+      if (head && head.length) pSocket.write(head);
+      pSocket.pipe(socket);
+      socket.pipe(pSocket);
+    } catch (err) {
+      log("livekit ws pipe failed", err.message);
+      try { pSocket.destroy(); } catch {}
+      try { socket.destroy(); } catch {}
+      return;
     }
+    pSocket.on("error", () => {
+      try { socket.destroy(); } catch {}
+    });
+    socket.on("error", () => {
+      try { pSocket.destroy(); } catch {}
+    });
+    log("livekit ws 101", req.url);
   });
-  socket.on("error", () => {
+  pReq.on("response", (pRes) => {
+    log("livekit ws expected 101, got HTTP", pRes.statusCode, req.url);
     try {
-      upstream.destroy();
+      socket.write(`HTTP/1.1 ${pRes.statusCode} ${pRes.statusMessage || ""}\r\nConnection: close\r\n\r\n`);
     } catch {
-      /* already closed */
+      /* ignore */
     }
+    pRes.pipe(socket);
+  });
+  pReq.on("error", (err) => {
+    log("livekit ws proxy error", err.message, "upstream", `${target.hostname}:${target.port}`);
+    try { socket.destroy(); } catch {}
+  });
+  pReq.on("timeout", () => {
+    log("livekit ws proxy timeout", `${target.hostname}:${target.port}`);
+    pReq.destroy();
+    try { socket.destroy(); } catch {}
+  });
+  pReq.end();
+}
+
+function probeLivekit() {
+  let target;
+  try {
+    target = livekitTarget();
+  } catch (err) {
+    log("livekit probe skipped", err.message);
+    return;
+  }
+  const lib = target.tls ? https : http;
+  const req = lib.get(
+    {
+      hostname: target.hostname,
+      port: target.port,
+      path: "/",
+      timeout: 3000,
+    },
+    (res) => {
+      log("livekit probe", `${target.hostname}:${target.port}`, "HTTP", res.statusCode);
+      res.resume();
+    },
+  );
+  req.on("error", (err) => {
+    log(
+      "livekit probe FAILED",
+      `${target.hostname}:${target.port}`,
+      err.message,
+      "— browser Connect will time out on wss /rtc until LiveKit listens here",
+    );
+  });
+  req.on("timeout", () => {
+    log("livekit probe timeout", `${target.hostname}:${target.port}`);
+    req.destroy();
+  });
+}
+
+function sendJson(res, status, obj) {
+  const buf = Buffer.from(JSON.stringify(obj));
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": buf.length,
+    "cache-control": "no-store",
+  });
+  res.end(buf);
+}
+
+function livekitDiag(req, res) {
+  let target;
+  try {
+    target = livekitTarget();
+  } catch (err) {
+    sendJson(res, 500, { ok: false, error: err.message, upstream: LIVEKIT });
+    return;
+  }
+  let sent = false;
+  const done = (status, obj) => {
+    if (sent) return;
+    sent = true;
+    sendJson(res, status, obj);
+  };
+  const started = Date.now();
+  const socket = net.connect(target.port, target.hostname, () => {
+    const ms = Date.now() - started;
+    socket.end();
+    done(200, {
+      ok: true,
+      upstream: `${target.hostname}:${target.port}`,
+      tcp_ms: ms,
+      path: "/rtc",
+    });
+  });
+  socket.setTimeout(3000);
+  socket.on("timeout", () => {
+    socket.destroy();
+    done(503, {
+      ok: false,
+      upstream: `${target.hostname}:${target.port}`,
+      error: "tcp timeout",
+    });
+  });
+  socket.on("error", (err) => {
+    done(503, {
+      ok: false,
+      upstream: `${target.hostname}:${target.port}`,
+      error: err.message,
+    });
   });
 }
 
 function serveStatic(req, res) {
   const pathname = pathnameOf(req.url);
+  if (pathname === "/lk-diag") {
+    livekitDiag(req, res);
+    return;
+  }
   if (isMediaPath(pathname)) {
     proxyMedia(req, res);
     return;
@@ -325,6 +471,7 @@ async function main() {
   });
   await listen(mux, PORT, "0.0.0.0");
   log(`capture-ui mux :${PORT}  http→https  media=${MEDIA}  livekit=${LIVEKIT}  inner http=${INNER_HTTP} https=${INNER_HTTPS}`);
+  probeLivekit();
 }
 
 main().catch((err) => {

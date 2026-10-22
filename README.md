@@ -27,7 +27,7 @@ msestream keeps `:5173` / `:7860` / `:7880` / `:3000` / `:3100`. This stack uses
 | `livekit` | Self-hosted SFU. Host network so ICE/TURN advertise the GPU LAN IP. |
 | `model-server` | `vllm/vllm-omni:v0.28.0` (prebuilt, includes flash-attn). Pinned to Ada GPU. |
 | `agent` | Joins the room as a bot, streams A/V into the model, publishes speech back. |
-| `frontend` | Same capture-ui mux as msestream, on **:6173**, SPA at `/patient`, proxies `/api` and `/rtc`. |
+| `frontend` | Same capture-ui mux as msestream, on **:6173** host network, SPA at `/patient`, proxies `/api` and `/rtc` to loopback. |
 | `loki` / `promtail` / `grafana` | Log pipeline. Anonymous Grafana Admin. |
 | `log-collector` | Copies container stdout into `./logs/*.log`. |
 | `log-janitor` | On `compose down` (SIGTERM), deletes everything under `./logs/`. |
@@ -267,7 +267,7 @@ See [`.env`](.env). Important knobs:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MSE_LAN_IP` | `192.168.1.34` | ICE/TURN advertise this address; TLS cert SAN; capture-ui `:6173/patient` |
+| `MSE_LAN_IP` | `10.4.7.193` | ICE/TURN advertise this address; TLS cert SAN; capture-ui `:6173/patient`. Must be the GPU box LAN IP, not a laptop. |
 | `ADA_GPU_INDEX` | `1` | Host `nvidia-smi` index of the Ada 48 GB |
 | `FREE_ADA_GPU` | `1` | Stop other Ada GPU users before vLLM loads |
 | `MODEL_NAME` | `openbmb/MiniCPM-o-4_5` | Which omni weights to load |
@@ -288,9 +288,10 @@ See [`.env`](.env). Important knobs:
 | Chrome: camera/mic blocked | Use **https://LAN:6173/patient**, accept the self-signed cert. Not `http://`, not GPU `127.0.0.1` from a laptop. |
 | Mic: `Could not start audio source` | Chrome Linux `"default"` device. Pick a real input in chrome://settings/content/microphone. |
 | Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
+| `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
 | Silent agent / `duplex.ws_retry` | Model-server restart loop. `docker compose logs -f model-server` on the **GPU box**. Look for `0.0 GiB` KV cache. |
 | `Available KV cache memory: 0.0 GiB` | GPU not visible in StageEngineCoreProc, or Ada full. Recreate `model-server` after pull. Confirm `runtime: nvidia` and `CUDA_VISIBLE_DEVICES=0`. Free Ada VRAM (`nvidia-smi` on the GPU box). |
-| Grafana empty / wrong stack | Open **http://192.168.1.34:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |
+| Grafana empty / wrong stack | Open **http://10.4.7.193:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |
 | Logs still on disk after down | `docker compose logs log-janitor`. The janitor needs 20 s grace. Then `ls logs/`. |
 | Ada not used | `nvidia-smi` on the GPU box — compose `device_ids: ["1"]`. Inside the container `CUDA_VISIBLE_DEVICES=0`. |
 

@@ -14,8 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from agent import SpeechSession
-from tokens import token_for_user
-from trace import trace, trace_exc
+from tokens import livekit_url, token_for_user
+from trace import trace, trace_exc, trace_stream
 
 LOG = logging.getLogger("token_server")
 
@@ -36,6 +36,32 @@ _bots_lock: asyncio.Lock | None = None
 _humans: dict[str, set[str]] = {}
 
 
+def _livekit_host_port() -> tuple[str, int]:
+    raw = livekit_url()
+    if "://" not in raw:
+        raw = "ws://" + raw
+    from urllib.parse import urlparse
+
+    parsed = urlparse(raw)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8880
+    return host, port
+
+
+async def livekit_tcp_ok() -> tuple[bool, str]:
+    host, port = _livekit_host_port()
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 2.0)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True, f"{host}:{port}"
+    except Exception as exc:
+        return False, f"{host}:{port} {exc}"
+
+
 def public_ws_url(request: Request | None = None) -> str:
     if LIVEKIT_PUBLIC_URL:
         return LIVEKIT_PUBLIC_URL
@@ -53,6 +79,7 @@ def public_ws_url(request: Request | None = None) -> str:
 @app.get("/health")
 async def health():
     brains = sum(1 for b in _bots.values() if b._brain_started and b._running)
+    lk_ok, lk_detail = await livekit_tcp_ok()
     return {
         "ok": True,
         "model": os.environ.get("MODEL_NAME", ""),
@@ -62,6 +89,8 @@ async def health():
         "rooms": list(_bots.keys()),
         "livekit_url": os.environ.get("LIVEKIT_URL", ""),
         "livekit_public_url": LIVEKIT_PUBLIC_URL or "(same-origin wss /rtc)",
+        "livekit_tcp": lk_ok,
+        "livekit_tcp_detail": lk_detail,
     }
 
 
@@ -74,6 +103,16 @@ async def livekit_token(request: Request):
     role = (request.query_params.get("role") or "patient").strip().lower() or "patient"
     room_id = (request.query_params.get("room") or "default").strip() or "default"
     identity = f"{role}-{uuid.uuid4().hex[:8]}"
+    lk_ok, lk_detail = await livekit_tcp_ok()
+    if not lk_ok:
+        trace_stream("speech", "error.livekit_down", detail=lk_detail)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"LiveKit SFU is not listening ({lk_detail}). Recreate the livekit service.",
+            },
+            status_code=503,
+        )
     try:
         token = token_for_user(room_id, identity, name=role)
     except Exception as exc:
@@ -100,6 +139,15 @@ async def livekit_token(request: Request):
             bot.spawn_brain()
 
     url = public_ws_url(request)
+    trace_stream(
+        "speech",
+        "livekit.token",
+        role=role,
+        room=room_id,
+        identity=identity,
+        url=url,
+        sfu=lk_detail,
+    )
     trace("speech", "session.open", role=role, room=room_id, identity=identity)
     return {
         "ok": True,

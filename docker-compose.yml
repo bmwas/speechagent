@@ -214,17 +214,17 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    network_mode: host
     environment:
-      MEDIA_UPSTREAM: ${MEDIA_UPSTREAM:-http://host.docker.internal:8860}
-      LIVEKIT_UPSTREAM: ${LIVEKIT_UPSTREAM:-http://host.docker.internal:8880}
+      # Host network: talk to LiveKit + agent on loopback. Bridge → host-gateway
+      # WebSockets time out on Fedora firewalld (signal connection timed out).
+      MEDIA_UPSTREAM: ${MEDIA_UPSTREAM:-http://127.0.0.1:8860}
+      LIVEKIT_UPSTREAM: ${LIVEKIT_UPSTREAM:-http://127.0.0.1:8880}
       TLS_CERT_DIR: /app/certs
       CAPTURE_TLS_IP: ${MSE_LAN_IP:-}
       MSE_LAN_IP: ${MSE_LAN_IP:-}
       PORT: "${FRONTEND_PORT:-6173}"
-    ports: ["${FRONTEND_PORT:-6173}:${FRONTEND_PORT:-6173}"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on: [agent]
+    depends_on: [agent, livekit]
     healthcheck:
       test:
         [

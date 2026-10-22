@@ -31,8 +31,7 @@ export function lanHttpsUrl(loc) {
 }
 
 /**
- * LiveKit Room.connect URL. Prefer the page origin (capture-ui muxes /rtc)
- * whenever the token URL would be mixed-content or GPU loopback on a laptop.
+ * LiveKit Room.connect URL. Always same-origin (capture-ui muxes /rtc).
  */
 export function livekitConnectUrl(page, bodyUrl) {
   const host = page && page.host ? page.host : "";
@@ -48,14 +47,11 @@ export function livekitConnectUrl(page, bodyUrl) {
   } catch {
     return pageWs;
   }
+  if (u.hostname !== hostname) return pageWs;
   const givenSecure = u.protocol === "wss:" || u.protocol === "https:";
   if (wantSecure && !givenSecure) return pageWs;
   if (isLoopbackHostname(u.hostname) && !isLoopbackHostname(hostname)) return pageWs;
-  if (u.protocol === "http:" || u.protocol === "https:") {
-    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    return u.toString().replace(/\/$/, "");
-  }
-  return given.replace(/\/$/, "");
+  return pageWs;
 }
 
 export function isFailedToFetch(msg) {

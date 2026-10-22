@@ -8,7 +8,8 @@ rtc:
   tcp_port: 8881
   port_range_start: 51000
   port_range_end: 51100
-  use_external_ip: true
+  use_external_ip: false
+  node_ip: "10.4.7.193"
 
 room:
   empty_timeout: 300

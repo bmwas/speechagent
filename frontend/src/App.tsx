@@ -244,7 +244,22 @@ export default function App() {
       }
       if (!r.ok || !body.token) throw new Error(body.error || `token HTTP ${r.status}`);
       if (body.model) setModel(body.model);
+      let diag = "";
+      try {
+        const d = await fetch("/lk-diag", { signal: AbortSignal.timeout(4000) });
+        const dj = (await d.json()) as { ok?: boolean; error?: string; upstream?: string };
+        if (!dj.ok) {
+          throw new Error(
+            `LiveKit SFU is not reachable from the capture UI (${dj.upstream || "unknown"}: ${dj.error || d.status}). Signaling is wss://${window.location.host}/rtc — recreate livekit + frontend.`,
+          );
+        }
+        diag = dj.upstream || "";
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("LiveKit SFU is not reachable")) throw err;
+        /* /lk-diag is best-effort; Room.connect still tries. */
+      }
       const url = livekitConnectUrl(window.location, body.url || "");
+      setState(`signaling ${url}${diag ? ` via ${diag}` : ""}`);
       const videoEncoding = { maxBitrate: 1_500_000, maxFramerate: 30 };
       const room = new Room({
         adaptiveStream: false,
@@ -280,7 +295,7 @@ export default function App() {
           localRef.current.play().catch(() => undefined);
         }
       });
-      await room.connect(url, body.token, { websocketTimeout: 10000 });
+      await room.connect(url, body.token, { websocketTimeout: 20000, peerConnectionTimeout: 20000 });
       room.remoteParticipants.forEach((p) => {
         p.trackPublications.forEach((pub) => {
           if (pub.track) attachRemote(pub.track);
@@ -315,9 +330,12 @@ export default function App() {
         }
       }
       const raw = err instanceof Error ? err.message : String(err);
+      const signalFail = /signal connection|timed out \(signal\)|websocket/i.test(raw);
       const msg = isFailedToFetch(raw)
         ? `Connect failed (Failed to fetch). LiveKit signaling is same-origin wss://${window.location.host}/rtc — accept the self-signed cert, stay on this host (not 127.0.0.1 from a laptop), then Connect again. (${raw})`
-        : raw;
+        : signalFail
+          ? `${raw}. Browser never reached LiveKit signaling (wss://${window.location.host}/rtc → SFU :8880). Open this page at https://<GPU-LAN>:6173/patient (not the laptop IP). Recreate livekit + frontend after pulling this fix.`
+          : raw;
       setError(msg);
       setState("idle");
       setLkOn(false);
