@@ -30,6 +30,11 @@ nvsmi() {
   exit 1
 }
 
+csv1() {
+  # One csv,noheader field; strip spaces. nvidia-smi -i already selected the GPU.
+  nvsmi "$@" | head -n1 | tr -d '[:space:]'
+}
+
 if [ "${FREE_ADA_GPU:-1}" = "0" ]; then
   echo "gpu-free skipped (FREE_ADA_GPU=0)"
   exit 0
@@ -39,10 +44,7 @@ echo "gpu-free target nvidia-smi index ${IDX}"
 nvsmi -L || true
 nvsmi --query-gpu=index,name,uuid,memory.used,memory.total --format=csv || true
 
-UUID=$(nvsmi --query-gpu=index,uuid --format=csv,noheader | awk -F',' -v i="$IDX" '
-  gsub(/ /,"",$1) gsub(/ /,"",$2)
-  $1==i { print $2; exit }
-')
+UUID=$(csv1 -i "$IDX" --query-gpu=uuid --format=csv,noheader)
 if [ -z "${UUID}" ]; then
   echo "gpu-free FATAL: no GPU at index ${IDX}" >&2
   nvsmi -L >&2 || true
@@ -58,11 +60,10 @@ uses_ada() {
   cvd=$(printf '%s\n' "$envs" | sed -n 's/^CUDA_VISIBLE_DEVICES=//p' | head -n1)
 
   echo "$req" | grep -q "\"${IDX}\"" && return 0
-  echo "$req" | grep -q "${UUID}" && return 0
+  echo "$req" | grep -Fq "${UUID}" && return 0
   case "$nv" in
     "${IDX}"|"${UUID}") return 0 ;;
   esac
-  # All GPUs visible and the process pinned to host Ada index.
   if echo "$req" | grep -q '"Count":-1'; then
     case "$cvd" in
       "${IDX}") return 0 ;;
@@ -110,13 +111,13 @@ keep_proc() {
 
 i=0
 while [ "$i" -lt 3 ]; do
-  nvsmi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader 2>/dev/null \
-    | awk -F',' -v u="$UUID" '
-        {
-          uuid=$1; pid=$2; name=$3
-          gsub(/ /,"",uuid); gsub(/ /,"",pid); gsub(/^ +| +$/,"",name)
-          if (uuid==u && pid ~ /^[0-9]+$/) print pid, name
-        }' | while read -r pid pname; do
+  nvsmi -i "$IDX" --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
+    | awk -F',' '{
+        pid=$1; name=$2
+        gsub(/ /,"",pid)
+        gsub(/^ +| +$/,"",name)
+        if (pid ~ /^[0-9]+$/) print pid, name
+      }' | while read -r pid pname; do
           base=$(basename "$pname")
           if keep_proc "$base"; then
             echo "gpu-free keep pid=${pid} ${base}"
@@ -129,29 +130,28 @@ while [ "$i" -lt 3 ]; do
   sleep 2
 done
 
-nvsmi --query-compute-apps=gpu_uuid,pid,process_name --format=csv,noheader 2>/dev/null \
-  | awk -F',' -v u="$UUID" '
-      {
-        uuid=$1; pid=$2; name=$3
-        gsub(/ /,"",uuid); gsub(/ /,"",pid); gsub(/^ +| +$/,"",name)
-        if (uuid==u && pid ~ /^[0-9]+$/) print pid, name
-      }' | while read -r pid pname; do
-        base=$(basename "$pname")
-        keep_proc "$base" && continue
-        echo "gpu-free SIGKILL pid=${pid} ${base}"
-        kill -KILL "$pid" 2>/dev/null || true
-      done
+nvsmi -i "$IDX" --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
+  | awk -F',' '{
+      pid=$1; name=$2
+      gsub(/ /,"",pid)
+      gsub(/^ +| +$/,"",name)
+      if (pid ~ /^[0-9]+$/) print pid, name
+    }' | while read -r pid pname; do
+      base=$(basename "$pname")
+      keep_proc "$base" && continue
+      echo "gpu-free SIGKILL pid=${pid} ${base}"
+      kill -KILL "$pid" 2>/dev/null || true
+    done
 
 waited=0
+used=99999
 while [ "$waited" -lt "$MAX_WAIT" ]; do
-  used=$(nvsmi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F',' -v i="$IDX" '
-    gsub(/ /,"",$1); gsub(/ /,"",$2)
-    $1==i { print int($2); exit }
-  ')
+  used=$(csv1 -i "$IDX" --query-gpu=memory.used --format=csv,noheader,nounits)
+  used=$(echo "$used" | tr -cd '0-9')
   used=${used:-99999}
   echo "gpu-free Ada memory.used=${used} MiB (want <= ${MAX_USED_MB})"
   if [ "$used" -le "$MAX_USED_MB" ]; then
-    nvsmi --query-gpu=index,name,memory.used,memory.free,memory.total --format=csv
+    nvsmi -i "$IDX" --query-gpu=index,name,memory.used,memory.free,memory.total --format=csv
     echo "gpu-free Ada is clear"
     exit 0
   fi
@@ -160,5 +160,5 @@ while [ "$waited" -lt "$MAX_WAIT" ]; do
 done
 
 echo "gpu-free FATAL: Ada still has ${used} MiB in use after ${MAX_WAIT}s" >&2
-nvsmi --query-compute-apps=pid,process_name,used_gpu_memory,gpu_uuid --format=csv || true
+nvsmi -i "$IDX" --query-compute-apps=pid,process_name,used_gpu_memory --format=csv || true
 exit 1
