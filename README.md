@@ -301,7 +301,7 @@ See [`.env`](.env). Important knobs:
 | `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
 | `STREAM_TRACE` | `1` | Realtime pipeline traces (`lane=stream`) for the Grafana **Realtime stream** dashboard |
 | `STREAM_TRACE_PERIOD_S` | `1` | Aggregation window for mic/append/delta meters |
-| `REF_AUDIO_PATH` | empty | MiniCPM custom voice WAV |
+| `REF_AUDIO_PATH` | empty | MiniCPM voice clone WAV. Empty uses the snapshot `assets/HT_ref_audio.wav` (required by v0.30.0 duplex). |
 | `QWEN_SPEAKER` | `Chelsie` | Qwen built-in voice |
 
 ## Troubleshooting
@@ -313,6 +313,7 @@ See [`.env`](.env). Important knobs:
 | Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
 | `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
 | Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: vocoder import errors or `0.0 GiB` KV. Recreate `model-server` (`vllm/vllm-omni:v0.30.0`). Wait for `Application startup complete`, then speak. MiniCPM: `duplex.video_attach` → `duplex.first_audio` → `playout.first_frame`. Qwen: `qwen.video_frame` (while talking) → `qwen.request` → `qwen.first_audio` → `playout.first_frame`. |
+| `MiniCPM-o duplex audio output requires ref_audio` / `error.brain` `never sent session.created` | v0.30.0 will not open a duplex session without a clone WAV. Recreate **agent** after this fix so it sends `assets/HT_ref_audio.wav` from `/models/hf`. Override with `REF_AUDIO_PATH`. Model-server does not need a reload. |
 | Qwen `qwen.request skipped=no_frames` | Camera never produced a JPEG. Check `video.frame` and `QWEN_VIDEO_FPS`. Server `video.query` with an empty buffer returns `No frames buffered`. |
 | `Available KV cache memory: 0.0 GiB` | GPU not visible in StageEngineCoreProc, or Ada full. Recreate `model-server` after pull. Confirm `runtime: nvidia` and `CUDA_VISIBLE_DEVICES=0`. Free Ada VRAM (`nvidia-smi` on the GPU box). |
 | Grafana empty / wrong stack | Open **http://10.4.7.193:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |

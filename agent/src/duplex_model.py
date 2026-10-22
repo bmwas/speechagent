@@ -68,20 +68,55 @@ def _model_ws_url() -> str:
         base = "ws://" + base[len("http://") :]
     elif base.startswith("https://"):
         base = "wss://" + base[len("https://") :]
-    return f"{base}/v1/realtime?duplex=1"
+    # autostart=0: first message is session.update with ref_audio. v0.30.0
+    # rejects a default session that has no ref_audio.
+    return f"{base}/v1/realtime?duplex=1&autostart=0"
 
 
-def _ref_audio_data_url() -> str | None:
-    path = (os.environ.get("REF_AUDIO_PATH") or "").strip()
-    if not path:
-        return None
-    p = Path(path)
-    if not p.is_file():
-        LOG.warning("REF_AUDIO_PATH missing: %s", path)
-        return None
-    raw = p.read_bytes()
-    b64 = base64.b64encode(raw).decode("ascii")
-    return f"data:audio/wav;base64,{b64}"
+def _find_bundled_ref_audio() -> Path | None:
+    hf_home = Path(os.environ.get("HF_HOME") or "/models/hf")
+    roots = (
+        hf_home / "hub" / "models--openbmb--MiniCPM-o-4_5",
+        Path("/models/hf/hub/models--openbmb--MiniCPM-o-4_5"),
+    )
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.resolve() if root.exists() else root
+        if resolved in seen or not root.is_dir():
+            continue
+        seen.add(resolved)
+        matches = sorted(root.glob("snapshots/*/assets/HT_ref_audio.wav"))
+        if matches:
+            return matches[-1]
+    fallback = Path("/models")
+    if fallback.is_dir():
+        hits = sorted(fallback.glob("**/assets/HT_ref_audio.wav"))
+        if hits:
+            return hits[-1]
+    return None
+
+
+def _ref_audio_data_url() -> tuple[str, str]:
+    """Return (data_url, source_label). v0.30.0 duplex requires this for audio out."""
+    override = (os.environ.get("REF_AUDIO_PATH") or "").strip()
+    if override:
+        path = Path(override)
+        if not path.is_file():
+            raise FileNotFoundError(f"REF_AUDIO_PATH missing: {path}")
+        source = "REF_AUDIO_PATH"
+    else:
+        path = _find_bundled_ref_audio()
+        if path is None:
+            raise FileNotFoundError(
+                "MiniCPM-o duplex requires ref_audio. Set REF_AUDIO_PATH to a "
+                "16 kHz mono WAV, or keep the bundled assets/HT_ref_audio.wav "
+                "in the HuggingFace snapshot under /models/hf."
+            )
+        source = str(path)
+    raw = path.read_bytes()
+    if len(raw) < 64 or raw[:4] != b"RIFF":
+        raise ValueError(f"ref_audio is not a WAV file: {path}")
+    return f"data:audio/wav;base64,{base64.b64encode(raw).decode('ascii')}", source
 
 
 def _err_text(ev: dict[str, Any]) -> str:
@@ -131,6 +166,8 @@ class MiniCPMDuplexEngine:
         self._in_resampler = None
         self._speaking = False
         self._ready = asyncio.Event()
+        self._handshake = asyncio.Event()
+        self._handshake_error = ""
         self._last_append = 0.0
         self._append_bytes = 0
         self._append_n = 0
@@ -213,8 +250,8 @@ class MiniCPMDuplexEngine:
     async def start(self) -> None:
         url = _model_ws_url()
         model = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-o-4_5")
-        ref = _ref_audio_data_url()
-        trace_stream("speech", "duplex.ws_open", url=url, model=model, has_ref=bool(ref))
+        ref, ref_source = _ref_audio_data_url()
+        trace_stream("speech", "duplex.ws_open", url=url, model=model, has_ref=True, ref_source=ref_source[-80:])
         delay = 2.0
         last_err = "unknown"
         connected_at = 0
@@ -250,16 +287,16 @@ class MiniCPMDuplexEngine:
             "playback_commit_policy": "ack_only",
             "temperature": 0.7,
             "idle_timeout_s": 300,
+            "ref_audio": ref,
             "extra_body": {
                 "auto_response": True,
                 "force_listen_count": 0,
+                "ref_audio": ref,
             },
         }
-        if ref:
-            session["ref_audio"] = ref
-            trace_stream("speech", "voice.ref_loaded", source="REF_AUDIO_PATH")
-        else:
-            trace_stream("speech", "voice.ref_loaded", source="HT_ref_audio.wav")
+        trace_stream("speech", "voice.ref_loaded", source=ref_source[-120:], bytes=len(ref))
+        self._handshake.clear()
+        self._handshake_error = ""
         self._reader = asyncio.create_task(self._read())
         await self._send({"type": "session.update", "session": session})
         trace_stream(
@@ -268,14 +305,18 @@ class MiniCPMDuplexEngine:
             modalities=session.get("modalities"),
             auto_response=True,
             overlap_policy=session.get("overlap_policy"),
-            has_ref=bool(ref),
+            has_ref=True,
             instructions_len=len(str(session.get("instructions") or "")),
             chunk_ms=CHUNK_MS,
         )
         try:
-            await asyncio.wait_for(self._ready.wait(), timeout=30.0)
+            await asyncio.wait_for(self._handshake.wait(), timeout=30.0)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("model-server never sent session.created") from exc
+        if self._handshake_error:
+            raise RuntimeError(f"duplex handshake failed: {self._handshake_error}")
+        if not self._ready.is_set():
+            raise RuntimeError("model-server never sent session.created")
         self._hb = asyncio.create_task(self._heartbeat())
 
     async def _heartbeat(self) -> None:
@@ -340,6 +381,13 @@ class MiniCPMDuplexEngine:
                 ready=self._ready.is_set(),
                 speaking=self._speaking,
             )
+            if not self._ready.is_set() and not self._handshake.is_set():
+                self._handshake_error = reason or "duplex websocket closed"
+                self._handshake.set()
+        else:
+            if not self._ready.is_set() and not self._handshake.is_set():
+                self._handshake_error = self._handshake_error or "duplex websocket closed before session.created"
+                self._handshake.set()
 
     async def _handle(self, ev: dict[str, Any]) -> None:
         typ = str(ev.get("type") or "")
@@ -349,6 +397,7 @@ class MiniCPMDuplexEngine:
             sid = str(sess.get("id") or "")[:16]
             self._t_ready = time.monotonic()
             self._ready.set()
+            self._handshake.set()
             trace_stream(
                 "speech",
                 "duplex.session_created" if typ.endswith("created") else "duplex.session_updated",
@@ -424,7 +473,11 @@ class MiniCPMDuplexEngine:
             summary = _ev_summary(ev)
             summary.pop("type", None)
             summary.pop("error", None)
-            trace_stream("speech", "error.duplex", error=_err_text(ev), type=typ, **summary)
+            err = _err_text(ev)
+            trace_stream("speech", "error.duplex", error=err, type=typ, **summary)
+            if not self._ready.is_set():
+                self._handshake_error = err
+                self._handshake.set()
             return
         if typ in _SPEECH_START_TYPES:
             trace_stream("speech", "duplex.model_speech_start", ev_type=typ, keys=",".join(list(ev.keys())[:12]))
