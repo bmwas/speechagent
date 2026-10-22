@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: speechagent
+    orgId: 1
+    folder: Speech Agent
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

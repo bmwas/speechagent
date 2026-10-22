@@ -1,0 +1,204 @@
+# GPU server only: docker compose up -d --build
+# Builds agent + frontend (msestream /patient HTTPS mux on :5173),
+# pulls LiveKit / vLLM-Omni / Loki / Grafana, pins Ada GPU, downloads HF
+# weights into ./models, mints TLS. docker compose down wipes ./logs.
+name: speechagent
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  loki:
+    image: grafana/loki:3.2.1
+    user: "0"
+    command: ["-config.file=/etc/loki/config.yml"]
+    ports: ["${LOKI_PORT:-3100}:3100"]
+    volumes:
+      - ./obs/loki.yml:/etc/loki/config.yml:ro
+      - ./logs/loki:/loki
+    depends_on: [log-janitor]
+    logging: *default-logging
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  promtail:
+    image: grafana/promtail:3.2.1
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./obs/promtail.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
+    logging: *default-logging
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./obs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./obs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    depends_on: [loki]
+    logging: *default-logging
+    restart: unless-stopped
+
+  log-collector:
+    image: docker:27-cli
+    environment:
+      PROJECT: speechagent
+      INTERVAL: "30"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./obs/log-collector.sh:/collector.sh:ro
+      - ./logs:/logs
+    command: ["sh", "/collector.sh"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on: [log-janitor]
+    logging: *default-logging
+    restart: unless-stopped
+
+  log-janitor:
+    image: docker:27-cli
+    init: true
+    volumes:
+      - ./obs/log-janitor.sh:/janitor.sh:ro
+      - ./logs:/logs
+    command: ["sh", "/janitor.sh"]
+    stop_grace_period: 20s
+    logging: *default-logging
+    restart: unless-stopped
+
+  livekit:
+    image: livekit/livekit-server:v1.9.0
+    network_mode: host
+    env_file: .env
+    environment:
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}
+      LIVEKIT_NODE_IP: ${LIVEKIT_NODE_IP:-${MSE_LAN_IP:-}}
+      MSE_LAN_IP: ${MSE_LAN_IP:-}
+    volumes:
+      - ./livekit/entrypoint.sh:/entrypoint.sh:ro
+      - ./livekit/livekit.yaml:/livekit.yaml:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    logging: *default-logging
+    restart: unless-stopped
+
+  model-server:
+    image: vllm/vllm-omni:v0.28.0
+    env_file: .env
+    environment:
+      HF_HOME: /models/hf
+      # From the GPU-box shell (~/.bashrc). Not read from .env.
+      HUGGINGFACE_TOKEN: ${HUGGINGFACE_TOKEN:-}
+      HF_TOKEN: ${HUGGINGFACE_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGINGFACE_TOKEN:-}
+      MODEL_NAME: ${MODEL_NAME:-openbmb/MiniCPM-o-4_5}
+      PORT: "8099"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./models:/models
+      - ./model-server/entrypoint.sh:/entrypoint.sh:ro
+    ports: ["8099:8099"]
+    shm_size: "8gb"
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    logging: *default-logging
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ADA_GPU_INDEX:-1}"]
+              capabilities: [gpu]
+
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    network_mode: host
+    env_file: .env
+    environment:
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://127.0.0.1:7880}
+      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-}
+      MSE_LAN_IP: ${MSE_LAN_IP:-}
+      MODEL_NAME: ${MODEL_NAME:-openbmb/MiniCPM-o-4_5}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://127.0.0.1:8099}
+      AGENT_SYSTEM_PROMPT: ${AGENT_SYSTEM_PROMPT:-}
+      REF_AUDIO_PATH: ${REF_AUDIO_PATH:-}
+      QWEN_SPEAKER: ${QWEN_SPEAKER:-Chelsie}
+      AUDIO_SOURCE_QUEUE_MS: ${AUDIO_SOURCE_QUEUE_MS:-120}
+      VAD_START_SECS: ${VAD_START_SECS:-0.15}
+      VAD_STOP_SECS: ${VAD_STOP_SECS:-0.80}
+      VAD_MIN_VOLUME: ${VAD_MIN_VOLUME:-0.01}
+      VAD_CONFIDENCE: ${VAD_CONFIDENCE:-0.5}
+      VIDEO_FPS: ${VIDEO_FPS:-1}
+      AUDIO_CHUNK_MS: ${AUDIO_CHUNK_MS:-100}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TRACE_DEBUG: ${TRACE_DEBUG:-1}
+      PORT: "7860"
+    volumes:
+      - ./models:/models:ro
+    depends_on: [livekit, model-server]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging: *default-logging
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      MEDIA_UPSTREAM: ${MEDIA_UPSTREAM:-http://host.docker.internal:7860}
+      LIVEKIT_UPSTREAM: ${LIVEKIT_UPSTREAM:-http://host.docker.internal:7880}
+      TLS_CERT_DIR: /app/certs
+      CAPTURE_TLS_IP: ${MSE_LAN_IP:-}
+      MSE_LAN_IP: ${MSE_LAN_IP:-}
+      PORT: "5173"
+    ports: ["${FRONTEND_PORT:-5173}:5173"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on: [agent]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "NODE_TLS_REJECT_UNAUTHORIZED=0 node -e \"(async()=>{const s=await fetch('https://127.0.0.1:5173/patient'); if(!s.ok){console.error('https',s.status);process.exit(1);} process.exit(0);})().catch(e=>{console.error(e.message);process.exit(1);})\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    logging: *default-logging
+    restart: unless-stopped

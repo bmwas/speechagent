@@ -1,0 +1,140 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Agent logs",
+      "type": "link",
+      "url": "/d/agent-logs/agent-logs",
+      "icon": "doc"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Events / sec by event type",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "cps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (event) (count_over_time({agent=~\"$agent\", event=~\"$event\", compose_project=\"speechagent\"}[1m]))",
+          "legendFormat": "{{event}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Barge-ins (range)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "barge-in",
+          "expr": "sum(count_over_time({agent=~\"$agent\", event=\"turn.barge_in\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Turn latency (unwrap latency_ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "p50",
+          "legendFormat": "p50",
+          "expr": "quantile_over_time(0.5, {agent=~\"$agent\", event=~\".*\\\\.end\"} | json | unwrap latency_ms [1m])"
+        },
+        {
+          "refId": "p95",
+          "legendFormat": "p95",
+          "expr": "quantile_over_time(0.95, {agent=~\"$agent\", event=~\".*\\\\.end\"} | json | unwrap latency_ms [1m])"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "First audio latency (qwen.first_audio / duplex.speak)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{event}}",
+          "expr": "avg_over_time({event=~\"qwen.first_audio|duplex.speak\"} | json | unwrap latency_ms [1m])"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "SA_TRACE stream (newest first)",
+      "type": "logs",
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", agent=~\"$agent\", event=~\"$event\"} |~ \"SA_TRACE \"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["speechagent"],
+  "templating": {
+    "list": [
+      {
+        "name": "agent",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "loki" },
+        "query": "label_values({compose_project=\"speechagent\"}, agent)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "allValue": ".+"
+      },
+      {
+        "name": "event",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "loki" },
+        "query": "label_values({compose_project=\"speechagent\"}, event)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "allValue": ".+"
+      }
+    ]
+  },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "Agent traces",
+  "uid": "agent-traces",
+  "version": 1
+}

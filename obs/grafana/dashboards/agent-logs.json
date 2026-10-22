@@ -1,0 +1,97 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Agent traces",
+      "type": "link",
+      "url": "/d/agent-traces/agent-traces",
+      "icon": "dashboard"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Log volume by service",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "cps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (service) (count_over_time({compose_project=\"speechagent\"}[1m]))",
+          "legendFormat": "{{service}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Errors / traceback / timeout",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 7 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\"} |~ \"(?i)error|fail|traceback|fatal|timeout|exception\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Agent",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [{ "expr": "{service=\"agent\"}", "queryType": "range", "refId": "A" }]
+    },
+    {
+      "id": 4,
+      "title": "Model server",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [{ "expr": "{service=\"model-server\"}", "queryType": "range", "refId": "A" }]
+    },
+    {
+      "id": 5,
+      "title": "LiveKit",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 29 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [{ "expr": "{service=\"livekit\"}", "queryType": "range", "refId": "A" }]
+    },
+    {
+      "id": 6,
+      "title": "Frontend",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 29 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending" },
+      "targets": [{ "expr": "{service=\"frontend\"}", "queryType": "range", "refId": "A" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["speechagent"],
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "Agent logs",
+  "uid": "agent-logs",
+  "version": 1
+}
