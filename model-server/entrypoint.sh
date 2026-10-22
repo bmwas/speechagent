@@ -77,13 +77,20 @@ ensure_mod() {
 # vllm/vllm-omni:v0.28.0 image does not ship them, so stage 2 crashes,
 # the orchestrator never serves :8199, and the agent drops every mic
 # chunk as stream.drop_not_ready.
+# `step_audio2` (PyPI, wheels cosyvoice2 + flashcosyvoice) provides the
+# flow class `cosyvoice2.flow.flow.CausalMaskedDiffWithXvec` and
+# `flashcosyvoice.modules.hifigan.HiFTGenerator` that vllm-omni's in-tree
+# StepAudio2 Token2wav imports. Without it, hyperpyyaml cannot resolve the
+# !new:cosyvoice2... tag in assets/token2wav/flow.yaml and stage 2 dies with
+#   ImportError: There is no such class as cosyvoice2.flow.flow.CausalMaskedDiffWithXvec
 install_minicpm_vocoder() {
   local missing=()
   ensure_mod s3tokenizer || missing+=(s3tokenizer)
   ensure_mod onnxruntime || missing+=(onnxruntime)
   ensure_mod hyperpyyaml || missing+=(hyperpyyaml)
+  ensure_mod flashcosyvoice || missing+=(step_audio2)
   if [ "${#missing[@]}" -eq 0 ]; then
-    echo "model-server MiniCPM vocoder imports ok (s3tokenizer, onnxruntime, hyperpyyaml)"
+    echo "model-server MiniCPM vocoder imports ok (s3tokenizer, onnxruntime, hyperpyyaml, step_audio2/flashcosyvoice)"
     return 0
   fi
   echo "model-server installing MiniCPM-o Code2Wav deps: ${missing[*]}"
@@ -94,9 +101,17 @@ install_minicpm_vocoder() {
     --no-warn-script-location \
     "s3tokenizer>=0.3.0" \
     "onnxruntime>=1.17.0" \
-    "hyperpyyaml"
-  if ! ensure_mod s3tokenizer; then
-    echo "model-server FATAL: s3tokenizer still missing after pip install. Stage-2 Code2Wav cannot start." >&2
+    "hyperpyyaml" \
+    "step_audio2"
+  local fail=0
+  ensure_mod s3tokenizer || { echo "model-server FATAL: s3tokenizer still missing after pip install." >&2; fail=1; }
+  ensure_mod flashcosyvoice || { echo "model-server FATAL: flashcosyvoice still missing after pip install step_audio2." >&2; fail=1; }
+  if ! python -c "from cosyvoice2.flow.flow import CausalMaskedDiffWithXvec" >/dev/null 2>&1; then
+    echo "model-server FATAL: cosyvoice2.flow.flow.CausalMaskedDiffWithXvec not importable (needed by assets/token2wav/flow.yaml)." >&2
+    fail=1
+  fi
+  if [ "$fail" -ne 0 ]; then
+    echo "model-server FATAL: Stage-2 Code2Wav cannot start; deps above unresolved." >&2
     exit 1
   fi
   echo "model-server MiniCPM vocoder imports ok after install"
