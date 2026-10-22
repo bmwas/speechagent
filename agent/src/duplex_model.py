@@ -135,6 +135,8 @@ class MiniCPMDuplexEngine:
         self._append_bytes = 0
         self._append_n = 0
         self._video_pending: str | None = None
+        self._video_n = 0
+        self._last_video_ms = -1_000
         self._played_ms = 0
         self._audio_end_ms = 0
         self._evt = 0
@@ -194,6 +196,8 @@ class MiniCPMDuplexEngine:
             "rx_age_ms": _age_ms(self._t_last_rx, now),
             "acks_tx": self._acks_tx,
             "acks_rx": self._acks_rx,
+            "video_n": self._video_n,
+            "video_pending": bool(self._video_pending),
         }
 
     def _eid(self) -> str:
@@ -515,7 +519,7 @@ class MiniCPMDuplexEngine:
             if self._buf:
                 piece = bytes(self._buf)
                 self._buf.clear()
-                await self._append(piece, is_speech=False)
+                await self._append(piece, is_speech=False, force_video=True)
             else:
                 await self._commit_input()
 
@@ -528,12 +532,12 @@ class MiniCPMDuplexEngine:
         await self._send({"type": "input_audio_buffer.commit"})
         trace_stream("speech", "duplex.commit", audio_end_ms=self._audio_end_ms)
 
-    async def _append(self, pcm16: bytes, is_speech: bool = True) -> None:
+    async def _append(self, pcm16: bytes, is_speech: bool = True, *, force_video: bool = False) -> None:
         if self._ws is None:
             return
         duration_ms = int(1000.0 * (len(pcm16) / 2.0) / MODEL_RATE)
         self._audio_end_ms += duration_ms
-        video_attached = bool(self._video_pending)
+        video_attached = False
         body: dict[str, Any] = {
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(pcm16).decode("ascii"),
@@ -543,10 +547,26 @@ class MiniCPMDuplexEngine:
             "audio_end_ms": self._audio_end_ms,
             "is_speech": bool(is_speech),
         }
-        if self._video_pending:
+        # Native duplex expects ~1 JPEG per 1 s audio unit. Attach the latest
+        # camera still on that cadence so vision rides the live mic stream.
+        if self._video_pending and (
+            force_video or (self._audio_end_ms - self._last_video_ms) >= 900
+        ):
             # Bare JPEG base64 — a data: URL is rejected by the duplex runner.
             body["video_frames"] = [self._video_pending]
+            self._last_video_ms = self._audio_end_ms
+            self._video_n += 1
+            video_attached = True
+            jpeg_chars = len(self._video_pending)
             self._video_pending = None
+            trace_stream(
+                "speech",
+                "duplex.video_attach",
+                n=self._video_n,
+                audio_end_ms=self._audio_end_ms,
+                b64_chars=jpeg_chars,
+                is_speech=int(bool(is_speech)),
+            )
         await self._send(body)
         now = time.monotonic()
         self._append_n += 1
@@ -578,23 +598,22 @@ class MiniCPMDuplexEngine:
         )
 
     async def end_of_speech(self) -> None:
-        """Flush leftover PCM and commit the user turn (VAD stop)."""
+        """Flush leftover PCM (with latest camera still) and commit the turn."""
         if self._buf:
             piece = bytes(self._buf)
             self._buf.clear()
-            await self._append(piece, is_speech=True)
+            await self._append(piece, is_speech=True, force_video=True)
         await self._commit_input()
         self._last_is_speech = False
 
     async def push_image(self, jpeg: bytes) -> None:
         if not jpeg:
             return
-        if self._speaking:
-            self._video_drop.add(dropped=1, reason="speaking")
-            return
         if not self.ready:
             self._video_drop.add(dropped=1, reason="not_ready")
             return
+        # Keep the newest still even while the model is speaking so the next
+        # 1 s audio unit still carries live camera (duplex in, speech out).
         self._video_pending = base64.b64encode(jpeg).decode("ascii")
 
     async def pull_audio(self) -> list[tuple[bytes, int]]:

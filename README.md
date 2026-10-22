@@ -25,7 +25,7 @@ msestream keeps `:5173` / `:7860` / `:7880` / `:3000` / `:3100`. This stack uses
 | Service | Role |
 |---|---|
 | `livekit` | Self-hosted SFU. Host network so ICE/TURN advertise the GPU LAN IP. |
-| `model-server` | `vllm/vllm-omni:v0.28.0` (prebuilt, includes flash-attn). Pinned to Ada GPU. |
+| `model-server` | `vllm/vllm-omni:v0.30.0` (prebuilt, includes flash-attn). Pinned to Ada GPU. |
 | `agent` | Joins the room as a bot, streams A/V into the model, publishes speech back. |
 | `frontend` | Same capture-ui mux as msestream, on **:6173** host network, SPA at `/patient`, proxies `/api` and `/rtc` to loopback. |
 | `loki` / `promtail` / `grafana` | Log pipeline. Anonymous Grafana Admin. |
@@ -40,7 +40,7 @@ That one command:
 
 1. Builds `agent` (Python 3.11 + LiveKit SDK) inside Docker
 2. Builds `frontend` (`npm ci` + Vite + `serve.mjs` HTTPS mux on :6173) and mints a self-signed TLS cert (SAN includes `MSE_LAN_IP`)
-3. Pulls `livekit/livekit-server:v1.9.0`, `vllm/vllm-omni:v0.28.0` (flash-attn included), Loki, Promtail, Grafana
+3. Pulls `livekit/livekit-server:v1.9.0`, `vllm/vllm-omni:v0.30.0` (flash-attn included), Loki, Promtail, Grafana
 4. Pins vLLM to the Ada GPU (`ADA_GPU_INDEX`, default host index **1**)
 5. Downloads HuggingFace weights into `./models` (kept across `down`)
 6. Starts LiveKit on host network so ICE/TURN advertise `MSE_LAN_IP`
@@ -156,13 +156,16 @@ Only one omni model is loaded. Do not run both.
 
 ## How conversation stays real-time
 
-- Mic audio is sent in **100 ms** chunks; MiniCPM-o decides listen vs speak every ~1 s internally.
+This is a **native omni duplex** path on vLLM-Omni (`/v1/realtime?duplex=1`), not ASR → LLM → TTS.
+
+- Browser camera + mic publish over LiveKit. The agent subscribes both tracks and streams them into MiniCPM-o **while you talk**.
+- Mic PCM is appended every **100 ms**. Camera stills (~**1 JPEG/s**, long side 448) ride on those appends as `video_frames` — the MiniCPM-o duplex contract is one still per ~1 s audio unit.
+- `auto_response` is on, so the model can start speaking from the live stream. On VAD stop the agent also sends `input_audio_buffer.commit` so a residual unit is not left hanging.
+- Model speech is **streamed out as it is generated**: each `response.output_audio.delta` is decoded immediately, resampled, and clocked into LiveKit at **20 ms**. The agent never waits for `response.done` or a full WAV.
 - LiveKit `AudioSource` queue is **120 ms** (shallow) so barge-in is tens of ms, not seconds.
-- A **20 ms playout clock** feeds WebRTC; the producer never burst-dumps a 1 s wav into the SDK.
-- Leading silence on the first model chunk is trimmed.
 - MiniCPM-o 4.5 **does not self-yield** when you talk over it. The agent runs energy VAD, sends `response.cancel`, and clears the LiveKit queue (client-side barge-in).
-- While MiniCPM-o is synthesizing speech, camera frames are suppressed so Token2Wav keeps the GPU.
-- Qwen uses VAD start 150 ms / stop 800 ms, then streams `/v1/chat/completions` audio deltas.
+- Camera stills keep updating while the model talks, so the next user unit still has live video.
+- Qwen2.5-Omni is turn-based: VAD start 150 ms / stop 800 ms, then streams `/v1/chat/completions` audio deltas (with the latest JPEG on that turn).
 - Browser: AudioContext prewarm on the Connect click, 20 ms inbound playout delay, AEC/NS/AGC, skip Chrome's Linux `"default"` mic.
 
 ## GPU pinning
@@ -207,7 +210,9 @@ Promtail parses the prefix, labels `agent` + `event` + `lane`, and stores `sessi
 | `duplex.ws_open` / `duplex.session_created` / `duplex.ws_close` | MiniCPM WS |
 | `duplex.append` | 1 Hz audio+video heartbeat into the model |
 | `duplex.append_speech` | First `is_speech=true` append of an utterance |
-| `duplex.first_audio` | Time-to-first-byte from the model (`latency_ms`) |
+| `duplex.video_attach` | JPEG still attached to an audio append (~1 / s) |
+| `duplex.commit` | VAD end-of-speech `input_audio_buffer.commit` |
+| `duplex.first_audio` | Time-to-first-byte from the model (`latency_ms`) — first delta, not full turn |
 | `duplex.audio_delta` | 1 Hz model PCM out (bytes, qsize, rms) |
 | `duplex.speak` / `duplex.listen` / `duplex.cancel` | Model turn decision |
 | `duplex.rx_stats` | 1 Hz WebSocket event-type histogram |
@@ -274,7 +279,8 @@ See [`.env`](.env). Important knobs:
 | `HUGGINGFACE_TOKEN` | bashrc | Hub auth for weight download. Read from the GPU-box shell, not `.env` |
 | `AUDIO_SOURCE_QUEUE_MS` | `120` | LiveKit speaker queue depth |
 | `VAD_STOP_SECS` | `0.80` | Silence before a Qwen turn ends |
-| `VIDEO_FPS` | `1` | Stills sent to the model |
+| `VIDEO_FPS` | `1` | Camera stills sent to MiniCPM-o (~1 JPEG per 1 s audio unit) |
+| `VIDEO_MAX_SIDE` | `448` | Long-side cap on those JPEGs so vision tokens fit the 4096 context |
 | `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
 | `STREAM_TRACE` | `1` | Realtime pipeline traces (`lane=stream`) for the Grafana **Realtime stream** dashboard |
 | `STREAM_TRACE_PERIOD_S` | `1` | Aggregation window for mic/append/delta meters |
@@ -289,7 +295,7 @@ See [`.env`](.env). Important knobs:
 | Mic: `Could not start audio source` | Chrome Linux `"default"` device. Pick a real input in chrome://settings/content/microphone. |
 | Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
 | `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
-| Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: `ModuleNotFoundError: s3tokenizer` (stage-2 vocoder) or `0.0 GiB` KV. Recreate `model-server` so entrypoint can `pip install s3tokenizer`. Wait until `vllm serve` is listening, then speak. |
+| Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: vocoder import errors or `0.0 GiB` KV. Recreate `model-server` (`vllm/vllm-omni:v0.30.0`). Wait for `Application startup complete`, then speak. Look for `duplex.video_attach` → `duplex.first_audio` → `playout.first_frame`. |
 | `Available KV cache memory: 0.0 GiB` | GPU not visible in StageEngineCoreProc, or Ada full. Recreate `model-server` after pull. Confirm `runtime: nvidia` and `CUDA_VISIBLE_DEVICES=0`. Free Ada VRAM (`nvidia-smi` on the GPU box). |
 | Grafana empty / wrong stack | Open **http://10.4.7.193:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |
 | Logs still on disk after down | `docker compose logs log-janitor`. The janitor needs 20 s grace. Then `ls logs/`. |

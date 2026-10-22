@@ -13,25 +13,45 @@ from trace import trace_stream
 
 LOG = logging.getLogger("video")
 VIDEO_FPS = float(os.environ.get("VIDEO_FPS", "1"))
-MIN_JPEG = 2048
+# MiniCPM-o duplex takes ~1 JPEG per 1 s audio unit. Keep the long side small
+# so vision tokens fit stage-0 max_model_len 4096.
+VIDEO_MAX_SIDE = int(os.environ.get("VIDEO_MAX_SIDE", "448"))
+MIN_JPEG = 512
+
+
+def packed_rgb24(raw: bytes, width: int, height: int) -> bytes | None:
+    """Drop LiveKit row stride so PIL sees tightly packed RGB24."""
+    if width <= 0 or height <= 0 or not raw:
+        return None
+    row = width * 3
+    expected = row * height
+    if len(raw) == expected:
+        return raw
+    if len(raw) < expected:
+        return None
+    stride = len(raw) // height
+    if stride < row or stride * height > len(raw):
+        return raw[:expected]
+    return b"".join(raw[i * stride : i * stride + row] for i in range(height))
 
 
 def rgb_to_jpeg(raw: bytes, size: tuple[int, int], quality: int = 70) -> bytes | None:
     w, h = size
-    if w <= 0 or h <= 0 or not raw:
-        return None
-    expected = w * h * 3
-    if len(raw) < expected:
+    packed = packed_rgb24(raw, w, h)
+    if packed is None:
         return None
     try:
-        img = Image.frombytes("RGB", (w, h), raw[:expected])
+        img = Image.frombytes("RGB", (w, h), packed)
+        max_side = max(VIDEO_MAX_SIDE, 64)
+        if max(img.size) > max_side:
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         jpeg = buf.getvalue()
     except Exception:
         LOG.debug("jpeg encode failed", exc_info=True)
         return None
-    if len(jpeg) < MIN_JPEG:
+    if len(jpeg) < MIN_JPEG or jpeg[:2] != b"\xff\xd8":
         return None
     return jpeg
 
