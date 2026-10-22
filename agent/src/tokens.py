@@ -17,7 +17,7 @@ def livekit_api_secret() -> str:
 
 
 def livekit_url() -> str:
-    return (os.environ.get("LIVEKIT_URL") or "ws://127.0.0.1:7880").strip()
+    return (os.environ.get("LIVEKIT_URL") or "ws://127.0.0.1:8880").strip()
 
 
 def mint_token(

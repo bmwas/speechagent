@@ -11,5 +11,5 @@ COPY src/ ./
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
-EXPOSE 7860
+EXPOSE 8860
 CMD ["python", "agent.py"]

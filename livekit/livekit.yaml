@@ -1,13 +1,13 @@
-# Placeholder. The entrypoint rewrites node_ip / turn.domain / keys from .env.
-port: 7880
+# Placeholder. The entrypoint rewrites ports / node_ip / turn.domain / keys from .env.
+port: 8880
 bind_addresses:
   - "0.0.0.0"
 log_level: info
 
 rtc:
-  tcp_port: 7881
-  port_range_start: 50000
-  port_range_end: 50100
+  tcp_port: 8881
+  port_range_start: 51000
+  port_range_end: 51100
   use_external_ip: true
 
 room:
@@ -16,7 +16,7 @@ room:
 
 turn:
   enabled: true
-  udp_port: 7882
+  udp_port: 8882
   tls_port: 0
   external_tls: false
 

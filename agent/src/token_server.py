@@ -132,6 +132,6 @@ async def livekit_leave(request: Request):
 
 
 def run() -> None:
-    port = int(os.environ.get("PORT", "7860"))
+    port = int(os.environ.get("PORT") or os.environ.get("AGENT_PORT") or "8860")
     LOG.info("token server :%s model=%s", port, os.environ.get("MODEL_NAME", ""))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

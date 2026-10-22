@@ -1,6 +1,6 @@
-/** Host header → host:port. Never drop the UI port (https://10.x.x.x without :5173 is :443). */
+/** Host header → host:port. Never drop the UI port (https://10.x.x.x without :6173 is :443). */
 export function hostWithPort(hostHdr, port) {
-  const p = Number(port) || 5173;
+  const p = Number(port) || 6173;
   if (!hostHdr) return `127.0.0.1:${p}`;
   if (hostHdr.startsWith("[")) {
     if (/\]:\d+$/.test(hostHdr)) return hostHdr;

@@ -1,7 +1,7 @@
 # GPU server only: docker compose up -d --build
-# Builds agent + frontend (msestream /patient HTTPS mux on :5173),
-# pulls LiveKit / vLLM-Omni / Loki / Grafana, pins Ada GPU, downloads HF
-# weights into ./models, mints TLS. docker compose down wipes ./logs.
+# Ports are offset from msestream (5173/7860/7880/3000/3100 stay with MSE).
+# speechagent: UI :6173/patient, agent :8860, LiveKit :8880-8882 + UDP 51000-51100,
+# vLLM :8199, Grafana :3300, Loki :3310.
 name: speechagent
 
 x-logging: &default-logging
@@ -15,7 +15,7 @@ services:
     image: grafana/loki:3.2.1
     user: "0"
     command: ["-config.file=/etc/loki/config.yml"]
-    ports: ["${LOKI_PORT:-3100}:3100"]
+    ports: ["${LOKI_PORT:-3310}:3100"]
     volumes:
       - ./obs/loki.yml:/etc/loki/config.yml:ro
       - ./logs/loki:/loki
@@ -48,7 +48,7 @@ services:
     volumes:
       - ./obs/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./obs/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    ports: ["${GRAFANA_PORT:-3300}:3000"]
     depends_on: [loki]
     logging: *default-logging
     restart: unless-stopped
@@ -89,6 +89,11 @@ services:
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}
       LIVEKIT_NODE_IP: ${LIVEKIT_NODE_IP:-${MSE_LAN_IP:-}}
       MSE_LAN_IP: ${MSE_LAN_IP:-}
+      LIVEKIT_PORT: ${LIVEKIT_PORT:-8880}
+      LIVEKIT_TCP_PORT: ${LIVEKIT_TCP_PORT:-8881}
+      LIVEKIT_TURN_PORT: ${LIVEKIT_TURN_PORT:-8882}
+      LIVEKIT_RTC_PORT_START: ${LIVEKIT_RTC_PORT_START:-51000}
+      LIVEKIT_RTC_PORT_END: ${LIVEKIT_RTC_PORT_END:-51100}
     volumes:
       - ./livekit/entrypoint.sh:/entrypoint.sh:ro
       - ./livekit/livekit.yaml:/livekit.yaml:ro
@@ -106,14 +111,14 @@ services:
       HF_TOKEN: ${HUGGINGFACE_TOKEN:-}
       HUGGING_FACE_HUB_TOKEN: ${HUGGINGFACE_TOKEN:-}
       MODEL_NAME: ${MODEL_NAME:-openbmb/MiniCPM-o-4_5}
-      PORT: "8099"
+      PORT: "${MODEL_PORT:-8199}"
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - ./models:/models
       - ./model-server/entrypoint.sh:/entrypoint.sh:ro
-    ports: ["8099:8099"]
+    ports: ["${MODEL_PORT:-8199}:${MODEL_PORT:-8199}"]
     shm_size: "8gb"
     ipc: host
     ulimits:
@@ -139,11 +144,11 @@ services:
     environment:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY in .env}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET in .env}
-      LIVEKIT_URL: ${LIVEKIT_URL:-ws://127.0.0.1:7880}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://127.0.0.1:8880}
       LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-}
       MSE_LAN_IP: ${MSE_LAN_IP:-}
       MODEL_NAME: ${MODEL_NAME:-openbmb/MiniCPM-o-4_5}
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://127.0.0.1:8099}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://127.0.0.1:8199}
       AGENT_SYSTEM_PROMPT: ${AGENT_SYSTEM_PROMPT:-}
       REF_AUDIO_PATH: ${REF_AUDIO_PATH:-}
       QWEN_SPEAKER: ${QWEN_SPEAKER:-Chelsie}
@@ -156,7 +161,7 @@ services:
       AUDIO_CHUNK_MS: ${AUDIO_CHUNK_MS:-100}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TRACE_DEBUG: ${TRACE_DEBUG:-1}
-      PORT: "7860"
+      PORT: "${AGENT_PORT:-8860}"
     volumes:
       - ./models:/models:ro
     depends_on: [livekit, model-server]
@@ -166,7 +171,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health', timeout=3)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${AGENT_PORT:-8860}/health', timeout=3)",
         ]
       interval: 10s
       timeout: 5s
@@ -180,13 +185,13 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     environment:
-      MEDIA_UPSTREAM: ${MEDIA_UPSTREAM:-http://host.docker.internal:7860}
-      LIVEKIT_UPSTREAM: ${LIVEKIT_UPSTREAM:-http://host.docker.internal:7880}
+      MEDIA_UPSTREAM: ${MEDIA_UPSTREAM:-http://host.docker.internal:8860}
+      LIVEKIT_UPSTREAM: ${LIVEKIT_UPSTREAM:-http://host.docker.internal:8880}
       TLS_CERT_DIR: /app/certs
       CAPTURE_TLS_IP: ${MSE_LAN_IP:-}
       MSE_LAN_IP: ${MSE_LAN_IP:-}
-      PORT: "5173"
-    ports: ["${FRONTEND_PORT:-5173}:5173"]
+      PORT: "${FRONTEND_PORT:-6173}"
+    ports: ["${FRONTEND_PORT:-6173}:${FRONTEND_PORT:-6173}"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on: [agent]
@@ -194,7 +199,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "NODE_TLS_REJECT_UNAUTHORIZED=0 node -e \"(async()=>{const s=await fetch('https://127.0.0.1:5173/patient'); if(!s.ok){console.error('https',s.status);process.exit(1);} process.exit(0);})().catch(e=>{console.error(e.message);process.exit(1);})\"",
+          "NODE_TLS_REJECT_UNAUTHORIZED=0 node -e \"(async()=>{const s=await fetch('https://127.0.0.1:${FRONTEND_PORT:-6173}/patient'); if(!s.ok){console.error('https',s.status);process.exit(1);} process.exit(0);})().catch(e=>{console.error(e.message);process.exit(1);})\"",
         ]
       interval: 5s
       timeout: 5s

@@ -3,8 +3,8 @@ import path from "node:path";
 import { defineConfig, type ProxyOptions } from "vite";
 import react from "@vitejs/plugin-react";
 
-const media = process.env.MEDIA_UPSTREAM || "http://127.0.0.1:7860";
-const livekit = process.env.LIVEKIT_UPSTREAM || "http://127.0.0.1:7880";
+const media = process.env.MEDIA_UPSTREAM || "http://127.0.0.1:8860";
+const livekit = process.env.LIVEKIT_UPSTREAM || "http://127.0.0.1:8880";
 
 const proxyOne: ProxyOptions = {
   target: media,
@@ -40,6 +40,6 @@ const https =
 
 export default defineConfig({
   plugins: [react()],
-  server: { host: true, port: 5173, https, proxy, allowedHosts: true },
-  preview: { host: true, port: 5173, strictPort: true, https, proxy, allowedHosts: true },
+  server: { host: true, port: 6173, https, proxy, allowedHosts: true },
+  preview: { host: true, port: 6173, strictPort: true, https, proxy, allowedHosts: true },
 });

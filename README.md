@@ -7,25 +7,27 @@ Everything starts and stops with Docker Compose. Grafana shows every agent actio
 ## Architecture
 
 ```
-Browser  https://<GPU-LAN>:5173/patient
-   HTTP :5173 308s to HTTPS on the same host:port (msestream capture-ui mux)
-   wss://<same>/rtc  -->  LiveKit SFU (:7880, host net, ICE=MSE_LAN_IP)
+Browser  https://<GPU-LAN>:6173/patient
+   HTTP :6173 308s to HTTPS on the same host:port
+   wss://<same>/rtc  -->  LiveKit SFU (:8880, host net, ICE=MSE_LAN_IP)
                               |
-                         Python agent (:7860)
+                         Python agent (:8860)
                               |
-                   vLLM-Omni model-server (:8099)
+                   vLLM-Omni model-server (:8199)
                               |
                     RTX 6000 Ada 48 GB (device 1)
 
-stdout SA_TRACE  -->  Promtail  -->  Loki (:3100)  -->  Grafana (:3000)
+stdout SA_TRACE  -->  Promtail  -->  Loki (:3310)  -->  Grafana (:3300)
 ```
+
+msestream keeps `:5173` / `:7860` / `:7880` / `:3000` / `:3100`. This stack uses the offsets above so both can listen at once. They still **share Ada GPU 1** — two omni models can OOM.
 
 | Service | Role |
 |---|---|
 | `livekit` | Self-hosted SFU. Host network so ICE/TURN advertise the GPU LAN IP. |
 | `model-server` | `vllm/vllm-omni:v0.28.0` (prebuilt, includes flash-attn). Pinned to Ada GPU. |
 | `agent` | Joins the room as a bot, streams A/V into the model, publishes speech back. |
-| `frontend` | Same capture-ui as msestream: HTTPS+HTTP mux on **:5173**, SPA at `/patient`, proxies `/api` and `/rtc`. |
+| `frontend` | Same capture-ui mux as msestream, on **:6173**, SPA at `/patient`, proxies `/api` and `/rtc`. |
 | `loki` / `promtail` / `grafana` | Log pipeline. Anonymous Grafana Admin. |
 | `log-collector` | Copies container stdout into `./logs/*.log`. |
 | `log-janitor` | On `compose down` (SIGTERM), deletes everything under `./logs/`. |
@@ -37,7 +39,7 @@ On the GPU server, **`docker compose up -d --build` is the entire install**. You
 That one command:
 
 1. Builds `agent` (Python 3.11 + LiveKit SDK) inside Docker
-2. Builds `frontend` (`npm ci` + Vite + `serve.mjs` HTTPS mux on :5173) and mints a self-signed TLS cert (SAN includes `MSE_LAN_IP`)
+2. Builds `frontend` (`npm ci` + Vite + `serve.mjs` HTTPS mux on :6173) and mints a self-signed TLS cert (SAN includes `MSE_LAN_IP`)
 3. Pulls `livekit/livekit-server:v1.9.0`, `vllm/vllm-omni:v0.28.0` (flash-attn included), Loki, Promtail, Grafana
 4. Pins vLLM to the Ada GPU (`ADA_GPU_INDEX`, default host index **1**)
 5. Downloads HuggingFace weights into `./models` (kept across `down`)
@@ -84,23 +86,23 @@ docker compose up -d --build
 
 # 4. Watch first-boot weight download / CUDA init
 docker compose logs -f model-server
-# Ctrl-C when you see the server listening on :8099 (can take several minutes)
+# Ctrl-C when you see the server listening on :8199 (can take several minutes)
 
 docker compose ps
-curl -sS http://127.0.0.1:7860/health
+curl -sS http://127.0.0.1:8860/health
 ```
 
 Open from a **laptop on the LAN** (not `127.0.0.1` of the GPU box):
 
-- Patient UI: `https://<MSE_LAN_IP>:5173/patient` — Chrome **Advanced → Proceed** (self-signed)
-- HTTP on the **same** `:5173` 308s to that HTTPS URL (never to 127.0.0.1, never drops the port)
-- LiveKit signaling is same-origin `wss://<MSE_LAN_IP>:5173/rtc`
+- Patient UI: `https://<MSE_LAN_IP>:6173/patient` — Chrome **Advanced → Proceed** (self-signed)
+- HTTP on the **same** `:6173` 308s to that HTTPS URL (never to 127.0.0.1, never drops the port)
+- LiveKit signaling is same-origin `wss://<MSE_LAN_IP>:6173/rtc`
 - Click **Connect**, allow camera + mic, headphones on, talk
-- Grafana: `http://<MSE_LAN_IP>:3000` (anonymous Admin)
+- Grafana: `http://<MSE_LAN_IP>:3300` (anonymous Admin)
   - **Agent traces** — every `SA_TRACE` event
   - **Agent logs** — raw service stdout
 
-Do not run this stack at the same time as msestream: both bind LiveKit `:7880` and capture-ui `:5173`.
+msestream `/patient` stays at `:5173`. This agent is `:6173`.
 
 Stop (this **wipes `./logs`**, keeps `./models`):
 
@@ -236,13 +238,13 @@ speechagent/
 
 | Port | Service |
 |---|---|
-| 5173 TCP | Capture UI: HTTP 308 → HTTPS `/patient`, plus `/api` and `/rtc` |
-| 3000 TCP | Grafana |
-| 3100 TCP | Loki |
-| 7860 TCP | Agent token/health (host network) |
-| 7880–7882 | LiveKit signaling / TCP media / TURN |
-| 50000–50100 UDP | LiveKit WebRTC |
-| 8099 TCP | vLLM-Omni |
+| 6173 TCP | Capture UI: HTTP 308 → HTTPS `/patient`, plus `/api` and `/rtc` |
+| 3300 TCP | Grafana |
+| 3310 TCP | Loki |
+| 8860 TCP | Agent token/health (host network) |
+| 8880–8882 | LiveKit signaling / TCP media / TURN |
+| 51000–51100 UDP | LiveKit WebRTC |
+| 8199 TCP | vLLM-Omni |
 
 ## Configuration
 
@@ -250,7 +252,7 @@ See [`.env`](.env). Important knobs:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MSE_LAN_IP` | `192.168.1.34` | ICE/TURN advertise this address; TLS cert SAN; capture-ui `:5173/patient` |
+| `MSE_LAN_IP` | `192.168.1.34` | ICE/TURN advertise this address; TLS cert SAN; capture-ui `:6173/patient` |
 | `ADA_GPU_INDEX` | `1` | Host `nvidia-smi` index of the Ada 48 GB |
 | `MODEL_NAME` | `openbmb/MiniCPM-o-4_5` | Which omni weights to load |
 | `HUGGINGFACE_TOKEN` | bashrc | Hub auth for weight download. Read from the GPU-box shell, not `.env` |
@@ -265,9 +267,9 @@ See [`.env`](.env). Important knobs:
 
 | Symptom | Likely cause |
 |---|---|
-| Chrome: camera/mic blocked | Use **https://LAN:5173/patient**, accept the self-signed cert. Not `http://`, not GPU `127.0.0.1` from a laptop. |
+| Chrome: camera/mic blocked | Use **https://LAN:6173/patient**, accept the self-signed cert. Not `http://`, not GPU `127.0.0.1` from a laptop. |
 | Mic: `Could not start audio source` | Chrome Linux `"default"` device. Pick a real input in chrome://settings/content/microphone. |
-| Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 50000–50100 + 7882 open on the LAN. |
+| Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
 | Silent agent | `docker compose logs -f model-server` — weights still downloading or CUDA OOM. Grafana `error.*` events. |
 | Grafana empty | Wait ~15 s for Promtail. Filter `{compose_project="speechagent"}`. |
 | Logs still on disk after down | `docker compose logs log-janitor`. The janitor needs 20 s grace. Then `ls logs/`. |

@@ -21,7 +21,7 @@ LOG = logging.getLogger("qwen")
 
 
 def _base_url() -> str:
-    return (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8099").rstrip("/")
+    return (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8199").rstrip("/")
 
 
 def _wav_b64(pcm16: bytes, rate: int) -> str:

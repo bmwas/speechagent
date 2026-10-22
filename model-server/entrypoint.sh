@@ -3,7 +3,7 @@
 set -euo pipefail
 
 MODEL="${MODEL_NAME:-openbmb/MiniCPM-o-4_5}"
-PORT="${PORT:-8099}"
+PORT="${PORT:-8199}"
 HOST="${HOST:-0.0.0.0}"
 HF_HOME="${HF_HOME:-/models/hf}"
 mkdir -p "${HF_HOME}"

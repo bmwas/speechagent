@@ -21,7 +21,7 @@ CHUNK_MS = int(os.environ.get("AUDIO_CHUNK_MS", "100"))
 
 
 def _model_ws_url() -> str:
-    base = (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8099").rstrip("/")
+    base = (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8199").rstrip("/")
     if base.startswith("http://"):
         base = "ws://" + base[len("http://") :]
     elif base.startswith("https://"):

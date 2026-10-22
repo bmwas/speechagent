@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Capture UI: HTTP + HTTPS on the same port (default 5173).
+ * Capture UI: HTTP + HTTPS on the same port (default 6173; msestream uses 5173).
  *
  * Chrome hides getUserMedia on http://<LAN-IP>, so a laptop on the LAN cannot
  * open camera/mic from that origin. This process:
- *   - serves HTTPS (self-signed) on :5173                 → secure context
- *   - serves HTTP  on :5173 and 308s to https://<same>:5173/... → never 127.0.0.1
+ *   - serves HTTPS (self-signed) on :6173                 → secure context
+ *   - serves HTTP  on :6173 and 308s to https://<same>:6173/... → never 127.0.0.1
  * The muxing is a TCP byte-sniff proxy to two loopback servers; using
  * `Server.emit('connection', socket)` on https.Server does not drive the TLS
  * handshake, so we hand off a raw TCP pipe instead.
@@ -19,12 +19,12 @@ import { fileURLToPath } from "node:url";
 import { httpsLocation } from "./https-location.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.PORT || 5173);
+const PORT = Number(process.env.PORT || 6173);
 const INNER_HTTP = Number(process.env.INNER_HTTP_PORT || 15173);
 const INNER_HTTPS = Number(process.env.INNER_HTTPS_PORT || 15174);
 const DIST = path.resolve(process.env.DIST_DIR || path.join(__dirname, "dist"));
-const MEDIA = process.env.MEDIA_UPSTREAM || "http://127.0.0.1:7860";
-const LIVEKIT = process.env.LIVEKIT_UPSTREAM || "http://127.0.0.1:7880";
+const MEDIA = process.env.MEDIA_UPSTREAM || "http://127.0.0.1:8860";
+const LIVEKIT = process.env.LIVEKIT_UPSTREAM || "http://127.0.0.1:8880";
 const CERT_DIR = process.env.TLS_CERT_DIR || path.resolve(__dirname, "certs");
 const SPA = new Set(["/", "/patient", "/clinician"]);
 const MIME = {
@@ -161,7 +161,7 @@ function proxyLivekitHttp(req, res) {
   const pReq = http.request(
     {
       hostname: target.hostname,
-      port: target.port || 7880,
+      port: target.port || 8880,
       path: req.url,
       method: req.method,
       headers,
@@ -189,7 +189,7 @@ function proxyLivekitUpgrade(req, socket, head) {
     socket.destroy();
     return;
   }
-  const port = Number(target.port) || 7880;
+  const port = Number(target.port) || 8880;
   const upstream = net.connect(port, target.hostname, () => {
     const lines = [`${req.method} ${req.url} HTTP/1.1`];
     for (const [k, v] of Object.entries(req.headers)) {
