@@ -6,7 +6,7 @@
 set -eu
 
 IDX="${ADA_GPU_INDEX:-1}"
-KEEP_RE="${KEEP_CONTAINER_REGEX:-speechagent-model-server|speechagent-gpu-free}"
+KEEP_RE="${KEEP_CONTAINER_REGEX:-speechagent-model-server|speechagent-gpu-free|speechagent-gpu-stats}"
 MAX_WAIT="${ADA_FREE_WAIT_SECS:-45}"
 MAX_USED_MB="${ADA_FREE_MAX_USED_MB:-1024}"
 

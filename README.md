@@ -29,6 +29,7 @@ msestream keeps `:5173` / `:7860` / `:7880` / `:3000` / `:3100`. This stack uses
 | `agent` | Joins the room as a bot, streams A/V into the model, publishes speech back. |
 | `frontend` | Same capture-ui mux as msestream, on **:6173** host network, SPA at `/patient`, proxies `/api` and `/rtc` to loopback. |
 | `loki` / `promtail` / `grafana` | Log pipeline. Anonymous Grafana Admin. |
+| `gpu-stats` | Host `nvidia-smi` sampler (query only, no VRAM). `SA_TRACE gpu.sample` / `gpu.summary` / `gpu.verdict` → Grafana **Ada GPU**. |
 | `log-collector` | Copies container stdout into `./logs/*.log`. |
 | `log-janitor` | On `compose down` (SIGTERM), deletes everything under `./logs/`. |
 
@@ -103,6 +104,7 @@ Open from a **laptop on the LAN** (not `127.0.0.1` of the GPU box):
   - **Agent logs** (home dashboard) — model-server KV/CUDA errors + per-service stdout
   - **Agent traces** — `SA_TRACE` events (`duplex.*`, barge-in, video.frame)
   - **Realtime stream** — duplex (`duplex.video_attach` → `duplex.first_audio`) or Qwen (`qwen.video_frame` → `qwen.request` → `qwen.first_audio`) then playout (`lane=stream`)
+  - **Ada GPU** — VRAM / util / power over time plus sampler-computed 1m/5m/15m avg, p50, p95, peak, min headroom, duty cycle (`/d/speechagent-gpu`)
 
 msestream `/patient` stays at `:5173`. This agent is `:6173`.
 
@@ -121,6 +123,7 @@ docker compose down
 | `FREE_ADA_GPU=0 docker compose up -d model-server` | Load vLLM without touching msestream |
 | `docker compose ps` | Service status |
 | `docker compose logs -f agent` | Agent stdout including `SA_TRACE` |
+| `docker compose logs -f gpu-stats` | Ada VRAM/util samples + rolling avg/p95/peak/headroom verdicts |
 | `docker compose logs -f model-server` | vLLM-Omni / weight download |
 | `docker compose logs -f livekit` | SFU / ICE |
 | `docker compose restart agent` | Bounce the bot without unloading weights |
@@ -163,7 +166,10 @@ This is a **native omni** path on vLLM-Omni, not ASR → LLM → TTS. The two mo
 - Browser camera + mic publish over LiveKit. The agent streams both into MiniCPM-o **while you talk**.
 - Mic PCM is appended every **100 ms**. Camera stills (~**1 JPEG/s**, long side 448) ride on those appends as `video_frames` — the OpenBMB duplex contract is one still per ~1 s audio unit.
 - `auto_response` is on, so the model can start speaking from the live stream. On VAD stop the agent also sends `input_audio_buffer.commit`.
-- Camera stills keep updating while the model talks, so the next user unit still has live video.
+- Stage-0 `max_model_len` is **8192**. The session also opens with MiniCPM's **basic sliding window** (trim at 3000 tokens, resume at 2000, system/ref-audio prefix kept) so a long call does not hit `context_length_exceeded`.
+- Language is locked by the **official English clone prompt** (`AGENT_SYSTEM_PROMPT`), not by `HT_ref_audio.wav`. That WAV is bilingual; without the English prefix MiniCPM falls back to Chinese after a thinker overflow.
+- While the model is speaking, silence and camera stills are **not** appended (they were filling the thinker KV and stalling the vocoder). User speech still is, so barge-in works. Stills resume on the next listen unit.
+- If a speak stalls (≥4 s with no audio delta), the agent sends `response.cancel` and **reopens the duplex socket** (`duplex.reconnect`). vllm-omni drops `context_length_exceeded` as `dropping error for unknown req` and otherwise leaves a zombie session.
 - MiniCPM-o 4.5 **does not self-yield** when you talk over it. The agent runs energy VAD, sends `response.cancel`, and clears the LiveKit queue (client-side barge-in).
 
 **Qwen2.5-Omni-3B** — live video stream (`/v1/video/chat/stream`), not duplex, not one JPEG, not an MP4 at VAD stop:
@@ -293,13 +299,17 @@ See [`.env`](.env). Important knobs:
 | `AUDIO_SOURCE_QUEUE_MS` | `120` | LiveKit speaker queue depth |
 | `VAD_STOP_SECS` | `0.80` | Silence before a Qwen turn ends |
 | `VIDEO_FPS` | `1` | MiniCPM-o camera cadence (~1 JPEG per 1 s audio unit). Do not raise this for Qwen. |
-| `VIDEO_MAX_SIDE` | `448` | MiniCPM JPEG long-side cap so vision tokens fit the 4096 context |
+| `VIDEO_MAX_SIDE` | `448` | MiniCPM JPEG long-side cap so vision tokens fit the sliding window |
+| `AGENT_SYSTEM_PROMPT` | English clone prompt | MiniCPM language lock. Official English prefix; do not replace with a generic assistant string. |
 | `QWEN_VIDEO_FPS` | `5` | Live `video.frame` rate into Qwen's video-stream session |
 | `QWEN_VIDEO_NUM_FRAMES` | `40` | Frames the server samples from the session buffer on `video.query` |
 | `QWEN_VIDEO_MAX_FRAMES` | `50` | Server session buffer cap |
 | `QWEN_VIDEO_MAX_SIDE` | `448` | Qwen JPEG long-side cap (3B token budget) |
 | `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
 | `STREAM_TRACE` | `1` | Realtime pipeline traces (`lane=stream`) for the Grafana **Realtime stream** dashboard |
+| `GPU_STATS_INTERVAL_S` | `2` | `nvidia-smi` sample period (`gpu.sample`) |
+| `GPU_STATS_SUMMARY_S` | `30` | Rolling 1m/5m/15m stats line (`gpu.summary`) |
+| `GPU_STATS_VERDICT_S` | `300` | Lifetime avg/p95/peak + “would another model fit?” (`gpu.verdict`) |
 | `STREAM_TRACE_PERIOD_S` | `1` | Aggregation window for mic/append/delta meters |
 | `REF_AUDIO_PATH` | empty | MiniCPM voice clone WAV. Empty uses the snapshot `assets/HT_ref_audio.wav` (required by v0.30.0 duplex). |
 | `QWEN_SPEAKER` | `Chelsie` | Qwen built-in voice |
@@ -314,9 +324,14 @@ See [`.env`](.env). Important knobs:
 | `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
 | Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: vocoder import errors or `0.0 GiB` KV. Recreate `model-server` (`vllm/vllm-omni:v0.30.0`). Wait for `Application startup complete`, then speak. MiniCPM: `duplex.video_attach` → `duplex.first_audio` → `playout.first_frame`. Qwen: `qwen.video_frame` (while talking) → `qwen.request` → `qwen.first_audio` → `playout.first_frame`. |
 | `MiniCPM-o duplex audio output requires ref_audio` / `error.brain` `never sent session.created` | v0.30.0 will not open a duplex session without a clone WAV. Recreate **agent** after this fix so it sends `assets/HT_ref_audio.wav` from `/models/hf`. Override with `REF_AUDIO_PATH`. Model-server does not need a reload. |
+| First turns good, then buffering / quiet, then Chinese | Stage-0 `context_length_exceeded` (prompt ~4167 vs old cap 4096). Server logs `dropping error for unknown req`; agent sees `stream.stall` and `ring_ms=0` while `speaking=true`. Recreate **model-server** (8192 cap) **and agent** (sliding window + English clone prompt + reconnect). Grafana: `duplex.session_update` should show `sliding_window=basic`; a hung speak should emit `duplex.stall_cancel` then `duplex.reconnect` within ~4 s. |
+| `audio_past_key_values length 1500 exceeds 1500, reset` | Expected MiniCPM audio-encoder window (`max_source_positions=1500`), about every 30 s. Not a crash. Harmless unless it coincides with thinker overflow. |
+| `This model does not officially support disabling chunked prefill` | Expected on MiniCPM stage-2 (vocoder yaml sets `enable_chunked_prefill: false`). Ignore. |
+| SageMaker `model.py` not found / NVFP4 NaN-clamp skipped | Image noise from the vllm-omni container. Ignore. |
 | Qwen `qwen.request skipped=no_frames` | Camera never produced a JPEG. Check `video.frame` and `QWEN_VIDEO_FPS`. Server `video.query` with an empty buffer returns `No frames buffered`. |
 | `Available KV cache memory: 0.0 GiB` | GPU not visible in StageEngineCoreProc, or Ada full. Recreate `model-server` after pull. Confirm `runtime: nvidia` and `CUDA_VISIBLE_DEVICES=0`. Free Ada VRAM (`nvidia-smi` on the GPU box). |
 | Grafana empty / wrong stack | Open **http://10.4.7.193:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |
+| Ada GPU dashboard empty | Recreate **gpu-stats** (and Grafana if the **Ada GPU** link is missing). `docker compose logs gpu-stats` should show `gpu-stats hello` then a `gpu.summary` line every 30 s. Query-only `nvidia-smi` — it does not take VRAM. |
 | Logs still on disk after down | `docker compose logs log-janitor`. The janitor needs 20 s grace. Then `ls logs/`. |
 | Ada not used | `nvidia-smi` on the GPU box — compose `device_ids: ["1"]`. Inside the container `CUDA_VISIBLE_DEVICES=0`. |
 

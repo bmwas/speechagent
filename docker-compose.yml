@@ -103,6 +103,26 @@ services:
     logging: *default-logging
     restart: unless-stopped
 
+  gpu-stats:
+    image: python:3.12-alpine
+    environment:
+      ADA_GPU_INDEX: "${ADA_GPU_INDEX:-1}"
+      GPU_STATS_INTERVAL_S: "${GPU_STATS_INTERVAL_S:-2}"
+      GPU_STATS_SUMMARY_S: "${GPU_STATS_SUMMARY_S:-30}"
+      GPU_STATS_VERDICT_S: "${GPU_STATS_VERDICT_S:-300}"
+    pid: host
+    privileged: true
+    volumes:
+      - ./obs/gpu-stats.py:/gpu-stats.py:ro
+    command:
+      [
+        "sh",
+        "-c",
+        "apk add --no-cache util-linux >/dev/null && exec python3 /gpu-stats.py",
+      ]
+    logging: *default-logging
+    restart: unless-stopped
+
   gpu-free:
     image: docker:27-cli
     environment:

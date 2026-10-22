@@ -206,6 +206,10 @@ class MiniCPMDuplexEngine:
         self._text_rl = RateLimiter(1.0)
         self._unknown_rl = RateLimiter(2.0)
         self._stall_rl = RateLimiter(2.0)
+        self._watchdog: asyncio.Task | None = None
+        self._reconnect_reason = ""
+        self._last_reconnect = 0.0
+        self._closing = False
 
     @property
     def generating(self) -> bool:
@@ -248,14 +252,29 @@ class MiniCPMDuplexEngine:
         await self._ws.send(json.dumps(body))
 
     async def start(self) -> None:
+        self._closing = False
+        await self._connect_and_handshake()
+        if self._watchdog is None or self._watchdog.done():
+            self._watchdog = asyncio.create_task(self._watchdog_loop())
+
+    async def _connect_and_handshake(self) -> None:
         url = _model_ws_url()
         model = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-o-4_5")
         ref, ref_source = _ref_audio_data_url()
+        instructions = self.system_prompt or (
+            "Clone the voice in the provided audio prompt. Please assist users "
+            "while maintaining this voice style. Please answer the user's questions "
+            "seriously and in a high quality. Please chat with the user in a highly "
+            "human-like and oral style. Always reply in English. Never switch to "
+            "Chinese unless the user is speaking Chinese. You are a helpful assistant."
+        )
         trace_stream("speech", "duplex.ws_open", url=url, model=model, has_ref=True, ref_source=ref_source[-80:])
         delay = 2.0
         last_err = "unknown"
         connected_at = 0
         for attempt in range(1, 181):
+            if self._closing:
+                raise RuntimeError("duplex closed before connect")
             try:
                 self._ws = await websockets.connect(url, max_size=16_000_000, ping_interval=20)
                 connected_at = attempt
@@ -275,11 +294,13 @@ class MiniCPMDuplexEngine:
             attempt=connected_at,
             model=model,
         )
+        # v0.30.0 defaults sliding_window_mode=off and high=8000, both of which
+        # overflow our stage-0 max_model_len. basic 3000/2000 trims units
+        # (keeps the system/ref-audio prefix) before the scheduler rejects.
         session: dict[str, Any] = {
             "model": model,
             "modalities": ["audio", "text"],
-            "instructions": self.system_prompt
-            or "You are a helpful, friendly AI assistant. Respond naturally and conversationally.",
+            "instructions": instructions,
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
             "turn_detection": None,
@@ -290,13 +311,17 @@ class MiniCPMDuplexEngine:
             "ref_audio": ref,
             "extra_body": {
                 "auto_response": True,
-                "force_listen_count": 0,
+                "force_listen_count": 3,
                 "ref_audio": ref,
+                "sliding_window_mode": "basic",
+                "basic_window_high_tokens": 3000,
+                "basic_window_low_tokens": 2000,
             },
         }
         trace_stream("speech", "voice.ref_loaded", source=ref_source[-120:], bytes=len(ref))
         self._handshake.clear()
         self._handshake_error = ""
+        self._ready.clear()
         self._reader = asyncio.create_task(self._read())
         await self._send({"type": "session.update", "session": session})
         trace_stream(
@@ -306,7 +331,10 @@ class MiniCPMDuplexEngine:
             auto_response=True,
             overlap_policy=session.get("overlap_policy"),
             has_ref=True,
-            instructions_len=len(str(session.get("instructions") or "")),
+            sliding_window="basic",
+            window_high=3000,
+            window_low=2000,
+            instructions_len=len(instructions),
             chunk_ms=CHUNK_MS,
         )
         try:
@@ -319,29 +347,136 @@ class MiniCPMDuplexEngine:
             raise RuntimeError("model-server never sent session.created")
         self._hb = asyncio.create_task(self._heartbeat())
 
+    def _request_reconnect(self, reason: str) -> None:
+        if self._closing or self._reconnect_reason:
+            return
+        self._reconnect_reason = reason[:120]
+        trace_stream("speech", "duplex.reconnect_request", reason=self._reconnect_reason)
+
+    async def _watchdog_loop(self) -> None:
+        try:
+            while not self._closing:
+                await asyncio.sleep(0.5)
+                reason = self._reconnect_reason
+                if not reason:
+                    continue
+                now = time.monotonic()
+                if now - self._last_reconnect < 15.0:
+                    self._reconnect_reason = ""
+                    continue
+                self._reconnect_reason = ""
+                self._last_reconnect = now
+                try:
+                    await self._reconnect(reason)
+                except Exception as exc:
+                    trace_exc("speech", "error.duplex_reconnect", exc, reason=reason)
+        except asyncio.CancelledError:
+            raise
+
+    async def _reconnect(self, reason: str) -> None:
+        trace_stream("speech", "duplex.reconnect", reason=reason)
+        self._ready.clear()
+        self._speaking = False
+        await self._teardown_socket(cancel_watchdog=False)
+        self._reset_stream_state()
+        await self._connect_and_handshake()
+        trace_stream("speech", "duplex.reconnected", reason=reason)
+
+    def _reset_stream_state(self) -> None:
+        self._buf.clear()
+        self._audio_end_ms = 0
+        self._played_ms = 0
+        self._last_video_ms = -1_000
+        self._commit_pending = False
+        self._last_is_speech = False
+        self._turn_deltas = 0
+        self._turn_bytes = 0
+        self._response_id = ""
+        self._t_last_delta = 0.0
+        self._t_speak = 0.0
+        while not self._out.empty():
+            try:
+                self._out.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def _teardown_socket(self, *, cancel_watchdog: bool) -> None:
+        tasks = ["_hb", "_reader"]
+        if cancel_watchdog:
+            tasks.append("_watchdog")
+        current = asyncio.current_task()
+        for attr in tasks:
+            task = getattr(self, attr)
+            if task is None or task is current or task.done():
+                setattr(self, attr, None)
+                continue
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            setattr(self, attr, None)
+        if self._ws is not None:
+            try:
+                await self._send({"type": "session.close"})
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            trace_stream(
+                "speech",
+                "duplex.ws_close",
+                code=self._close_code,
+                reason=self._close_reason or "teardown",
+                delta_n=self._delta_n,
+                append_n=self._append_n,
+                played_ms=self._played_ms,
+            )
+
     async def _heartbeat(self) -> None:
+        ticks = 0
         try:
             while self._ws is not None:
-                await asyncio.sleep(20.0)
+                await asyncio.sleep(2.0)
+                ticks += 1
                 try:
-                    await self._send({"type": "session.heartbeat"})
                     now = time.monotonic()
-                    trace_stream(
-                        "speech",
-                        "duplex.heartbeat",
-                        rx_age_ms=_age_ms(self._t_last_rx, now),
-                        delta_age_ms=_age_ms(self._t_last_delta, now),
-                        speaking=self._speaking,
+                    stalled = (
+                        self._speaking
+                        and self._turn_deltas > 0
+                        and self._t_last_delta > 0.0
+                        and (now - self._t_last_delta) >= 2.0
                     )
-                    if self._speaking and self._t_last_delta and (now - self._t_last_delta) >= 2.0:
-                        if self._stall_rl.due():
+                    if stalled and self._stall_rl.due():
+                        gap = _age_ms(self._t_last_delta, now)
+                        trace_stream(
+                            "speech",
+                            "stream.stall",
+                            where="duplex.delta",
+                            gap_ms=gap,
+                            response_id=self._response_id[:16],
+                        )
+                        # Hung mid-utterance after context overflow: the server
+                        # drops the error and leaves a zombie session that then
+                        # speaks Chinese (system prefix gone). Reopen.
+                        if gap >= 4000:
                             trace_stream(
                                 "speech",
-                                "stream.stall",
-                                where="duplex.delta",
-                                gap_ms=_age_ms(self._t_last_delta, now),
+                                "duplex.stall_cancel",
+                                gap_ms=gap,
                                 response_id=self._response_id[:16],
                             )
+                            await self.interrupt()
+                            self._request_reconnect(f"stall_{gap}ms")
+                    if ticks % 10 == 0:
+                        await self._send({"type": "session.heartbeat"})
+                        trace_stream(
+                            "speech",
+                            "duplex.heartbeat",
+                            rx_age_ms=_age_ms(self._t_last_rx, now),
+                            delta_age_ms=_age_ms(self._t_last_delta, now),
+                            speaking=self._speaking,
+                        )
                 except Exception:
                     return
         except asyncio.CancelledError:
@@ -384,10 +519,14 @@ class MiniCPMDuplexEngine:
             if not self._ready.is_set() and not self._handshake.is_set():
                 self._handshake_error = reason or "duplex websocket closed"
                 self._handshake.set()
+            elif self._ready.is_set() and not self._closing:
+                self._request_reconnect(reason or "duplex_ws_closed")
         else:
             if not self._ready.is_set() and not self._handshake.is_set():
                 self._handshake_error = self._handshake_error or "duplex websocket closed before session.created"
                 self._handshake.set()
+            elif self._ready.is_set() and not self._closing:
+                self._request_reconnect("duplex_ws_closed")
 
     async def _handle(self, ev: dict[str, Any]) -> None:
         typ = str(ev.get("type") or "")
@@ -478,6 +617,10 @@ class MiniCPMDuplexEngine:
             if not self._ready.is_set():
                 self._handshake_error = err
                 self._handshake.set()
+                return
+            low = err.lower()
+            if "context_length" in low or "max_model_len" in low:
+                self._request_reconnect(err[:80])
             return
         if typ in _SPEECH_START_TYPES:
             trace_stream("speech", "duplex.model_speech_start", ev_type=typ, keys=",".join(list(ev.keys())[:12]))
@@ -559,6 +702,13 @@ class MiniCPMDuplexEngine:
             pcm16 = self._in_resampler.feed(pcm16, sample_rate)
             if not pcm16:
                 return
+        # While the talker is occupying the Ada, silence+JPEGs still grow
+        # stage-0 KV and compete with generation. Barge-in still flows
+        # because is_speech=True. Drop leftover silence so it is not dumped
+        # the moment the model yields.
+        if not is_speech and self._speaking:
+            self._buf.clear()
+            return
         self._buf.extend(pcm16)
         chunk_bytes = int(MODEL_RATE * (CHUNK_MS / 1000.0) * 2)
         while len(self._buf) >= chunk_bytes:
@@ -718,33 +868,12 @@ class MiniCPMDuplexEngine:
             trace_exc("speech", "error.duplex_cancel", exc)
 
     async def close(self) -> None:
+        self._closing = True
+        self._reconnect_reason = ""
         for meter in (self._rx_types, self._append_meter, self._delta_meter, self._drop_meter, self._video_drop):
             try:
                 meter.flush()
             except Exception:
                 pass
-        for attr in ("_hb", "_reader"):
-            task = getattr(self, attr)
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                setattr(self, attr, None)
-        if self._ws is not None:
-            try:
-                await self._send({"type": "session.close"})
-                await self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
-            trace_stream(
-                "speech",
-                "duplex.ws_close",
-                code=self._close_code,
-                reason=self._close_reason,
-                delta_n=self._delta_n,
-                append_n=self._append_n,
-                played_ms=self._played_ms,
-            )
+        await self._teardown_socket(cancel_watchdog=True)
+        self._ready.clear()

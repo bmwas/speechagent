@@ -1,0 +1,522 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "Agent logs",
+      "type": "link",
+      "url": "/d/speechagent-logs/agent-logs",
+      "icon": "doc"
+    },
+    {
+      "title": "Agent traces",
+      "type": "link",
+      "url": "/d/speechagent-traces/agent-traces",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Realtime stream",
+      "type": "link",
+      "url": "/d/speechagent-stream/realtime-stream",
+      "icon": "bolt"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Ada now (gpu.sample)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "title": "VRAM used",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "decgbytes", "decimals": 2 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "used GiB",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap mem_used_gib | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Headroom",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 8 },
+              { "color": "green", "value": 18 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "free GiB",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap headroom_gib | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "VRAM %",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 75 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "used %",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap mem_used_pct | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "SM util",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 0, "max": 100 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "util %",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap util_gpu_pct | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Power",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "watt", "decimals": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "draw W",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap power_w | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Temp",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 75 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "GPU °C",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap temp_c | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Over this range (Grafana) + 5m window from gpu.summary",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
+      "id": 9,
+      "title": "Range avg used",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 6 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "decgbytes", "decimals": 2 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "avg GiB",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap mem_used_gib | __error__=\"\" [$__range])"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Range peak used",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 6 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "decgbytes", "decimals": 2 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "peak GiB",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap mem_used_gib | __error__=\"\" [$__range])"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Range min headroom",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 6 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 8 },
+              { "color": "green", "value": 18 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "worst free GiB",
+          "expr": "min_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap headroom_gib | __error__=\"\" [$__range])"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "5m used avg (script)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 6 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "decgbytes", "decimals": 2 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "5m avg",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.summary\"} | json | unwrap w5m_used_avg | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "5m used p95 (script)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 6 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "decgbytes", "decimals": 2 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "5m p95",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.summary\"} | json | unwrap w5m_used_p95 | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "5m compute duty",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 6 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "duty %",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.summary\"} | json | unwrap duty_compute_5m_pct | __error__=\"\" [$__interval])"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "VRAM used / total / headroom (GiB)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "decgbytes", "decimals": 2 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "used",
+          "legendFormat": "used",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap mem_used_gib | __error__=\"\" [30s])"
+        },
+        {
+          "refId": "total",
+          "legendFormat": "total",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap mem_total_gib | __error__=\"\" [30s])"
+        },
+        {
+          "refId": "head",
+          "legendFormat": "headroom",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap headroom_gib | __error__=\"\" [30s])"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "SM util / mem-controller / encoder (%)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "sm",
+          "legendFormat": "SM",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap util_gpu_pct | __error__=\"\" [30s])"
+        },
+        {
+          "refId": "mc",
+          "legendFormat": "mem ctrl",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap util_mem_pct | __error__=\"\" [30s])"
+        },
+        {
+          "refId": "enc",
+          "legendFormat": "encoder",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap util_enc_pct | __error__=\"\" [30s])"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Power (W) + temperature (°C)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "pwr",
+          "legendFormat": "power W",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap power_w | __error__=\"\" [30s])"
+        },
+        {
+          "refId": "tmp",
+          "legendFormat": "temp C",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap temp_c | __error__=\"\" [30s])"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "vLLM process VRAM + compute-app count",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "vllm",
+          "legendFormat": "vllm MiB",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap vllm_mem_mib | __error__=\"\" [30s])"
+        },
+        {
+          "refId": "proc",
+          "legendFormat": "procs",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.sample\"} | json | unwrap procs | __error__=\"\" [30s])"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "5m window from the sampler (avg / p95 / peak / min headroom)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 26 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "decgbytes", "decimals": 2 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "avg",
+          "legendFormat": "5m avg used",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.summary\"} | json | unwrap w5m_used_avg | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "p95",
+          "legendFormat": "5m p95 used",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.summary\"} | json | unwrap w5m_used_p95 | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "max",
+          "legendFormat": "5m peak used",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.summary\"} | json | unwrap w5m_used_max | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "hmin",
+          "legendFormat": "5m min headroom",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"gpu.summary\"} | json | unwrap w5m_head_min | __error__=\"\" [1m])"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "gpu.verdict (script: avg / p50 / p95 / peak / duty / would-another-model-fit)",
+      "type": "logs",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 34 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"gpu.verdict|gpu.summary|gpu.hello|gpu.error\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "gpu-stats stdout (human lines + SA_TRACE)",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 42 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", service=\"gpu-stats\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["speechagent", "gpu", "ada"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "Ada GPU",
+  "uid": "speechagent-gpu",
+  "version": 1
+}

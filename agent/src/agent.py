@@ -45,11 +45,18 @@ def _env_int(name: str, default: int) -> int:
 
 
 def system_prompt() -> str:
+    # MiniCPM-o picks language from this string (official English clone
+    # prompt). A generic assistant prompt plus HT_ref_audio.wav falls back
+    # to Chinese after a thinker overflow / audio-encoder KV reset.
     return (
         os.environ.get("AGENT_SYSTEM_PROMPT")
-        or "You are a helpful, friendly AI assistant. You can see the user through "
-        "their camera and hear them through their microphone. Respond naturally "
-        "and conversationally. Keep responses concise and engaging."
+        or "Clone the voice in the provided audio prompt. Please assist users "
+        "while maintaining this voice style. Please answer the user's questions "
+        "seriously and in a high quality. Please chat with the user in a highly "
+        "human-like and oral style. You can see the user through their camera "
+        "and hear them through their microphone. Always reply in English. Never "
+        "switch to Chinese unless the user is speaking Chinese. Keep responses "
+        "concise. You are a helpful assistant developed by ModelBest: MiniCPM-Omni."
     ).strip()
 
 

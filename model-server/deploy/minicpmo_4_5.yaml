@@ -38,16 +38,20 @@ stages:
     gpu_memory_utilization: 0.55
     kv_cache_memory_bytes: 4294967296
     enforce_eager: true
-    max_model_len: 4096
-    max_num_batched_tokens: 4096
+    # 4096 overflowed at ~4167 tokens (~2 min of 100 ms PCM + 1 JPEG/s).
+    # 8192 leaves sampling room; the agent still opens with
+    # sliding_window_mode=basic (trim 3000 / resume 2000) so the thinker
+    # never grows to this cap. Talker (stage 1) stays 4096.
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
     interleave_mm_strings: true
     media_io_kwargs:
       video:
         fps: 1
-        # Upstream ships 128; 128 frames cannot fit max_model_len 4096.
+        # Upstream ships 128; 128 frames cannot fit the Ada stage-0 window.
         num_frames: 16
     limit_mm_per_prompt:
-      # Upstream ships image/audio 64; trimmed to fit the 4096 context.
+      # Upstream ships image/audio 64; trimmed so live 1 FPS stills fit the window.
       image: 8
       audio: 8
       video: 1

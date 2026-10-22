@@ -15,6 +15,12 @@
       "type": "link",
       "url": "/d/speechagent-traces/agent-traces",
       "icon": "dashboard"
+    },
+    {
+      "title": "Ada GPU",
+      "type": "link",
+      "url": "/d/speechagent-gpu/ada-gpu",
+      "icon": "monitor"
     }
   ],
   "panels": [
