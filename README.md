@@ -289,7 +289,7 @@ See [`.env`](.env). Important knobs:
 | Mic: `Could not start audio source` | Chrome Linux `"default"` device. Pick a real input in chrome://settings/content/microphone. |
 | Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
 | `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
-| Silent agent / `duplex.ws_retry` | Model-server restart loop. `docker compose logs -f model-server` on the **GPU box**. Look for `0.0 GiB` KV cache. |
+| Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: `ModuleNotFoundError: s3tokenizer` (stage-2 vocoder) or `0.0 GiB` KV. Recreate `model-server` so entrypoint can `pip install s3tokenizer`. Wait until `vllm serve` is listening, then speak. |
 | `Available KV cache memory: 0.0 GiB` | GPU not visible in StageEngineCoreProc, or Ada full. Recreate `model-server` after pull. Confirm `runtime: nvidia` and `CUDA_VISIBLE_DEVICES=0`. Free Ada VRAM (`nvidia-smi` on the GPU box). |
 | Grafana empty / wrong stack | Open **http://10.4.7.193:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |
 | Logs still on disk after down | `docker compose logs log-janitor`. The janitor needs 20 s grace. Then `ls logs/`. |

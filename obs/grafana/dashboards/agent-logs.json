@@ -62,7 +62,7 @@
         {
           "refId": "A",
           "legendFormat": "model errors",
-          "expr": "sum(count_over_time({compose_project=\"speechagent\", service=\"model-server\"} |~ \"(?i)ERROR |ValueError|Traceback|Orchestrator initialization failed|No available memory|StageEngineCoreProc failed\" [$__range]))"
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", service=\"model-server\"} |~ \"(?i)ERROR |ValueError|Traceback|Orchestrator initialization failed|No available memory|StageEngineCoreProc failed|ModuleNotFoundError|s3tokenizer\" [$__range]))"
         }
       ]
     },
@@ -81,7 +81,7 @@
       },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\"} |~ \"(?i)ERROR |ValueError|Traceback|fatal|Orchestrator initialization failed|No available memory|StageEngineCoreProc failed|duplex.ws_retry|error\\\\.\"",
+          "expr": "{compose_project=\"speechagent\"} |~ \"(?i)ERROR |ValueError|Traceback|fatal|Orchestrator initialization failed|No available memory|StageEngineCoreProc failed|ModuleNotFoundError|s3tokenizer|duplex.ws_retry|drop_not_ready|error\\\\.\"",
           "queryType": "range",
           "refId": "A"
         }

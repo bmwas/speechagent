@@ -67,6 +67,41 @@ if free < need:
     sys.exit(1)
 PY
 
+ensure_mod() {
+  local mod="$1"
+  python -c "import ${mod}" >/dev/null 2>&1
+}
+
+# MiniCPM-o 4.5 Code2Wav (stage 2) imports in-tree Step-Audio2 Token2wav,
+# which needs s3tokenizer + onnxruntime + hyperpyyaml. The public
+# vllm/vllm-omni:v0.28.0 image does not ship them, so stage 2 crashes,
+# the orchestrator never serves :8199, and the agent drops every mic
+# chunk as stream.drop_not_ready.
+install_minicpm_vocoder() {
+  local missing=()
+  ensure_mod s3tokenizer || missing+=(s3tokenizer)
+  ensure_mod onnxruntime || missing+=(onnxruntime)
+  ensure_mod hyperpyyaml || missing+=(hyperpyyaml)
+  if [ "${#missing[@]}" -eq 0 ]; then
+    echo "model-server MiniCPM vocoder imports ok (s3tokenizer, onnxruntime, hyperpyyaml)"
+    return 0
+  fi
+  echo "model-server installing MiniCPM-o Code2Wav deps: ${missing[*]}"
+  mkdir -p /models/pip
+  python -m pip install \
+    --cache-dir /models/pip \
+    --disable-pip-version-check \
+    --no-warn-script-location \
+    "s3tokenizer>=0.3.0" \
+    "onnxruntime>=1.17.0" \
+    "hyperpyyaml"
+  if ! ensure_mod s3tokenizer; then
+    echo "model-server FATAL: s3tokenizer still missing after pip install. Stage-2 Code2Wav cannot start." >&2
+    exit 1
+  fi
+  echo "model-server MiniCPM vocoder imports ok after install"
+}
+
 find_yaml() {
   local name="$1"
   local cand
@@ -87,6 +122,7 @@ DEPLOY=""
 case "${MODEL}" in
   *MiniCPM*|*minicpm*)
     DEPLOY="$(find_yaml minicpmo_4_5.yaml || true)"
+    install_minicpm_vocoder
     ;;
   *Qwen2.5-Omni*|*qwen2.5-omni*|*Qwen2_5*)
     DEPLOY="$(find_yaml qwen2_5_omni.yaml || true)"
