@@ -10,7 +10,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 
-from trace import trace
+from trace import trace_stream
 
 LOG = logging.getLogger("audio")
 
@@ -134,6 +134,8 @@ class ClockedPlayout:
         self._stats_t = time.monotonic()
         self._silence = b"\x00" * WEBRTC_FRAME_BYTES
         self._first_push = True
+        self._underrun_open = False
+        self._first_frame = False
 
     @property
     def ring_ms(self) -> float:
@@ -146,7 +148,7 @@ class ClockedPlayout:
         if self._first_push:
             pcm = trim_leading_silence(pcm)
             self._first_push = False
-            trace("speech", "playout.push", bytes=len(pcm), rate=rate, first=True)
+            trace_stream("speech", "playout.push", bytes=len(pcm), rate=rate, first=True)
         if rate != WEBRTC_RATE:
             if self._resampler is None or self._resampler.dst_rate != WEBRTC_RATE:
                 self._resampler = LinearResampler(WEBRTC_RATE)
@@ -164,7 +166,9 @@ class ClockedPlayout:
         self._last_push = 0.0
         self._first_push = True
         self.clears += 1
-        trace("speech", "playout.clear", clears=self.clears)
+        self._underrun_open = False
+        self._first_frame = False
+        trace_stream("speech", "playout.clear", clears=self.clears)
 
     def take_frame(self, now: float | None = None) -> bytes | None:
         now = time.monotonic() if now is None else now
@@ -174,6 +178,12 @@ class ClockedPlayout:
             del self._ring[:need]
             self.frames += 1
             self._active = True
+            if self._underrun_open:
+                self._underrun_open = False
+                trace_stream("speech", "playout.recover", ring_ms=round(self.ring_ms, 1))
+            if not self._first_frame:
+                self._first_frame = True
+                trace_stream("speech", "playout.first_frame", bytes=len(frame), ring_ms=round(self.ring_ms, 1))
             return frame
         if self._ring:
             frame = bytes(self._ring) + self._silence[len(self._ring) :]
@@ -182,8 +192,19 @@ class ClockedPlayout:
             return frame[:need]
         if self._active and self._last_push and (now - self._last_push) <= HOLD_SILENCE_S:
             self.silence_frames += 1
+            if not self._underrun_open:
+                self._underrun_open = True
+                trace_stream(
+                    "speech",
+                    "playout.underrun",
+                    hold=True,
+                    since_push_ms=int((now - self._last_push) * 1000),
+                )
             return self._silence
+        if self._active:
+            trace_stream("speech", "playout.idle", since_push_ms=int((now - self._last_push) * 1000) if self._last_push else -1)
         self._active = False
+        self._underrun_open = False
         self.idle_ticks += 1
         return None
 
@@ -193,7 +214,7 @@ class ClockedPlayout:
             return
         self._stats_t = now
         underrun = self.silence_frames > 0
-        trace(
+        trace_stream(
             "speech",
             "playout.underrun" if underrun else "playout.stats",
             frames=self.frames,
@@ -223,7 +244,7 @@ class ClockedPlayout:
                         await asyncio.wait_for(capture(frame, WEBRTC_RATE), timeout=CAPTURE_TIMEOUT_S)
                     except TimeoutError:
                         self.capture_timeouts += 1
-                        trace("speech", "playout.block", block_ms=int(CAPTURE_TIMEOUT_S * 1000))
+                        trace_stream("speech", "playout.block", block_ms=int(CAPTURE_TIMEOUT_S * 1000), where="capture_timeout")
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -231,7 +252,7 @@ class ClockedPlayout:
                     else:
                         block_ms = int((time.monotonic() - t0) * 1000)
                         if block_ms >= 50:
-                            trace("speech", "playout.block", block_ms=block_ms)
+                            trace_stream("speech", "playout.block", block_ms=block_ms, where="capture")
                 self._emit_stats()
                 next_t += FRAME_S
                 delay = next_t - time.monotonic()

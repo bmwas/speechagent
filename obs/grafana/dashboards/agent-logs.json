@@ -9,6 +9,12 @@
       "type": "link",
       "url": "/d/speechagent-traces/agent-traces",
       "icon": "dashboard"
+    },
+    {
+      "title": "Realtime stream",
+      "type": "link",
+      "url": "/d/speechagent-stream/realtime-stream",
+      "icon": "bolt"
     }
   ],
   "panels": [
@@ -56,7 +62,7 @@
         {
           "refId": "A",
           "legendFormat": "model errors",
-          "expr": "sum(count_over_time({compose_project=\"speechagent\", service=\"model-server\"} |~ \"(?i)error|fatal|traceback|kv cache|no available memory|cuda\" [$__range]))"
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", service=\"model-server\"} |~ \"(?i)ERROR |ValueError|Traceback|Orchestrator initialization failed|No available memory|StageEngineCoreProc failed\" [$__range]))"
         }
       ]
     },
@@ -75,7 +81,7 @@
       },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\"} |~ \"(?i)error|fail|traceback|fatal|timeout|exception|kv cache|no available memory|cuda unavailable\"",
+          "expr": "{compose_project=\"speechagent\"} |~ \"(?i)ERROR |ValueError|Traceback|fatal|Orchestrator initialization failed|No available memory|StageEngineCoreProc failed|duplex.ws_retry|error\\\\.\"",
           "queryType": "range",
           "refId": "A"
         }

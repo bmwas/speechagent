@@ -9,7 +9,7 @@ import time
 
 from PIL import Image
 
-from trace import trace
+from trace import trace_stream
 
 LOG = logging.getLogger("video")
 VIDEO_FPS = float(os.environ.get("VIDEO_FPS", "1"))
@@ -57,7 +57,7 @@ class FrameSampler:
         if now - self._last < self.period:
             return None
         self._last = now
-        trace("speech", "video.frame", bytes=len(jpeg), w=size[0], h=size[1])
+        trace_stream("speech", "video.frame", bytes=len(jpeg), w=size[0], h=size[1])
         return jpeg
 
     @property

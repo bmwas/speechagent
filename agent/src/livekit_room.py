@@ -11,10 +11,27 @@ from typing import Any
 
 from audio import WEBRTC_CHANNELS, WEBRTC_FRAME_BYTES, WEBRTC_FRAME_SAMPLES, WEBRTC_RATE, LinearResampler, downmix_to_mono
 from tokens import BOT_IDENTITY, livekit_url
-from trace import trace, trace_exc
+from trace import RateLimiter, StreamMeter, trace_exc, trace_stream
 
 LOG = logging.getLogger("livekit_room")
 SOURCE_QUEUE_MS = int(os.environ.get("AUDIO_SOURCE_QUEUE_MS", "120"))
+
+
+def _pub_meta(args: tuple[Any, ...]) -> tuple[str, str]:
+    ident = ""
+    kind = ""
+    for arg in args:
+        ident = ident or str(getattr(arg, "identity", "") or "")
+        participant = getattr(arg, "participant", None)
+        if participant is not None:
+            ident = ident or str(getattr(participant, "identity", "") or "")
+        kind_val = getattr(arg, "kind", None)
+        if kind_val is not None:
+            kind = kind or str(kind_val)
+        source = getattr(arg, "source", None)
+        if source is not None and not kind:
+            kind = str(source)
+    return ident, kind
 
 
 async def cancel_task_robust(task: asyncio.Task, label: str = "", attempts: int = 6) -> None:
@@ -85,6 +102,8 @@ class LiveKitBotRoom:
         self._out_buf = bytearray()
         self._out_resampler: LinearResampler | None = None
         self._rtc: Any = None
+        self._quality_rl = RateLimiter(5.0)
+        self._pub_meter = StreamMeter("speech", "stream.livekit_out", kind="out")
 
     def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
@@ -101,7 +120,7 @@ class LiveKitBotRoom:
             ident = getattr(participant, "identity", "") or ""
             if ident == BOT_IDENTITY:
                 return
-            trace("speech", "livekit.connect", identity=ident)
+            trace_stream("speech", "livekit.participant_join", identity=ident)
             if self.on_participant:
                 self._spawn(self.on_participant(ident, "joined"))
 
@@ -110,6 +129,7 @@ class LiveKitBotRoom:
             ident = getattr(participant, "identity", "") or ""
             if ident == BOT_IDENTITY:
                 return
+            trace_stream("speech", "livekit.participant_leave", identity=ident)
             if self.on_participant:
                 self._spawn(self.on_participant(ident, "left"))
 
@@ -117,9 +137,43 @@ class LiveKitBotRoom:
         def _sub(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
             self._start_track(track, participant)
 
+        @room.on("track_muted")
+        def _muted(*args) -> None:
+            try:
+                ident, kind = _pub_meta(args)
+                trace_stream("speech", "track.muted", identity=ident, kind=kind)
+            except Exception:
+                LOG.debug("track_muted handler", exc_info=True)
+
+        @room.on("track_unmuted")
+        def _unmuted(*args) -> None:
+            try:
+                ident, kind = _pub_meta(args)
+                trace_stream("speech", "track.unmuted", identity=ident, kind=kind)
+            except Exception:
+                LOG.debug("track_unmuted handler", exc_info=True)
+
+        @room.on("connection_quality_changed")
+        def _quality(*args) -> None:
+            if not self._quality_rl.due():
+                return
+            try:
+                ident = ""
+                quality = ""
+                for arg in args:
+                    ident = ident or str(getattr(arg, "identity", "") or "")
+                    quality = quality or str(arg)
+                trace_stream("speech", "livekit.quality", identity=ident, quality=quality[:80])
+            except Exception:
+                LOG.debug("connection_quality handler", exc_info=True)
+
+        @room.on("reconnected")
+        def _reconnected(*_a) -> None:
+            trace_stream("speech", "livekit.reconnect")
+
         @room.on("disconnected")
         def _disc(*_a):
-            trace("speech", "livekit.disconnect")
+            trace_stream("speech", "livekit.disconnect")
             if self._closed.is_set():
                 return
             self._closed.set()
@@ -141,10 +195,10 @@ class LiveKitBotRoom:
         self._seen_tracks.add(key)
         kind = getattr(track, "kind", None)
         if kind == rtc.TrackKind.KIND_AUDIO:
-            trace("speech", "track.audio_sub", identity=ident)
+            trace_stream("speech", "track.audio_sub", identity=ident)
             self._spawn(self._audio_loop(rtc.AudioStream(track), ident))
         elif kind == rtc.TrackKind.KIND_VIDEO:
-            trace("speech", "track.video_sub", identity=ident)
+            trace_stream("speech", "track.video_sub", identity=ident)
             stream = rtc.VideoStream(track, format=rtc.VideoBufferType.RGB24)
             self._spawn(self._video_loop(stream, ident))
 
@@ -175,14 +229,14 @@ class LiveKitBotRoom:
         url = livekit_url()
         self._bind_handlers()
         await self.room.connect(url, self.token)
-        trace("speech", "livekit.connect", url=url, role="bot")
+        trace_stream("speech", "livekit.connect", url=url, role="bot")
         self._subscribe_existing()
         self.source = rtc.AudioSource(WEBRTC_RATE, WEBRTC_CHANNELS, SOURCE_QUEUE_MS)
         track = rtc.LocalAudioTrack.create_audio_track("assistant", self.source)
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
         await self.room.local_participant.publish_track(track, options)
-        trace("speech", "track.audio_pub", queue_ms=SOURCE_QUEUE_MS)
+        trace_stream("speech", "track.audio_pub", queue_ms=SOURCE_QUEUE_MS)
         return self.source
 
     async def _audio_loop(self, stream, identity: str) -> None:
@@ -240,19 +294,24 @@ class LiveKitBotRoom:
             except RuntimeError:
                 return
             block_ms = (time.monotonic() - t0) * 1000.0
+            self._pub_meter.add(frames=1, bytes=len(chunk), block_ms=block_ms)
             if block_ms >= 50:
-                trace("speech", "playout.block", block_ms=int(block_ms))
+                trace_stream("speech", "playout.block", block_ms=int(block_ms), where="livekit_capture")
 
     def clear_source_queue(self) -> None:
         clear = getattr(self.source, "clear_queue", None)
         if callable(clear):
             try:
                 clear()
-                trace("speech", "turn.source_queue_clear", source_queue_ms=SOURCE_QUEUE_MS)
+                trace_stream("speech", "turn.source_queue_clear", source_queue_ms=SOURCE_QUEUE_MS)
             except Exception:
                 LOG.exception("clear_source_queue")
 
     async def close(self) -> None:
+        try:
+            self._pub_meter.flush()
+        except Exception:
+            pass
         self._closed.set()
         for task in list(self._tasks):
             await cancel_task_robust(task, label="livekit_room")

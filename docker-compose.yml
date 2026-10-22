@@ -46,6 +46,7 @@ services:
       GF_CHECK_FOR_UPDATES: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/agent-logs.json
+      GF_LOG_LEVEL: warn
     volumes:
       - ./obs/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./obs/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -188,6 +189,8 @@ services:
       AUDIO_CHUNK_MS: ${AUDIO_CHUNK_MS:-100}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TRACE_DEBUG: ${TRACE_DEBUG:-1}
+      STREAM_TRACE: ${STREAM_TRACE:-1}
+      STREAM_TRACE_PERIOD_S: ${STREAM_TRACE_PERIOD_S:-1}
       PORT: "${AGENT_PORT:-8860}"
     volumes:
       - ./models:/models:ro

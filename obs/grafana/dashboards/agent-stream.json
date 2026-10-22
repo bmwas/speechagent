@@ -1,0 +1,358 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "Agent logs",
+      "type": "link",
+      "url": "/d/speechagent-logs/agent-logs",
+      "icon": "doc"
+    },
+    {
+      "title": "Agent traces",
+      "type": "link",
+      "url": "/d/speechagent-traces/agent-traces",
+      "icon": "dashboard"
+    }
+  ],
+  "panels": [
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Realtime pipeline",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "Mic first (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "mic first",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"stream.mic_first\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Model first audio (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "first audio",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=~\"duplex.first_audio|qwen.first_audio\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "TTFB p50 (ms)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "p50 TTFB",
+          "expr": "quantile_over_time(0.5, {compose_project=\"speechagent\", event=~\"duplex.first_audio|qwen.first_audio\"} | json | unwrap latency_ms | __error__=\"\" [$__range])"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Mic gaps (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "mic gap",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"stream.mic_gap\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Playout underrun (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "underrun",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.underrun\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "WS retries / stalls",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "retry+stall",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=~\"duplex.ws_retry|stream.stall|stream.drop_not_ready|qwen.ready_retry\"}[$__range]))"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Stream events / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 5 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "cps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (event) (count_over_time({compose_project=\"speechagent\", lane=\"stream\"}[1m]))",
+          "legendFormat": "{{event}}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Time-to-first-audio",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 5 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{event}}",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=~\"duplex.first_audio|qwen.first_audio\"} | json | unwrap latency_ms | __error__=\"\" [1m])"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Audio bytes in vs model bytes out (1s windows)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "decbytes" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "in",
+          "legendFormat": "mic → model (duplex.append)",
+          "expr": "sum(avg_over_time({compose_project=\"speechagent\", event=\"duplex.append\"} | json | unwrap bytes | __error__=\"\" [1m]))"
+        },
+        {
+          "refId": "out",
+          "legendFormat": "model → playout (duplex.audio_delta)",
+          "expr": "sum(avg_over_time({compose_project=\"speechagent\", event=\"duplex.audio_delta\"} | json | unwrap bytes | __error__=\"\" [1m]))"
+        },
+        {
+          "refId": "qwen",
+          "legendFormat": "qwen SSE audio",
+          "expr": "sum(avg_over_time({compose_project=\"speechagent\", event=\"qwen.sse\"} | json | unwrap bytes | __error__=\"\" [1m]))"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Playout ring + LiveKit mic age",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "ring",
+          "legendFormat": "ring_ms",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"stream.health\"} | json | unwrap ring_ms | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "mic",
+          "legendFormat": "lk_mic_age_ms",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"stream.health\"} | json | unwrap lk_mic_age_ms | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "delta",
+          "legendFormat": "delta_age_ms",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"stream.health\"} | json | unwrap delta_age_ms | __error__=\"\" [1m])"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "Protocol + health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "title": "Duplex / Qwen protocol (speak, listen, model VAD, text, SSE)",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 12, "x": 0, "y": 22 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"duplex\\\\.(ws_connected|session_.*|speak|listen|first_audio|append_speech|model_speech_.*|text_delta|committed|response_.*|event|cancel|rx_stats)|qwen\\\\.(request|sse_.*|first_audio|text_delta|done|cancel)\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "stream.health (1 Hz snapshot)",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 12, "x": 12, "y": 22 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"stream\\\\.(health|mic_first|mic_gap|mic_resume|stall|drop_not_ready|user_utt_.*)\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "All realtime traces (lane=stream, newest first)",
+      "type": "logs",
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 34 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", lane=\"stream\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["speechagent", "stream"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "Realtime stream",
+  "uid": "speechagent-stream",
+  "version": 1
+}

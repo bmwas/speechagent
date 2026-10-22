@@ -7,7 +7,7 @@ import os
 import time
 
 from audio import pcm_rms
-from trace import trace
+from trace import StreamMeter, trace_stream
 
 LOG = logging.getLogger("barge_in")
 
@@ -30,6 +30,7 @@ class EnergyVad:
         self._quiet_since: float | None = None
         self._speech_start: float | None = None
         self.last_rms = 0
+        self._stats = StreamMeter("speech", "vad.stats")
 
     def _open_thresh(self) -> float:
         return max(MIC_GATE_MIN, self._noise_ema * MIC_GATE_MULT, MIC_GATE_RMS)
@@ -39,6 +40,13 @@ class EnergyVad:
         self.last_rms = rms
         now = time.monotonic()
         open_t = self._open_thresh()
+        self._stats.add(
+            frames=1,
+            rms=rms,
+            open_thresh=int(open_t),
+            speaking=int(self.speaking),
+            bot_playing=int(self.bot_playing),
+        )
         close_t = open_t * 0.6
         if not self.speaking and rms < open_t:
             self._noise_ema = 0.98 * self._noise_ema + 0.02 * float(rms)
@@ -54,12 +62,13 @@ class EnergyVad:
                         return None
                 self.speaking = True
                 self._speech_start = now
-                trace(
+                trace_stream(
                     "speech",
                     "vad.start",
                     rms=int(rms),
                     open_thresh=int(open_t),
                     bot_playing=self.bot_playing,
+                    noise_ema=int(self._noise_ema),
                 )
                 return "start"
             return None
@@ -77,6 +86,12 @@ class EnergyVad:
             self.speaking = False
             self._speech_start = None
             self._quiet_since = None
-            trace("speech", "vad.stop", rms=int(rms), utterance_s=round(dur, 2), bot_playing=self.bot_playing)
+            trace_stream(
+                "speech",
+                "vad.stop",
+                rms=int(rms),
+                utterance_s=round(dur, 2),
+                bot_playing=self.bot_playing,
+            )
             return "stop"
         return None

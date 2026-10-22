@@ -102,6 +102,7 @@ Open from a **laptop on the LAN** (not `127.0.0.1` of the GPU box):
 - Grafana: `http://<MSE_LAN_IP>:3300` (anonymous Admin). **Not** msestream `:3000`.
   - **Agent logs** (home dashboard) — model-server KV/CUDA errors + per-service stdout
   - **Agent traces** — `SA_TRACE` events (`duplex.*`, barge-in, video.frame)
+  - **Realtime stream** — duplex/Qwen pipeline: mic → append → first audio → playout (`lane=stream`)
 
 msestream `/patient` stays at `:5173`. This agent is `:6173`.
 
@@ -191,7 +192,7 @@ Every meaningful action is one stdout line:
 SA_TRACE {"ts":..., "agent":"speech", "event":"session.open", "session_id":"lk-default", ...}
 ```
 
-Promtail parses the prefix, labels `agent` + `event`, and stores `session_id` / `trace_id` as structured metadata.
+Promtail parses the prefix, labels `agent` + `event` + `lane`, and stores `session_id` / `trace_id` as structured metadata.
 
 ### Event catalog
 
@@ -205,14 +206,22 @@ Promtail parses the prefix, labels `agent` + `event`, and stores `session_id` / 
 | `turn.barge_in` | User interrupted the agent |
 | `duplex.ws_open` / `duplex.session_created` / `duplex.ws_close` | MiniCPM WS |
 | `duplex.append` | 1 Hz audio+video heartbeat into the model |
+| `duplex.append_speech` | First `is_speech=true` append of an utterance |
+| `duplex.first_audio` | Time-to-first-byte from the model (`latency_ms`) |
+| `duplex.audio_delta` | 1 Hz model PCM out (bytes, qsize, rms) |
 | `duplex.speak` / `duplex.listen` / `duplex.cancel` | Model turn decision |
-| `qwen.request` / `qwen.first_audio` / `qwen.done` | Turn-based path |
-| `playout.push` / `playout.underrun` / `playout.block` / `playout.clear` | Speaker path |
+| `duplex.rx_stats` | 1 Hz WebSocket event-type histogram |
+| `duplex.model_speech_start` / `duplex.model_speech_stop` | Model-side VAD |
+| `stream.health` | 1 Hz pipeline snapshot (ready, ring, mic age) |
+| `stream.mic_in` / `stream.mic_first` / `stream.mic_gap` | LiveKit mic hop |
+| `stream.stall` / `stream.drop_not_ready` | Duplex not producing / WS not ready |
+| `qwen.request` / `qwen.first_audio` / `qwen.sse` / `qwen.done` | Turn-based path |
+| `playout.push` / `playout.first_frame` / `playout.underrun` / `playout.block` / `playout.clear` | Speaker path |
 | `video.frame` | JPEG still sent (1 fps) |
 | `voice.ref_loaded` | Which WAV / Qwen speaker |
 | `error.*` | Failures with traceback |
 
-`TRACE_DEBUG=1` (default) also emits VAD-edge debug traces. Dropped video frames and per-packet audio are not logged (they drowned Grafana). Raw PCM and JPEG are never logged.
+`TRACE_DEBUG=1` and `STREAM_TRACE=1` (defaults) emit VAD-edge plus 1 Hz pipeline meters (`lane=stream` in Loki). Per-packet PCM/JPEG is not logged. Raw PCM and JPEG are never logged.
 
 On `docker compose down`, `log-janitor` deletes `./logs/**` (Loki chunks + collector files). Docker json-file logs die with the containers. Weights in `./models` are kept.
 
@@ -267,6 +276,8 @@ See [`.env`](.env). Important knobs:
 | `VAD_STOP_SECS` | `0.80` | Silence before a Qwen turn ends |
 | `VIDEO_FPS` | `1` | Stills sent to the model |
 | `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
+| `STREAM_TRACE` | `1` | Realtime pipeline traces (`lane=stream`) for the Grafana **Realtime stream** dashboard |
+| `STREAM_TRACE_PERIOD_S` | `1` | Aggregation window for mic/append/delta meters |
 | `REF_AUDIO_PATH` | empty | MiniCPM custom voice WAV |
 | `QWEN_SPEAKER` | `Chelsie` | Qwen built-in voice |
 

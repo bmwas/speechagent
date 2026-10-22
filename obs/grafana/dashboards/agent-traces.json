@@ -9,6 +9,12 @@
       "type": "link",
       "url": "/d/speechagent-logs/agent-logs",
       "icon": "doc"
+    },
+    {
+      "title": "Realtime stream",
+      "type": "link",
+      "url": "/d/speechagent-stream/realtime-stream",
+      "icon": "bolt"
     }
   ],
   "panels": [

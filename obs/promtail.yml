@@ -39,6 +39,7 @@ scrape_configs:
                 expressions:
                   agent: agent
                   event: event
+                  lane: lane
                   trace_id: trace_id
                   session_id: session_id
                   seq: seq
@@ -47,6 +48,7 @@ scrape_configs:
             - labels:
                 agent:
                 event:
+                lane:
             - structured_metadata:
                 seq:
                 level:

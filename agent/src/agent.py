@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 from audio import ClockedPlayout, LinearResampler, MODEL_RATE
 from barge_in import EnergyVad
@@ -12,7 +13,7 @@ from duplex_model import MiniCPMDuplexEngine
 from livekit_room import LiveKitBotRoom, cancel_task_robust
 from qwen_omni import QwenOmniEngine
 from tokens import BOT_IDENTITY, token_for_bot
-from trace import set_session_id, set_trace_id, trace, trace_dbg, trace_exc
+from trace import StreamMeter, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
 from video import FrameSampler
 
 LOG = logging.getLogger("agent")
@@ -55,7 +56,15 @@ class SpeechSession:
         self._play_task: asyncio.Task | None = None
         self._clock_task: asyncio.Task | None = None
         self._brain_task: asyncio.Task | None = None
+        self._health_task: asyncio.Task | None = None
         self._humans: set[str] = set()
+        self._mic_first = False
+        self._last_mic = 0.0
+        self._gap_open = False
+        self._pull_n = 0
+        self._pull_bytes = 0
+        self._mic_meter = StreamMeter("speech", "stream.mic_in", kind="in")
+        self._pull_meter = StreamMeter("speech", "stream.playout_pull", kind="out")
 
     async def connect_and_publish(self) -> None:
         if self._running:
@@ -81,6 +90,7 @@ class SpeechSession:
         await self.bot.connect()
         self._play_task = asyncio.create_task(self._playback_loop())
         self._clock_task = asyncio.create_task(self._clock_loop())
+        self._health_task = asyncio.create_task(self._health_loop())
 
     async def run_brain(self) -> None:
         if self._brain_started:
@@ -88,7 +98,7 @@ class SpeechSession:
         self._brain_started = True
         try:
             await self.engine.start()
-            trace("speech", "session.brain_ready", model=self.model_name)
+            trace_stream("speech", "session.brain_ready", model=self.model_name, path="minicpm" if self.minicpm else "qwen")
         except Exception as exc:
             trace_exc("speech", "error.brain", exc)
             await self.stop()
@@ -114,21 +124,61 @@ class SpeechSession:
         pcm16 = self._in_rs.feed(pcm, int(rate) or 48000)
         if not pcm16:
             return
+        self._last_mic = time.monotonic()
+        if not self._mic_first:
+            self._mic_first = True
+            trace_stream(
+                "speech",
+                "stream.mic_first",
+                bytes=len(pcm16),
+                src_rate=int(rate) or 48000,
+                identity=identity,
+                brain_ready=self._brain_started and bool(getattr(self.engine, "ready", True)),
+            )
         self.vad.bot_playing = bool(getattr(self.engine, "generating", False))
         edge = self.vad.feed(pcm16)
+        if edge == "start":
+            trace_stream(
+                "speech",
+                "stream.user_utt_start",
+                rms=self.vad.last_rms,
+                identity=identity,
+                bot_playing=self.vad.bot_playing,
+                engine_ready=bool(getattr(self.engine, "ready", False)),
+            )
         if edge == "start" and self.vad.bot_playing:
             await self.engine.interrupt()
             self.playout.clear()
             if self.bot is not None:
                 self.bot.clear_source_queue()
-            trace("speech", "turn.barge_in", source="energy", identity=identity)
+            trace_stream("speech", "turn.barge_in", source="energy", identity=identity)
         if edge == "stop" and not self.minicpm:
             gen = getattr(self.engine, "generate", None)
             if callable(gen):
                 await gen()
-        await self.engine.push_audio(pcm16, MODEL_RATE)
+        if edge == "stop":
+            trace_stream(
+                "speech",
+                "stream.user_utt_end",
+                rms=self.vad.last_rms,
+                identity=identity,
+                generating=bool(getattr(self.engine, "generating", False)),
+                ring_ms=round(self.playout.ring_ms, 1),
+            )
+        is_speech = bool(self.vad.speaking or edge in ("start", "stop"))
+        ready = bool(getattr(self.engine, "ready", True))
+        self._mic_meter.add(
+            frames=1,
+            bytes=len(pcm16),
+            rms=self.vad.last_rms,
+            is_speech=int(is_speech),
+            ready=int(ready),
+            src_rate=int(rate) or 48000,
+            identity=identity,
+        )
+        await self.engine.push_audio(pcm16, MODEL_RATE, is_speech=is_speech)
         if edge:
-            trace_dbg("speech", "audio.chunk", rms=self.vad.last_rms, edge=edge, bytes=len(pcm16))
+            trace_dbg("speech", "audio.chunk", rms=self.vad.last_rms, edge=edge, bytes=len(pcm16), is_speech=is_speech)
 
     async def _on_video(self, raw: bytes, size: tuple[int, int], fmt: str, identity: str) -> None:
         jpeg = self.frames.offer(raw, size, fmt)
@@ -139,9 +189,15 @@ class SpeechSession:
         try:
             while self._running:
                 chunks = await self.engine.pull_audio()
+                pulled = 0
                 for pcm, rate in chunks:
                     self.vad.bot_playing = True
                     self.playout.push(pcm, int(rate) or 24000)
+                    pulled += len(pcm)
+                if pulled:
+                    self._pull_n += 1
+                    self._pull_bytes += pulled
+                    self._pull_meter.add(chunks=len(chunks), bytes=pulled, ring_ms=self.playout.ring_ms)
                 if not chunks and not getattr(self.engine, "generating", False):
                     self.vad.bot_playing = False
                 await asyncio.sleep(0.01)
@@ -149,6 +205,60 @@ class SpeechSession:
             raise
         except Exception as exc:
             trace_exc("speech", "error.playback", exc)
+
+    async def _health_loop(self) -> None:
+        try:
+            while self._running:
+                await asyncio.sleep(1.0)
+                if not self._running:
+                    break
+                now = time.monotonic()
+                mic_age_ms = int((now - self._last_mic) * 1000) if self._last_mic else -1
+                snap = {}
+                getter = getattr(self.engine, "stream_snapshot", None)
+                if callable(getter):
+                    try:
+                        snap = getter() or {}
+                    except Exception:
+                        snap = {}
+                ready = bool(getattr(self.engine, "ready", False))
+                generating = bool(getattr(self.engine, "generating", False))
+                fields = dict(snap)
+                fields.update(
+                    {
+                        "path": "minicpm" if self.minicpm else "qwen",
+                        "humans": len(self._humans),
+                        "brain_started": self._brain_started,
+                        "ready": ready,
+                        "generating": generating,
+                        "vad_speaking": self.vad.speaking,
+                        "vad_rms": self.vad.last_rms,
+                        "bot_playing": self.vad.bot_playing,
+                        "ring_ms": round(self.playout.ring_ms, 1),
+                        "lk_mic_age_ms": mic_age_ms,
+                        "mic_first": self._mic_first,
+                        "pull_n": self._pull_n,
+                        "pull_bytes": self._pull_bytes,
+                    }
+                )
+                trace_stream("speech", "stream.health", **fields)
+                if self._humans and self._mic_first and mic_age_ms >= 1500:
+                    if not self._gap_open:
+                        self._gap_open = True
+                        trace_stream(
+                            "speech",
+                            "stream.mic_gap",
+                            gap_ms=mic_age_ms,
+                            ready=ready,
+                            generating=generating,
+                        )
+                elif self._gap_open:
+                    self._gap_open = False
+                    trace_stream("speech", "stream.mic_resume", gap_ms=mic_age_ms)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            trace_exc("speech", "error.stream_health", exc)
 
     async def _clock_loop(self) -> None:
         try:
@@ -168,7 +278,12 @@ class SpeechSession:
         self._running = False
         self.playout.stop()
         current = asyncio.current_task()
-        for attr in ("_brain_task", "_play_task", "_clock_task"):
+        for meter in (self._mic_meter, self._pull_meter):
+            try:
+                meter.flush()
+            except Exception:
+                pass
+        for attr in ("_brain_task", "_play_task", "_clock_task", "_health_task"):
             task = getattr(self, attr)
             if task is None or task is current or task.done():
                 setattr(self, attr, None)

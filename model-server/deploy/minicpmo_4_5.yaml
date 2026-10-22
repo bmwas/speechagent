@@ -1,6 +1,6 @@
-# MiniCPM-o 4.5 duplex on one 48 GB Ada GPU (cuda:0 in the container).
-# One live session. Explicit KV bytes skip the broken "profiling fallback"
-# path that was reporting 0.0 GiB and restart-looping StageEngineCoreProc.
+# MiniCPM-o 4.5 duplex, three stages colocated on the one Ada GPU (cuda:0).
+# Thinker weights are ~17 GiB. gpu_memory_utilization 0.42 left 0 GiB for KV
+# after load and killed StageEngineCoreProc. 0.55 * 48 GiB ≈ 26 GiB so KV fits.
 pipeline: minicpmo_4_5
 async_chunk: true
 session_mode: duplex
@@ -18,8 +18,6 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
-      enable_hift_graph: false
-      enable_cfm_graph: false
       token2wav_spk_cpu_reference: true
 
 stages:
@@ -27,10 +25,10 @@ stages:
     devices: "0"
     tensor_parallel_size: 1
     max_num_seqs: 1
-    max_model_len: 2048
-    max_num_batched_tokens: 2048
-    gpu_memory_utilization: 0.42
-    kv_cache_memory_bytes: 2147483648
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    gpu_memory_utilization: 0.55
+    kv_cache_memory_bytes: 4294967296
     enforce_eager: true
     interleave_mm_strings: true
     media_io_kwargs:
@@ -50,10 +48,10 @@ stages:
   - stage_id: 1
     devices: "0"
     max_num_seqs: 1
-    max_model_len: 2048
-    max_num_batched_tokens: 2048
-    gpu_memory_utilization: 0.12
-    kv_cache_memory_bytes: 1073741824
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    gpu_memory_utilization: 0.15
+    kv_cache_memory_bytes: 2147483648
     enforce_eager: true
     output_connectors:
       to_stage_2: connector_of_shared_memory
@@ -69,9 +67,8 @@ stages:
   - stage_id: 2
     devices: "0"
     max_num_seqs: 1
-    gpu_memory_utilization: 0.14
+    gpu_memory_utilization: 0.18
     enforce_eager: true
-    enable_chunked_prefill: false
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -84,13 +81,13 @@ platforms:
     cuda_mps: false
     stages:
       - stage_id: 0
-        kv_cache_memory_bytes: 2147483648
-        gpu_memory_utilization: 0.42
+        kv_cache_memory_bytes: 4294967296
+        gpu_memory_utilization: 0.55
         enforce_eager: true
       - stage_id: 1
-        kv_cache_memory_bytes: 1073741824
-        gpu_memory_utilization: 0.12
+        kv_cache_memory_bytes: 2147483648
+        gpu_memory_utilization: 0.15
         enforce_eager: true
       - stage_id: 2
-        gpu_memory_utilization: 0.14
+        gpu_memory_utilization: 0.18
         enforce_eager: true
