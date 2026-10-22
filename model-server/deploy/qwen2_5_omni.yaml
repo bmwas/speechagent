@@ -1,5 +1,8 @@
 # Qwen2.5-Omni-3B turn-based. Official recipe puts talker on devices:"1";
 # this container only has Ada as cuda:0, so all three stages colocate there.
+# 8192 context is required for a live /v1/video/chat/stream window
+# (~40 frames at 448px + mic PCM). 2048 cannot hold that query.
+# If load OOMs, drop to 4096 and cut QWEN_VIDEO_NUM_FRAMES.
 async_chunk: false
 trust_remote_code: true
 enable_prefix_caching: false
@@ -8,8 +11,8 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
-    max_model_len: 2048
-    max_num_batched_tokens: 2048
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
     gpu_memory_utilization: 0.40
     kv_cache_memory_bytes: 2147483648
     enforce_eager: true
@@ -23,8 +26,8 @@ stages:
   - stage_id: 1
     devices: "0"
     max_num_seqs: 1
-    max_model_len: 2048
-    max_num_batched_tokens: 2048
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
     gpu_memory_utilization: 0.20
     kv_cache_memory_bytes: 1073741824
     enforce_eager: true

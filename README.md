@@ -102,7 +102,7 @@ Open from a **laptop on the LAN** (not `127.0.0.1` of the GPU box):
 - Grafana: `http://<MSE_LAN_IP>:3300` (anonymous Admin). **Not** msestream `:3000`.
   - **Agent logs** (home dashboard) — model-server KV/CUDA errors + per-service stdout
   - **Agent traces** — `SA_TRACE` events (`duplex.*`, barge-in, video.frame)
-  - **Realtime stream** — duplex/Qwen pipeline: mic → append → first audio → playout (`lane=stream`)
+  - **Realtime stream** — duplex (`duplex.video_attach` → `duplex.first_audio`) or Qwen (`qwen.video_frame` → `qwen.request` → `qwen.first_audio`) then playout (`lane=stream`)
 
 msestream `/patient` stays at `:5173`. This agent is `:6173`.
 
@@ -135,7 +135,7 @@ In `.env`:
 # Full-duplex, most natural conversation
 MODEL_NAME=openbmb/MiniCPM-o-4_5
 
-# Turn-based, lighter VRAM, Chelsie/Ethan voices
+# Turn-based live video stream, lighter VRAM, Chelsie/Ethan voices
 MODEL_NAME=Qwen/Qwen2.5-Omni-3B
 QWEN_SPEAKER=Chelsie
 ```
@@ -156,16 +156,26 @@ Only one omni model is loaded. Do not run both.
 
 ## How conversation stays real-time
 
-This is a **native omni duplex** path on vLLM-Omni (`/v1/realtime?duplex=1`), not ASR → LLM → TTS.
+This is a **native omni** path on vLLM-Omni, not ASR → LLM → TTS. The two models use different sockets. They cannot share one.
 
-- Browser camera + mic publish over LiveKit. The agent subscribes both tracks and streams them into MiniCPM-o **while you talk**.
-- Mic PCM is appended every **100 ms**. Camera stills (~**1 JPEG/s**, long side 448) ride on those appends as `video_frames` — the MiniCPM-o duplex contract is one still per ~1 s audio unit.
-- `auto_response` is on, so the model can start speaking from the live stream. On VAD stop the agent also sends `input_audio_buffer.commit` so a residual unit is not left hanging.
-- Model speech is **streamed out as it is generated**: each `response.output_audio.delta` is decoded immediately, resampled, and clocked into LiveKit at **20 ms**. The agent never waits for `response.done` or a full WAV.
-- LiveKit `AudioSource` queue is **120 ms** (shallow) so barge-in is tens of ms, not seconds.
-- MiniCPM-o 4.5 **does not self-yield** when you talk over it. The agent runs energy VAD, sends `response.cancel`, and clears the LiveKit queue (client-side barge-in).
+**MiniCPM-o 4.5** — native duplex (`/v1/realtime?duplex=1`):
+
+- Browser camera + mic publish over LiveKit. The agent streams both into MiniCPM-o **while you talk**.
+- Mic PCM is appended every **100 ms**. Camera stills (~**1 JPEG/s**, long side 448) ride on those appends as `video_frames` — the OpenBMB duplex contract is one still per ~1 s audio unit.
+- `auto_response` is on, so the model can start speaking from the live stream. On VAD stop the agent also sends `input_audio_buffer.commit`.
 - Camera stills keep updating while the model talks, so the next user unit still has live video.
-- Qwen2.5-Omni is turn-based: VAD start 150 ms / stop 800 ms, then streams `/v1/chat/completions` audio deltas (with the latest JPEG on that turn).
+- MiniCPM-o 4.5 **does not self-yield** when you talk over it. The agent runs energy VAD, sends `response.cancel`, and clears the LiveKit queue (client-side barge-in).
+
+**Qwen2.5-Omni-3B** — live video stream (`/v1/video/chat/stream`), not duplex, not one JPEG, not an MP4 at VAD stop:
+
+- Camera ticks become `video.frame` at **5 FPS** as they happen. Mic ticks become `audio.chunk` as they happen. The server keeps a sliding video session (EVS near-duplicate filter, sample `QWEN_VIDEO_NUM_FRAMES` at query time).
+- VAD stop (150 ms start / 800 ms stop) sends `video.query`. Speech streams back on `response.output_audio.delta`.
+- Wire frames are JPEG because that is vllm-omni's video-stream transport. The session is a video buffer, not a still we chose. The agent never sends `image_url`.
+
+**Both:**
+
+- Model speech is **streamed out as it is generated**: each audio delta is decoded immediately, resampled, and clocked into LiveKit at **20 ms**. The agent never waits for a full WAV.
+- LiveKit `AudioSource` queue is **120 ms** (shallow) so barge-in is tens of ms, not seconds.
 - Browser: AudioContext prewarm on the Connect click, 20 ms inbound playout delay, AEC/NS/AGC, skip Chrome's Linux `"default"` mic.
 
 ## GPU pinning
@@ -220,9 +230,12 @@ Promtail parses the prefix, labels `agent` + `event` + `lane`, and stores `sessi
 | `stream.health` | 1 Hz pipeline snapshot (ready, ring, mic age) |
 | `stream.mic_in` / `stream.mic_first` / `stream.mic_gap` | LiveKit mic hop |
 | `stream.stall` / `stream.drop_not_ready` | Duplex not producing / WS not ready |
-| `qwen.request` / `qwen.first_audio` / `qwen.sse` / `qwen.done` | Turn-based path |
+| `qwen.ws_open` / `qwen.ready` / `qwen.ws_close` | Qwen `/v1/video/chat/stream` session |
+| `qwen.video_frame` | Live `video.frame` sent into the server buffer |
+| `qwen.frames_consumed` | Server sampled this query's frames |
+| `qwen.request` / `qwen.first_audio` / `qwen.sse` / `qwen.done` | `video.query` then streamed speech |
 | `playout.push` / `playout.first_frame` / `playout.underrun` / `playout.block` / `playout.clear` | Speaker path |
-| `video.frame` | JPEG still sent (1 fps) |
+| `video.frame` | JPEG encoded for the active engine (1 fps MiniCPM, 5 fps Qwen) |
 | `voice.ref_loaded` | Which WAV / Qwen speaker |
 | `error.*` | Failures with traceback |
 
@@ -239,7 +252,7 @@ speechagent/
   agent/src/
     agent.py                  session: LiveKit + engine + VAD + playout
     duplex_model.py           MiniCPM-o Realtime WebSocket
-    qwen_omni.py              Qwen2.5-Omni chat completions + audio
+    qwen_omni.py              Qwen2.5-Omni `/v1/video/chat/stream` + speech out
     token_server.py           POST /api/livekit/token, GET /health
     livekit_room.py           rtc.Room subscribe / publish
     audio.py                  resample, silence trim, 20 ms clock
@@ -279,8 +292,12 @@ See [`.env`](.env). Important knobs:
 | `HUGGINGFACE_TOKEN` | bashrc | Hub auth for weight download. Read from the GPU-box shell, not `.env` |
 | `AUDIO_SOURCE_QUEUE_MS` | `120` | LiveKit speaker queue depth |
 | `VAD_STOP_SECS` | `0.80` | Silence before a Qwen turn ends |
-| `VIDEO_FPS` | `1` | Camera stills sent to MiniCPM-o (~1 JPEG per 1 s audio unit) |
-| `VIDEO_MAX_SIDE` | `448` | Long-side cap on those JPEGs so vision tokens fit the 4096 context |
+| `VIDEO_FPS` | `1` | MiniCPM-o camera cadence (~1 JPEG per 1 s audio unit). Do not raise this for Qwen. |
+| `VIDEO_MAX_SIDE` | `448` | MiniCPM JPEG long-side cap so vision tokens fit the 4096 context |
+| `QWEN_VIDEO_FPS` | `5` | Live `video.frame` rate into Qwen's video-stream session |
+| `QWEN_VIDEO_NUM_FRAMES` | `40` | Frames the server samples from the session buffer on `video.query` |
+| `QWEN_VIDEO_MAX_FRAMES` | `50` | Server session buffer cap |
+| `QWEN_VIDEO_MAX_SIDE` | `448` | Qwen JPEG long-side cap (3B token budget) |
 | `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
 | `STREAM_TRACE` | `1` | Realtime pipeline traces (`lane=stream`) for the Grafana **Realtime stream** dashboard |
 | `STREAM_TRACE_PERIOD_S` | `1` | Aggregation window for mic/append/delta meters |
@@ -295,7 +312,8 @@ See [`.env`](.env). Important knobs:
 | Mic: `Could not start audio source` | Chrome Linux `"default"` device. Pick a real input in chrome://settings/content/microphone. |
 | Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
 | `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
-| Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: vocoder import errors or `0.0 GiB` KV. Recreate `model-server` (`vllm/vllm-omni:v0.30.0`). Wait for `Application startup complete`, then speak. Look for `duplex.video_attach` → `duplex.first_audio` → `playout.first_frame`. |
+| Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: vocoder import errors or `0.0 GiB` KV. Recreate `model-server` (`vllm/vllm-omni:v0.30.0`). Wait for `Application startup complete`, then speak. MiniCPM: `duplex.video_attach` → `duplex.first_audio` → `playout.first_frame`. Qwen: `qwen.video_frame` (while talking) → `qwen.request` → `qwen.first_audio` → `playout.first_frame`. |
+| Qwen `qwen.request skipped=no_frames` | Camera never produced a JPEG. Check `video.frame` and `QWEN_VIDEO_FPS`. Server `video.query` with an empty buffer returns `No frames buffered`. |
 | `Available KV cache memory: 0.0 GiB` | GPU not visible in StageEngineCoreProc, or Ada full. Recreate `model-server` after pull. Confirm `runtime: nvidia` and `CUDA_VISIBLE_DEVICES=0`. Free Ada VRAM (`nvidia-smi` on the GPU box). |
 | Grafana empty / wrong stack | Open **http://10.4.7.193:3300**, not msestream `:3000`. Filter `{compose_project="speechagent"}`. |
 | Logs still on disk after down | `docker compose logs log-janitor`. The janitor needs 20 s grace. Then `ls logs/`. |
@@ -306,5 +324,6 @@ See [`.env`](.env). Important knobs:
 - [vLLM-Omni MiniCPM-o 4.5 recipe](https://github.com/vllm-project/vllm-omni)
 - [vLLM-Omni Realtime Duplex API](https://github.com/vllm-project/vllm-omni/blob/main/docs/serving/realtime_duplex_api.md)
 - [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B)
+- [vLLM-Omni Streaming Video Input API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/video_stream_api/)
 - [LiveKit Agents](https://docs.livekit.io/agents/)
 - Logging / GPU pin / `/patient` UI patterns from the local `msestream` stack

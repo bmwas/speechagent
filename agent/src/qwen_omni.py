@@ -1,4 +1,10 @@
-"""Qwen2.5-Omni-3B turn-based speech via ``/v1/chat/completions`` streaming."""
+"""Qwen2.5-Omni-3B live video+speech via vLLM-Omni ``/v1/video/chat/stream``.
+
+Camera and mic go to the server as they happen (``video.frame`` +
+``audio.chunk``). VAD stop submits ``video.query``; speech streams back on
+``response.output_audio.delta``. This is not ``image_url`` and not a
+post-hoc MP4. MiniCPM duplex stays in ``duplex_model.py``.
+"""
 
 from __future__ import annotations
 
@@ -12,50 +18,83 @@ import time
 import wave
 from typing import Any
 
-import aiohttp
+import websockets
 
 from audio import MODEL_RATE, LinearResampler
-from trace import RateLimiter, StreamMeter, TypeCounter, trace_exc, trace_stream, trace_turn
+from trace import RateLimiter, StreamMeter, TypeCounter, trace_exc, trace_stream
 
 LOG = logging.getLogger("qwen")
 
+_QUERY_TEXT = "Reply in spoken English. Keep it concise."
+_MIN_UTT_S = 0.2
+_OUT_RATE = 24000
 
-def _base_url() -> str:
-    return (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8199").rstrip("/")
+_AUDIO_DELTA_TYPES = frozenset(
+    {
+        "response.output_audio.delta",
+        "response.audio.delta",
+        "audio.delta",
+    }
+)
+_TEXT_DELTA_TYPES = frozenset(
+    {
+        "response.text.delta",
+        "response.output_text.delta",
+    }
+)
+_DONE_TYPES = frozenset(
+    {
+        "response.output_audio.done",
+        "response.audio.done",
+        "response.done",
+    }
+)
 
 
-def _wav_b64(pcm16: bytes, rate: int) -> str:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(pcm16)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
-def _decode_audio_delta(encoded: str) -> tuple[bytes, int]:
-    raw = base64.b64decode(encoded)
+def _model_ws_url() -> str:
+    base = (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8199").rstrip("/")
+    if base.startswith("http://"):
+        base = "ws://" + base[len("http://") :]
+    elif base.startswith("https://"):
+        base = "wss://" + base[len("https://") :]
+    return f"{base}/v1/video/chat/stream"
+
+
+def _age_ms(started: float, now: float) -> int:
+    if not started:
+        return -1
+    return int((now - started) * 1000)
+
+
+def _pcm_from_delta(ev: dict[str, Any]) -> tuple[bytes, int]:
+    encoded = ev.get("data") or ev.get("delta") or ev.get("audio") or ""
+    if not encoded or not isinstance(encoded, str):
+        return b"", _OUT_RATE
+    try:
+        raw = base64.b64decode(encoded)
+    except Exception:
+        return b"", _OUT_RATE
     if raw[:4] == b"RIFF":
-        with wave.open(io.BytesIO(raw), "rb") as w:
-            return w.readframes(w.getnframes()), w.getframerate()
-    return raw, 24000
-
-
-def _extract_text(chunk: dict[str, Any]) -> str:
-    for choice in chunk.get("choices") or []:
-        delta = choice.get("delta") or {}
-        content = delta.get("content")
-        if isinstance(content, str) and content and not delta.get("audio"):
-            if len(content) < 80 or " " in content:
-                return content
-        if isinstance(delta.get("text"), str):
-            return str(delta.get("text"))
-    return ""
+        try:
+            with wave.open(io.BytesIO(raw), "rb") as w:
+                return w.readframes(w.getnframes()), int(w.getframerate() or _OUT_RATE)
+        except Exception:
+            return raw[44:], _OUT_RATE
+    return raw, _OUT_RATE
 
 
 class QwenOmniEngine:
-    """Accumulate a user utterance, then stream text+audio back."""
+    """Persistent video-stream session. Same duck-type SpeechSession already calls."""
 
     input_rate = MODEL_RATE
 
@@ -63,21 +102,41 @@ class QwenOmniEngine:
         self.system_prompt = system_prompt.strip()
         self.speaker = os.environ.get("QWEN_SPEAKER", "Chelsie").strip() or "Chelsie"
         self.model = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-Omni-3B")
-        self._session: aiohttp.ClientSession | None = None
+        self._max_frames = max(1, min(_env_int("QWEN_VIDEO_MAX_FRAMES", 50), 256))
+        self._num_frames = max(1, min(_env_int("QWEN_VIDEO_NUM_FRAMES", 40), 128))
+        if self._num_frames > self._max_frames:
+            self._num_frames = self._max_frames
+        self._ws: Any = None
         self._out: asyncio.Queue[tuple[bytes, int]] = asyncio.Queue()
-        self._utt = bytearray()
-        self._jpeg: bytes | None = None
         self._in_rs: LinearResampler | None = None
+        self._ready = asyncio.Event()
         self._busy = False
-        self._http_ready = False
-        self._task: asyncio.Task | None = None
+        self._drop_output = False
+        self._reader: asyncio.Task | None = None
+        self._hb: asyncio.Task | None = None
+        self._frame_n = 0
+        self._audio_n = 0
+        self._utt_bytes = 0
         self._t_last_mic = 0.0
+        self._t_last_frame = 0.0
         self._t_last_delta = 0.0
-        self._sse_n = 0
+        self._t_last_rx = 0.0
+        self._t_query = 0.0
+        self._t_ready = 0.0
+        self._first_audio = False
+        self._text_n = 0
+        self._text_chars = 0
+        self._audio_bytes = 0
+        self._audio_chunks = 0
+        self._close_code = 0
+        self._close_reason = ""
         self._buf_meter = StreamMeter("speech", "qwen.buffer", kind="in")
-        self._sse_meter = StreamMeter("speech", "qwen.sse", kind="out")
-        self._sse_types = TypeCounter("speech", "qwen.rx_stats")
+        self._frame_meter = StreamMeter("speech", "qwen.video_tx", kind="in")
+        self._delta_meter = StreamMeter("speech", "qwen.sse", kind="out")
+        self._rx_types = TypeCounter("speech", "qwen.rx_stats")
+        self._drop_meter = StreamMeter("speech", "stream.drop_not_ready", kind="in")
         self._text_rl = RateLimiter(1.0)
+        self._unknown_rl = RateLimiter(2.0)
 
     @property
     def generating(self) -> bool:
@@ -85,43 +144,238 @@ class QwenOmniEngine:
 
     @property
     def ready(self) -> bool:
-        return self._http_ready and self._session is not None and not self._session.closed
+        return self._ready.is_set() and self._ws is not None
 
     def stream_snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
-        utt_ms = int(1000.0 * (len(self._utt) / 2.0) / MODEL_RATE) if self._utt else 0
         return {
             "ready": self.ready,
             "speaking": self._busy,
             "out_q": self._out.qsize(),
-            "utt_ms": utt_ms,
-            "has_jpeg": bool(self._jpeg),
-            "mic_age_ms": int((now - self._t_last_mic) * 1000) if self._t_last_mic else -1,
-            "delta_age_ms": int((now - self._t_last_delta) * 1000) if self._t_last_delta else -1,
-            "sse_n": self._sse_n,
+            "utt_ms": int(1000.0 * (self._utt_bytes / 2.0) / MODEL_RATE) if self._utt_bytes else 0,
+            "frame_n": self._frame_n,
+            "audio_n": self._audio_n,
+            "mic_age_ms": _age_ms(self._t_last_mic, now),
+            "frame_age_ms": _age_ms(self._t_last_frame, now),
+            "delta_age_ms": _age_ms(self._t_last_delta, now),
+            "rx_age_ms": _age_ms(self._t_last_rx, now),
         }
 
+    async def _send(self, body: dict[str, Any]) -> None:
+        if self._ws is None:
+            return
+        await self._ws.send(json.dumps(body))
+
     async def start(self) -> None:
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
+        url = _model_ws_url()
+        trace_stream(
+            "speech",
+            "qwen.ws_open",
+            url=url,
+            model=self.model,
+            num_frames=self._num_frames,
+            max_frames=self._max_frames,
+        )
         delay = 2.0
         last_err = "unknown"
-        url = f"{_base_url()}/v1/models"
+        connected_at = 0
         for attempt in range(1, 181):
             try:
-                async with self._session.get(url) as resp:
-                    if resp.status < 500:
-                        break
-                    last_err = f"HTTP {resp.status}"
+                self._ws = await websockets.connect(url, max_size=16_000_000, ping_interval=20)
+                connected_at = attempt
+                break
             except Exception as exc:
                 last_err = str(exc)[:200]
-            trace_stream("speech", "qwen.ready_retry", attempt=attempt, error=last_err, url=url)
-            await asyncio.sleep(min(delay, 15.0))
-            delay = min(delay * 1.25, 15.0)
+                trace_stream("speech", "qwen.ws_retry", attempt=attempt, error=last_err, url=url)
+                await asyncio.sleep(min(delay, 15.0))
+                delay = min(delay * 1.25, 15.0)
         else:
-            raise RuntimeError(f"model-server never ready at {url}: {last_err}")
-        self._http_ready = True
+            raise RuntimeError(f"model-server video stream never accepted {url}: {last_err}")
+
+        config: dict[str, Any] = {
+            "type": "session.config",
+            "modalities": ["text", "audio"],
+            "num_frames": self._num_frames,
+            "max_frames": self._max_frames,
+            "use_audio_in_video": False,
+            "enable_frame_filter": True,
+        }
+        if self.system_prompt:
+            config["system_prompt"] = self.system_prompt
+        await self._send(config)
+        self._t_ready = time.monotonic()
+        self._ready.set()
+        self._reader = asyncio.create_task(self._read())
+        self._hb = asyncio.create_task(self._heartbeat())
+        trace_stream(
+            "speech",
+            "qwen.ready",
+            url=url,
+            attempt=connected_at,
+            speaker=self.speaker,
+            model=self.model,
+            num_frames=self._num_frames,
+            max_frames=self._max_frames,
+        )
         trace_stream("speech", "voice.ref_loaded", source=f"qwen_speaker:{self.speaker}")
-        trace_stream("speech", "qwen.ready", url=url, speaker=self.speaker, model=self.model)
+
+    async def _heartbeat(self) -> None:
+        try:
+            while self._ws is not None:
+                await asyncio.sleep(20.0)
+                try:
+                    await self._send({"type": "ping"})
+                    now = time.monotonic()
+                    trace_stream(
+                        "speech",
+                        "qwen.heartbeat",
+                        rx_age_ms=_age_ms(self._t_last_rx, now),
+                        delta_age_ms=_age_ms(self._t_last_delta, now),
+                        busy=self._busy,
+                        frame_n=self._frame_n,
+                    )
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _read(self) -> None:
+        assert self._ws is not None
+        try:
+            async for raw in self._ws:
+                self._t_last_rx = time.monotonic()
+                if isinstance(raw, bytes):
+                    continue
+                try:
+                    ev = json.loads(raw)
+                except json.JSONDecodeError:
+                    trace_stream("speech", "qwen.bad_json", bytes=len(raw) if isinstance(raw, str) else 0)
+                    continue
+                if isinstance(ev, dict):
+                    await self._handle(ev)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            reason = str(getattr(exc, "reason", "") or exc)[:200]
+            self._close_code = int(code) if isinstance(code, int) else 0
+            self._close_reason = reason
+            self._ready.clear()
+            self._busy = False
+            trace_exc(
+                "speech",
+                "error.qwen_ws",
+                exc,
+                code=self._close_code,
+                reason=reason,
+                busy=self._busy,
+            )
+
+    async def _handle(self, ev: dict[str, Any]) -> None:
+        typ = str(ev.get("type") or "")
+        self._rx_types.add(typ)
+        if typ == "pong" or typ == "video.frame.ack":
+            return
+        if typ == "response.start":
+            if self._drop_output:
+                return
+            self._busy = True
+            self._first_audio = False
+            if not self._t_query:
+                self._t_query = time.monotonic()
+            trace_stream("speech", "qwen.response_start")
+            return
+        if typ in _AUDIO_DELTA_TYPES:
+            await self._on_audio_delta(ev)
+            return
+        if typ in _TEXT_DELTA_TYPES:
+            text = str(ev.get("delta") or ev.get("text") or "")
+            if text:
+                self._text_n += 1
+                self._text_chars += len(text)
+                if self._text_n == 1 or self._text_rl.due():
+                    trace_stream("speech", "qwen.text_delta", n=self._text_chars, text=text[:80])
+            return
+        if typ == "response.text.done":
+            text = str(ev.get("text") or "")
+            if text and (self._text_n <= 1 or self._text_rl.due()):
+                trace_stream("speech", "qwen.text_done", chars=len(text), text=text[:80])
+            return
+        if typ == "video.frames.consumed":
+            ids = ev.get("frame_ids") or []
+            n = ev.get("frames")
+            if n is None:
+                n = len(ids) if isinstance(ids, list) else 0
+            trace_stream(
+                "speech",
+                "qwen.frames_consumed",
+                frames=n,
+                latest_pts_ms=ev.get("latest_pts_ms"),
+            )
+            return
+        if typ in _DONE_TYPES:
+            self._finish_turn(typ)
+            return
+        if typ in ("error", "response.error"):
+            msg = str(ev.get("message") or ev.get("error") or ev)[:400]
+            trace_stream("speech", "error.qwen", error=msg, type=typ)
+            self._finish_turn("error")
+            return
+        if typ == "session.done":
+            self._ready.clear()
+            self._busy = False
+            trace_stream("speech", "qwen.session_done")
+            return
+        if self._unknown_rl.due() or not typ:
+            keys = ",".join(list(ev.keys())[:12])
+            trace_stream("speech", "qwen.event", type=typ or "empty", keys=keys)
+
+    async def _on_audio_delta(self, ev: dict[str, Any]) -> None:
+        if self._drop_output:
+            return
+        pcm, rate = _pcm_from_delta(ev)
+        if not pcm:
+            return
+        now = time.monotonic()
+        self._busy = True
+        self._audio_bytes += len(pcm)
+        self._audio_chunks += 1
+        self._t_last_delta = now
+        self._delta_meter.add(lines=1, audio_chunks=1, bytes=len(pcm))
+        if not self._first_audio:
+            self._first_audio = True
+            trace_stream(
+                "speech",
+                "qwen.first_audio",
+                latency_ms=_age_ms(self._t_query, now),
+                bytes=len(pcm),
+                rate=rate,
+                frames=self._frame_n,
+            )
+        await self._out.put((pcm, rate))
+
+    def _finish_turn(self, reason: str) -> None:
+        if not self._busy and reason != "error":
+            return
+        self._busy = False
+        latency_ms = _age_ms(self._t_query, time.monotonic())
+        self._delta_meter.flush()
+        self._rx_types.flush()
+        trace_stream(
+            "speech",
+            "qwen.done",
+            reason=reason,
+            latency_ms=latency_ms,
+            audio_bytes=self._audio_bytes,
+            audio_chunks=self._audio_chunks,
+            text_chars=self._text_chars,
+        )
+        self._t_query = 0.0
+        self._audio_bytes = 0
+        self._audio_chunks = 0
+        self._text_n = 0
+        self._text_chars = 0
+        self._first_audio = False
 
     async def push_audio(self, pcm16: bytes, sample_rate: int, is_speech: bool = True) -> None:
         if not pcm16:
@@ -130,161 +384,87 @@ class QwenOmniEngine:
             if self._in_rs is None:
                 self._in_rs = LinearResampler(MODEL_RATE)
             pcm16 = self._in_rs.feed(pcm16, sample_rate)
-        if not pcm16:
-            return
+            if not pcm16:
+                return
         self._t_last_mic = time.monotonic()
-        self._utt.extend(pcm16)
-        self._buf_meter.add(bytes=len(pcm16), utt_ms=int(1000.0 * (len(self._utt) / 2.0) / MODEL_RATE), is_speech=int(bool(is_speech)))
+        if not self.ready:
+            self._drop_meter.add(bytes=len(pcm16), frames=1)
+            return
+        if is_speech:
+            self._utt_bytes += len(pcm16)
+        self._audio_n += 1
+        self._buf_meter.add(
+            bytes=len(pcm16),
+            utt_ms=int(1000.0 * (self._utt_bytes / 2.0) / MODEL_RATE),
+            is_speech=int(bool(is_speech)),
+        )
+        await self._send(
+            {
+                "type": "audio.chunk",
+                "data": base64.b64encode(pcm16).decode("ascii"),
+            }
+        )
 
     async def push_image(self, jpeg: bytes) -> None:
-        if jpeg:
-            self._jpeg = jpeg
+        if not jpeg:
+            return
+        if not self.ready:
+            self._drop_meter.add(dropped=1, reason="not_ready")
+            return
+        self._frame_n += 1
+        self._t_last_frame = time.monotonic()
+        pts_ms = int(self._t_last_frame * 1000)
+        self._frame_meter.add(frames=1, bytes=len(jpeg))
+        await self._send(
+            {
+                "type": "video.frame",
+                "data": base64.b64encode(jpeg).decode("ascii"),
+                "frame_id": str(self._frame_n),
+                "pts_ms": pts_ms,
+            }
+        )
+        if self._frame_n == 1 or self._frame_n % 25 == 0:
+            trace_stream(
+                "speech",
+                "qwen.video_frame",
+                n=self._frame_n,
+                bytes=len(jpeg),
+                pts_ms=pts_ms,
+            )
 
     async def generate(self) -> None:
-        if self._busy or self._session is None:
+        if self._busy or not self.ready:
             return
-        pcm = bytes(self._utt)
-        self._utt.clear()
-        jpeg = self._jpeg
-        if len(pcm) < MODEL_RATE * 2 * 0.2:
-            trace_stream("speech", "qwen.request", skipped="too_short", bytes=len(pcm))
+        utt_ms = int(1000.0 * (self._utt_bytes / 2.0) / MODEL_RATE)
+        if self._utt_bytes < int(MODEL_RATE * 2 * _MIN_UTT_S):
+            trace_stream("speech", "qwen.request", skipped="too_short", bytes=self._utt_bytes, utt_ms=utt_ms)
             return
+        if self._frame_n <= 0:
+            trace_stream("speech", "qwen.request", skipped="no_frames", utt_ms=utt_ms)
+            return
+        self._utt_bytes = 0
+        self._drop_output = False
         self._busy = True
+        self._first_audio = False
+        self._t_query = time.monotonic()
+        self._audio_bytes = 0
+        self._audio_chunks = 0
+        self._text_n = 0
+        self._text_chars = 0
         trace_stream(
             "speech",
             "qwen.request",
-            bytes=len(pcm),
-            utt_ms=int(1000.0 * (len(pcm) / 2.0) / MODEL_RATE),
-            jpeg=bool(jpeg),
+            utt_ms=utt_ms,
+            frames=self._frame_n,
+            num_frames=self._num_frames,
             speaker=self.speaker,
         )
-        self._task = asyncio.create_task(self._request(pcm, jpeg))
-
-    async def _request(self, pcm: bytes, jpeg: bytes | None) -> None:
-        assert self._session is not None
-        content: list[dict[str, Any]] = [
-            {
-                "type": "input_audio",
-                "input_audio": {"data": _wav_b64(pcm, MODEL_RATE), "format": "wav"},
-            }
-        ]
-        if jpeg:
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(jpeg).decode('ascii')}"},
-                }
-            )
-        content.append({"type": "text", "text": "Reply in spoken English. Keep it concise."})
-        messages: list[dict[str, Any]] = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": content})
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "modalities": ["text", "audio"],
-            "audio": {"voice": self.speaker, "format": "wav"},
-            "stream": True,
-            "extra_body": {"speaker": self.speaker},
-        }
-        url = f"{_base_url()}/v1/chat/completions"
-        t0 = time.monotonic()
-        first = True
-        audio_bytes = 0
-        audio_chunks = 0
-        text_chars = 0
-        sse_lines = 0
-        last_chunk = t0
-        with trace_turn("speech", event="qwen", bytes=len(pcm), jpeg=bool(jpeg), speaker=self.speaker):
-            try:
-                async with self._session.post(url, json=body) as resp:
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        trace_stream("speech", "error.qwen_http", status=resp.status, body=text[:300])
-                        return
-                    trace_stream("speech", "qwen.sse_open", status=resp.status, latency_ms=int((time.monotonic() - t0) * 1000))
-                    async for raw in resp.content:
-                        line = raw.decode("utf-8", "replace").strip()
-                        if not line.startswith("data:"):
-                            continue
-                        sse_lines += 1
-                        self._sse_n += 1
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            trace_stream("speech", "qwen.sse_done", sse_lines=sse_lines, audio_chunks=audio_chunks)
-                            break
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        modality = str(chunk.get("modality") or chunk.get("object") or "")
-                        if modality:
-                            self._sse_types.add(modality)
-                        text_piece = _extract_text(chunk)
-                        if text_piece:
-                            text_chars += len(text_piece)
-                            if text_chars == len(text_piece) or self._text_rl.due():
-                                trace_stream("speech", "qwen.text_delta", n=text_chars, text=text_piece[:80])
-                        pcm_out, rate = self._extract_audio(chunk)
-                        now = time.monotonic()
-                        stall_ms = int((now - last_chunk) * 1000)
-                        last_chunk = now
-                        self._sse_meter.add(lines=1, audio_chunks=int(bool(pcm_out)), bytes=len(pcm_out), stall_ms=stall_ms)
-                        if not pcm_out:
-                            continue
-                        audio_bytes += len(pcm_out)
-                        audio_chunks += 1
-                        self._t_last_delta = now
-                        if first:
-                            first = False
-                            trace_stream(
-                                "speech",
-                                "qwen.first_audio",
-                                latency_ms=int((now - t0) * 1000),
-                                bytes=len(pcm_out),
-                                rate=rate,
-                                sse_lines=sse_lines,
-                            )
-                        await self._out.put((pcm_out, rate))
-            except asyncio.CancelledError:
-                trace_stream("speech", "qwen.cancel", latency_ms=int((time.monotonic() - t0) * 1000), audio_bytes=audio_bytes)
-                raise
-            except Exception as exc:
-                trace_exc("speech", "error.qwen_stream", exc)
-            finally:
-                self._busy = False
-                self._sse_meter.flush()
-                self._sse_types.flush()
-                trace_stream(
-                    "speech",
-                    "qwen.done",
-                    latency_ms=int((time.monotonic() - t0) * 1000),
-                    audio_bytes=audio_bytes,
-                    audio_chunks=audio_chunks,
-                    text_chars=text_chars,
-                    sse_lines=sse_lines,
-                )
-
-    def _extract_audio(self, chunk: dict[str, Any]) -> tuple[bytes, int]:
-        modality = chunk.get("modality") or chunk.get("object")
-        for choice in chunk.get("choices") or []:
-            delta = choice.get("delta") or {}
-            content = delta.get("content") or delta.get("audio") or ""
-            if not content:
-                continue
-            if modality == "audio" or delta.get("audio") or (isinstance(content, str) and len(content) > 80):
-                try:
-                    return _decode_audio_delta(content) if isinstance(content, str) else (b"", 24000)
-                except Exception:
-                    continue
-        audio = chunk.get("audio") or {}
-        if isinstance(audio, dict) and audio.get("data"):
-            try:
-                return _decode_audio_delta(audio["data"])
-            except Exception:
-                return b"", 24000
-        return b"", 24000
+        try:
+            await self._send({"type": "video.query", "text": _QUERY_TEXT})
+        except Exception as exc:
+            self._busy = False
+            self._t_query = 0.0
+            trace_exc("speech", "error.qwen_query", exc)
 
     async def pull_audio(self) -> list[tuple[bytes, int]]:
         out: list[tuple[bytes, int]] = []
@@ -296,19 +476,46 @@ class QwenOmniEngine:
         return out
 
     async def interrupt(self) -> None:
-        if self._task and not self._task.done():
-            self._task.cancel()
-            trace_stream("speech", "qwen.cancel", reason="interrupt")
+        q = self._out.qsize()
+        self._drop_output = True
         self._busy = False
-        self._utt.clear()
+        self._t_query = 0.0
         while not self._out.empty():
             try:
                 self._out.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        trace_stream("speech", "qwen.cancel", reason="interrupt", dropped_q=q)
 
     async def close(self) -> None:
         await self.interrupt()
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        for meter in (self._buf_meter, self._frame_meter, self._delta_meter, self._rx_types, self._drop_meter):
+            try:
+                meter.flush()
+            except Exception:
+                pass
+        for attr in ("_hb", "_reader"):
+            task = getattr(self, attr)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                setattr(self, attr, None)
+        if self._ws is not None:
+            try:
+                await self._send({"type": "video.done"})
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            self._ready.clear()
+            trace_stream(
+                "speech",
+                "qwen.ws_close",
+                code=self._close_code,
+                reason=self._close_reason,
+                frame_n=self._frame_n,
+                audio_n=self._audio_n,
+            )

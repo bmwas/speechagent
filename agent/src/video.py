@@ -1,4 +1,9 @@
-"""RGB24 LiveKit frames → JPEG stills at VIDEO_FPS."""
+"""RGB24 LiveKit frames → JPEG at a per-engine FPS.
+
+MiniCPM duplex attaches ~1 JPEG per 1 s audio unit (``VIDEO_FPS``).
+Qwen2.5-Omni live video-stream wants ``QWEN_VIDEO_FPS`` (default 5) so the
+server session buffer is a real video window, not one still.
+"""
 
 from __future__ import annotations
 
@@ -35,16 +40,21 @@ def packed_rgb24(raw: bytes, width: int, height: int) -> bytes | None:
     return b"".join(raw[i * stride : i * stride + row] for i in range(height))
 
 
-def rgb_to_jpeg(raw: bytes, size: tuple[int, int], quality: int = 70) -> bytes | None:
+def rgb_to_jpeg(
+    raw: bytes,
+    size: tuple[int, int],
+    quality: int = 70,
+    max_side: int | None = None,
+) -> bytes | None:
     w, h = size
     packed = packed_rgb24(raw, w, h)
     if packed is None:
         return None
     try:
         img = Image.frombytes("RGB", (w, h), packed)
-        max_side = max(VIDEO_MAX_SIDE, 64)
-        if max(img.size) > max_side:
-            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        cap = max(max_side if max_side is not None else VIDEO_MAX_SIDE, 64)
+        if max(img.size) > cap:
+            img.thumbnail((cap, cap), Image.Resampling.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         jpeg = buf.getvalue()
@@ -57,10 +67,11 @@ def rgb_to_jpeg(raw: bytes, size: tuple[int, int], quality: int = 70) -> bytes |
 
 
 class FrameSampler:
-    """Keep the newest JPEG and emit at most VIDEO_FPS stills per second."""
+    """Emit at most ``fps`` JPEGs per second from the current LiveKit frame."""
 
-    def __init__(self, fps: float = VIDEO_FPS) -> None:
+    def __init__(self, fps: float = VIDEO_FPS, max_side: int | None = None) -> None:
         self.period = 1.0 / max(fps, 0.1)
+        self.max_side = VIDEO_MAX_SIDE if max_side is None else int(max_side)
         self._last = 0.0
         self._jpeg: bytes | None = None
         self._size = (0, 0)
@@ -68,16 +79,16 @@ class FrameSampler:
     def offer(self, raw: bytes, size: tuple[int, int], fmt: str = "RGB") -> bytes | None:
         if fmt.upper() not in {"RGB", "RGB24"}:
             return None
-        jpeg = rgb_to_jpeg(raw, size)
+        now = time.monotonic()
+        if now - self._last < self.period:
+            return None
+        jpeg = rgb_to_jpeg(raw, size, max_side=self.max_side)
         if not jpeg:
             return None
         self._jpeg = jpeg
         self._size = size
-        now = time.monotonic()
-        if now - self._last < self.period:
-            return None
         self._last = now
-        trace_stream("speech", "video.frame", bytes=len(jpeg), w=size[0], h=size[1])
+        trace_stream("speech", "video.frame", bytes=len(jpeg), w=size[0], h=size[1], fps=round(1.0 / self.period, 2))
         return jpeg
 
     @property

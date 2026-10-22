@@ -24,6 +24,26 @@ def is_minicpm(model: str | None = None) -> bool:
     return "minicpm" in name
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def system_prompt() -> str:
     return (
         os.environ.get("AGENT_SYSTEM_PROMPT")
@@ -48,7 +68,13 @@ class SpeechSession:
             self.engine = QwenOmniEngine(prompt)
         self.vad = EnergyVad()
         self.playout = ClockedPlayout()
-        self.frames = FrameSampler()
+        if self.minicpm:
+            self.frames = FrameSampler()
+        else:
+            self.frames = FrameSampler(
+                fps=_env_float("QWEN_VIDEO_FPS", 5.0),
+                max_side=_env_int("QWEN_VIDEO_MAX_SIDE", 448),
+            )
         self.bot: LiveKitBotRoom | None = None
         self._in_rs = LinearResampler(MODEL_RATE)
         self._running = False
@@ -152,10 +178,6 @@ class SpeechSession:
             if self.bot is not None:
                 self.bot.clear_source_queue()
             trace_stream("speech", "turn.barge_in", source="energy", identity=identity)
-        if edge == "stop" and not self.minicpm:
-            gen = getattr(self.engine, "generate", None)
-            if callable(gen):
-                await gen()
         if edge == "stop":
             trace_stream(
                 "speech",
@@ -177,6 +199,10 @@ class SpeechSession:
             identity=identity,
         )
         await self.engine.push_audio(pcm16, MODEL_RATE, is_speech=is_speech)
+        if edge == "stop" and not self.minicpm:
+            gen = getattr(self.engine, "generate", None)
+            if callable(gen):
+                await gen()
         if edge == "stop" and self.minicpm:
             end = getattr(self.engine, "end_of_speech", None)
             if callable(end):
