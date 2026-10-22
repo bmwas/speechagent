@@ -1,13 +1,27 @@
-# MiniCPM-o 4.5 duplex, three stages colocated on the one Ada GPU (cuda:0).
-# Thinker weights are ~17 GiB. gpu_memory_utilization 0.42 left 0 GiB for KV
-# after load and killed StageEngineCoreProc. 0.55 * 48 GiB ≈ 26 GiB so KV fits.
+# MiniCPM-o 4.5 native duplex, three stages colocated on the one Ada GPU.
+# Mirrors upstream vllm-omni @ 536daea1: minicpmo_4_5_duplex.yaml merged onto
+# minicpmo_4_5_batching.yaml, with only single-GPU memory tuning changed:
+#   stage0 util 0.55 + 4 GiB KV, stage1 0.15 + 2 GiB KV, stage2 0.18, eager.
+# Everything else (sampling, stop tokens, scheduling, session knobs) matches
+# the upstream duplex config exactly.
 pipeline: minicpmo_4_5
-async_chunk: true
 session_mode: duplex
-duplex_session:
-  max_sessions: 1
+active_stream_window: 1
+async_chunk: true
 trust_remote_code: true
 enable_prefix_caching: false
+
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  # Matches the Stage0/Stage1 sequence capacity below (one live session).
+  max_sessions: 1
+  completed_append_cache_size: 256
 
 connectors:
   connector_of_shared_memory:
@@ -25,11 +39,12 @@ stages:
     devices: "0"
     tensor_parallel_size: 1
     max_num_seqs: 1
-    max_model_len: 4096
-    max_num_batched_tokens: 4096
+    async_scheduling: false
     gpu_memory_utilization: 0.55
     kv_cache_memory_bytes: 4294967296
     enforce_eager: true
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
     interleave_mm_strings: true
     media_io_kwargs:
       video:
@@ -40,40 +55,54 @@ stages:
       audio: 8
       video: 1
     default_sampling_params:
-      temperature: 0.7
-      top_p: 0.9
-      max_tokens: 512
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
       detokenize: true
+      repetition_penalty: 1.1
 
   - stage_id: 1
     devices: "0"
     max_num_seqs: 1
-    max_model_len: 4096
-    max_num_batched_tokens: 4096
+    async_scheduling: false
     gpu_memory_utilization: 0.15
     kv_cache_memory_bytes: 2147483648
     enforce_eager: true
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
     output_connectors:
       to_stage_2: connector_of_shared_memory
+    # Split Talker exposes a binary continue/stop vocabulary; codec sampling
+    # is model-owned by the checkpoint tts_config. stop_token_ids [1] is
+    # required so segment/turn boundaries propagate to stage 2.
     default_sampling_params:
-      temperature: 0.8
-      top_p: 0.85
-      top_k: 25
-      repetition_penalty: 1.05
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
       min_tokens: 50
       max_tokens: 2048
+      stop_token_ids: [1]
+      seed: 42
       detokenize: false
 
   - stage_id: 2
     devices: "0"
     max_num_seqs: 1
+    async_scheduling: false
     gpu_memory_utilization: 0.18
     enforce_eager: true
+    enable_chunked_prefill: false
+    max_model_len: 65536
+    max_num_batched_tokens: 65536
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.0
-      max_tokens: 4096
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
       detokenize: true
 
 platforms:
