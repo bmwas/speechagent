@@ -249,6 +249,10 @@ class MiniCPMDuplexEngine:
             "acks_rx": self._acks_rx,
             "video_n": self._video_n,
             "video_pending": bool(self._video_pending),
+            "turn_audio_ms": self._turn_audio_ms,
+            "turn_deltas": self._turn_deltas,
+            "turn_max_gap_ms": self._turn_max_gap_ms,
+            "rtf": self._last_rtf,
         }
 
     def _eid(self) -> str:
@@ -459,11 +463,18 @@ class MiniCPMDuplexEngine:
                     )
                     if stalled and self._stall_rl.due():
                         gap = _age_ms(self._t_last_delta, now)
+                        gen_wall = _age_ms(self._turn_gen_t0, now) if self._turn_gen_t0 else 0
+                        rtf = round(self._turn_audio_ms / gen_wall, 2) if gen_wall > 0 else 0.0
                         trace_stream(
                             "speech",
                             "stream.stall",
                             where="duplex.delta",
                             gap_ms=gap,
+                            turn_deltas=self._turn_deltas,
+                            turn_audio_ms=self._turn_audio_ms,
+                            turn_max_gap_ms=self._turn_max_gap_ms,
+                            rtf=rtf,
+                            out_q=self._out.qsize(),
                             response_id=self._response_id[:16],
                         )
                         # Hung mid-utterance after context overflow: the server
@@ -589,13 +600,20 @@ class MiniCPMDuplexEngine:
                 trace_stream("speech", "duplex.text_delta", n=self._text_n, text=text, chars=len(text))
             return
         if typ in ("response.listen",) or ev.get("decision") == "listen":
+            now = time.monotonic()
+            since_delta_ms = _age_ms(self._t_last_delta, now)
+            since_speak_ms = _age_ms(self._t_speak, now) if self._t_speak else -1
             trace_stream(
                 "speech",
                 "duplex.listen",
                 response_id=self._response_id[:16],
                 turn_bytes=self._turn_bytes,
                 turn_deltas=self._turn_deltas,
+                turn_audio_ms=self._turn_audio_ms,
                 played_ms=self._played_ms,
+                since_delta_ms=since_delta_ms,
+                since_speak_ms=since_speak_ms,
+                was_speaking=self._speaking,
             )
             self._speaking = False
             return
@@ -610,7 +628,10 @@ class MiniCPMDuplexEngine:
             return
         if typ in ("response.done", "response.completed"):
             status = str((ev.get("response") or {}).get("status") or "")
-            speak_ms = _age_ms(self._t_speak, time.monotonic()) if self._t_speak else -1
+            now = time.monotonic()
+            speak_ms = _age_ms(self._t_speak, now) if self._t_speak else -1
+            gen_wall_ms = _age_ms(self._turn_gen_t0, now) if self._turn_gen_t0 else 0
+            rtf = round(self._turn_audio_ms / gen_wall_ms, 2) if gen_wall_ms > 0 else 0.0
             trace_stream(
                 "speech",
                 "duplex.response_done",
@@ -618,6 +639,9 @@ class MiniCPMDuplexEngine:
                 played_ms=self._played_ms,
                 turn_bytes=self._turn_bytes,
                 turn_deltas=self._turn_deltas,
+                turn_audio_ms=self._turn_audio_ms,
+                turn_max_gap_ms=self._turn_max_gap_ms,
+                rtf=rtf,
                 speak_ms=speak_ms,
                 response_id=self._response_id[:16],
             )
@@ -635,6 +659,15 @@ class MiniCPMDuplexEngine:
                 return
             low = err.lower()
             if "context_length" in low or "max_model_len" in low:
+                trace_stream(
+                    "speech",
+                    "duplex.context_overflow",
+                    error=err[:200],
+                    audio_end_ms=self._audio_end_ms,
+                    turn_deltas=self._turn_deltas,
+                    turn_audio_ms=self._turn_audio_ms,
+                    speaking=self._speaking,
+                )
                 self._request_reconnect(err[:80])
             return
         if typ in _SPEECH_START_TYPES:
@@ -902,6 +935,10 @@ class MiniCPMDuplexEngine:
                 "duplex.cancel",
                 was_speaking=was,
                 dropped_q=q,
+                turn_deltas=self._turn_deltas,
+                turn_audio_ms=self._turn_audio_ms,
+                turn_max_gap_ms=self._turn_max_gap_ms,
+                played_ms=self._played_ms,
                 response_id=self._response_id[:16],
             )
         except Exception as exc:

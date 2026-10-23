@@ -1,0 +1,338 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 2,
+  "links": [
+    { "title": "Agent logs", "type": "link", "url": "/d/speechagent-logs/agent-logs", "icon": "doc" },
+    { "title": "Realtime stream", "type": "link", "url": "/d/speechagent-stream/realtime-stream", "icon": "bolt" },
+    { "title": "Ada GPU", "type": "link", "url": "/d/speechagent-gpu/ada-gpu", "icon": "monitor" }
+  ],
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Audio pipeline health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "RTF (real-time factor) — must stay above 1.0",
+      "description": "Audio produced / wall time.  RTF < 1 = model slower than realtime = underruns are inevitable.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 4, "showPoints": "auto" },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.8 }, { "color": "green", "value": 1.0 } ] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "RTF",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"duplex.delta_timing\"} | json | unwrap rtf | __error__=\"\" [30s])"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Inter-delta gap (ms) — normal 200-400, HiFT eager 5000-30000",
+      "description": "Time between consecutive audio deltas.  Spikes above 4000 ms are HiFT eager fallback.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "bars", "fillOpacity": 30, "lineWidth": 1 },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "red", "value": 5000 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "gap_ms",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"duplex.delta_timing\"} | json | unwrap gap_ms | __error__=\"\" [15s])"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Playout ring buffer (ms)",
+      "description": "Audio sitting in the ring waiting to be played.  Drops to 0 = underrun.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 50 }, { "color": "green", "value": 150 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "health",
+          "legendFormat": "ring_ms (health)",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"stream.health\"} | json | unwrap ring_ms | __error__=\"\" [15s])"
+        },
+        {
+          "refId": "pull",
+          "legendFormat": "ring_ms (pull)",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"pull.chunk\"} | json | unwrap ring_ms | __error__=\"\" [15s])"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Underruns + stalls + cancels (count/min)",
+      "description": "Each of these is an audible disruption.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "cpm" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "underrun",
+          "legendFormat": "playout.underrun",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.underrun\"}[1m]))"
+        },
+        {
+          "refId": "stall",
+          "legendFormat": "stream.stall",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"stream.stall\"}[1m]))"
+        },
+        {
+          "refId": "cancel",
+          "legendFormat": "duplex.stall_cancel",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.stall_cancel\"}[1m]))"
+        },
+        {
+          "refId": "reconnect",
+          "legendFormat": "duplex.reconnect",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.reconnect\"}[1m]))"
+        },
+        {
+          "refId": "overflow",
+          "legendFormat": "context_overflow",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.context_overflow\"}[1m]))"
+        }
+      ]
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Per-turn stats",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "title": "Turn audio duration (ms) vs wall time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "audio",
+          "legendFormat": "turn_audio_ms",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"duplex.response_done\"} | json | unwrap turn_audio_ms | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "speak",
+          "legendFormat": "speak_ms (wall)",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"duplex.response_done\"} | json | unwrap speak_ms | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "max_gap",
+          "legendFormat": "turn_max_gap_ms",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"duplex.response_done\"} | json | unwrap turn_max_gap_ms | __error__=\"\" [1m])"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Playout turn summary",
+      "description": "Per-turn: frames played, silence frames, underrun episodes, longest underrun.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "longest",
+          "legendFormat": "longest_underrun_ms",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"playout.turn_summary\"} | json | unwrap longest_underrun_ms | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "total",
+          "legendFormat": "underrun_total_ms",
+          "expr": "sum_over_time({compose_project=\"speechagent\", event=\"playout.turn_summary\"} | json | unwrap underrun_total_ms | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "ring_min",
+          "legendFormat": "ring_ms_min",
+          "expr": "min_over_time({compose_project=\"speechagent\", event=\"playout.turn_summary\"} | json | unwrap ring_ms_min | __error__=\"\" [1m])"
+        }
+      ]
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Prebuffer + speaking state",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "title": "Prebuffer gate events",
+      "description": "resume = gate opened after prebuffer filled.  prebuffer-clear = gate reset by barge-in.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "cpm" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "resume",
+          "legendFormat": "playout.resume",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.resume\"}[1m]))"
+        },
+        {
+          "refId": "clear",
+          "legendFormat": "playout.clear",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.clear\"}[1m]))"
+        },
+        {
+          "refId": "first_frame",
+          "legendFormat": "playout.first_frame",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.first_frame\"}[1m]))"
+        },
+        {
+          "refId": "idle",
+          "legendFormat": "playout.idle",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.idle\"}[1m]))"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Speaking state transitions",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "cpm" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "speak",
+          "legendFormat": "duplex.speak",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=~\"duplex\\\\.speak\"}[1m]))"
+        },
+        {
+          "refId": "listen",
+          "legendFormat": "duplex.listen",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.listen\"}[1m]))"
+        },
+        {
+          "refId": "cancel",
+          "legendFormat": "duplex.cancel",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.cancel\"}[1m]))"
+        },
+        {
+          "refId": "barge",
+          "legendFormat": "turn.barge_in",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"turn.barge_in\"}[1m]))"
+        },
+        {
+          "refId": "done",
+          "legendFormat": "duplex.response_done",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.response_done\"}[1m]))"
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Raw diagnostic logs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "collapsed": false
+    },
+    {
+      "id": 9,
+      "title": "Delta timing (gap, dur, RTF per delta)",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 36 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"duplex\\\\.delta_timing|duplex\\\\.first_audio|duplex\\\\.response_done\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Playout events (underrun, resume, idle, clear, turn_summary)",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 36 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"playout\\\\.(underrun|recover|resume|idle|first_frame|clear|turn_summary|clock_slip|capture_timeout)\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Stalls + cancels + reconnects + context overflow",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 46 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"stream\\\\.stall|duplex\\\\.(stall_cancel|cancel|reconnect.*|context_overflow|ws_close)|error\\\\.(duplex.*|brain|playout.*)\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Pull loop + speak/listen transitions",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 46 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"pull\\\\.chunk|duplex\\\\.(speak|listen|response_done|response_created)|stream\\\\.(user_utt_start|user_utt_end)|turn\\\\.barge_in\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["speechagent", "audio", "debug"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "Audio pipeline debug",
+  "uid": "speechagent-audio-pipeline",
+  "version": 1
+}

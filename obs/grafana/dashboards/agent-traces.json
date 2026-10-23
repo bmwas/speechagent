@@ -21,6 +21,12 @@
       "type": "link",
       "url": "/d/speechagent-gpu/ada-gpu",
       "icon": "monitor"
+    },
+    {
+      "title": "Audio pipeline debug",
+      "type": "link",
+      "url": "/d/speechagent-audio-pipeline/audio-pipeline-debug",
+      "icon": "bug"
     }
   ],
   "panels": [
