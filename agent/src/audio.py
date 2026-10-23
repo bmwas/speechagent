@@ -1,4 +1,15 @@
-"""Resample, RMS, leading-silence trim, and a 20 ms LiveKit playout clock."""
+"""Resample, RMS, leading-silence trim, and a jitter-buffered LiveKit playout clock.
+
+Jitter buffer design matches the Runtype Persona AudioWorklet
+(DEFAULT_PREBUFFER_MS=150) and the OpenBMB MiniCPM-o Demo
+(playback_delay_ms=200).  MiniCPM-o emits ~1 s PCM chunks with
+200-400 ms gaps between them; HiFT eager-fallback on vLLM-Omni 0.30.0
+can pause 5-30 s between deltas (#5069 / #5657 warmup still pending).
+
+The prebuffer absorbs normal inter-chunk jitter.  PLAYOUT_HOLD_S
+fills silence during longer gaps so the turn does not end and
+trigger a fresh prebuffer cycle.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +21,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 
-from trace import trace_stream
+from trace import RateLimiter, trace_stream
 
 LOG = logging.getLogger("audio")
 
@@ -20,7 +31,20 @@ WEBRTC_FRAME_SAMPLES = WEBRTC_RATE // 50
 WEBRTC_FRAME_BYTES = WEBRTC_FRAME_SAMPLES * 2 * WEBRTC_CHANNELS
 MODEL_RATE = 16000
 FRAME_S = 0.020
-HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "0.40"))
+
+# --- Playout jitter buffer (env-tunable) ---
+# Prebuffer before the first frame of a new turn.  Runtype Persona
+# uses 150 ms for realtime server-paced audio; OpenBMB Demo uses 200 ms.
+PLAYOUT_START_MS = float(os.environ.get("PLAYOUT_START_MS", "150"))
+# Rebuffer after an underrun.  Runtype uses same as start (150).
+PLAYOUT_REBUFFER_MS = float(os.environ.get("PLAYOUT_REBUFFER_MS", "150"))
+# Safety cap: max ms the prebuffer gate can hold before flushing anyway.
+PLAYOUT_MAX_WAIT_MS = float(os.environ.get("PLAYOUT_MAX_WAIT_MS", "3000"))
+# After the last push, how long to fill silence before declaring idle.
+# Must be long enough to bridge HiFT eager-fallback gaps (5-30 s) so the
+# turn stays open and does not trigger a fresh prebuffer cycle.
+HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "2.0"))
+
 CAPTURE_TIMEOUT_S = float(os.environ.get("PLAYOUT_CAPTURE_TIMEOUT_S", "0.08"))
 STATS_EVERY_S = 5.0
 SILENCE_RMS = int(os.environ.get("LEADING_SILENCE_RMS", "80"))
@@ -117,7 +141,17 @@ def trim_leading_silence(pcm: bytes, rms_floor: int = SILENCE_RMS, win: int = 32
 
 
 class ClockedPlayout:
-    """48 kHz ring + 20 ms ticker. Producer never awaits LiveKit."""
+    """48 kHz ring + 20 ms ticker with jitter-buffered prebuffer gate.
+
+    Producer (playback loop) calls push(); the 20 ms clock calls take_frame()
+    which either returns real audio or silence (during prebuffer / underrun
+    hold) or None (idle — no audio pending).
+
+    The prebuffer gate holds real audio and feeds silence until the ring
+    reaches the waterline, then releases.  On underrun it re-enters buffering
+    at the rebuffer waterline.  This matches the Runtype Persona AudioWorklet
+    pattern (waterline → play → underrun → re-buffer → play).
+    """
 
     def __init__(self) -> None:
         self._ring = bytearray()
@@ -136,6 +170,31 @@ class ClockedPlayout:
         self._first_push = True
         self._underrun_open = False
         self._first_frame = False
+        # Jitter buffer state.  Start "buffering": hold real audio until the
+        # ring reaches the prebuffer target, feeding silence to keep the clock
+        # warm.
+        self._buffering = True
+        self._buf_target_ms = PLAYOUT_START_MS
+        self._buffering_t0 = 0.0
+        # Set each tick by the playback loop: True while the model is producing.
+        # When it goes False we flush whatever is buffered (short-reply tail).
+        self.source_active = False
+        # Per-turn diagnostics (bounded by idle / clear).
+        self._turn_open = False
+        self._turn_frames = 0
+        self._turn_silence = 0
+        self._underrun_episodes = 0
+        self._underrun_total_ms = 0.0
+        self._longest_underrun_ms = 0.0
+        self._ring_ms_min = -1.0
+        self._underrun_t0 = 0.0
+        self._underrun_frames = 0
+        self.underruns_total = 0
+        # Clock-slip diagnostics.
+        self._slip_max_ms = 0.0
+        self._late_ticks = 0
+        self._slip_rl = RateLimiter(2.0)
+        self._capto_rl = RateLimiter(2.0)
 
     @property
     def ring_ms(self) -> float:
@@ -159,7 +218,37 @@ class ClockedPlayout:
         self._last_push = time.monotonic()
         self._active = True
 
+    def _reset_turn_stats(self) -> None:
+        self._turn_frames = 0
+        self._turn_silence = 0
+        self._underrun_episodes = 0
+        self._underrun_total_ms = 0.0
+        self._longest_underrun_ms = 0.0
+        self._ring_ms_min = -1.0
+        self._underrun_open = False
+        self._underrun_t0 = 0.0
+        self._underrun_frames = 0
+
+    def _emit_turn_summary(self, reason: str) -> None:
+        if self._turn_frames <= 0:
+            return
+        trace_stream(
+            "speech",
+            "playout.turn_summary",
+            reason=reason,
+            frames=self._turn_frames,
+            silence_frames=self._turn_silence,
+            underrun_episodes=self._underrun_episodes,
+            underrun_total_ms=int(self._underrun_total_ms),
+            longest_underrun_ms=int(self._longest_underrun_ms),
+            ring_ms_min=round(self._ring_ms_min, 1) if self._ring_ms_min >= 0 else -1,
+        )
+
     def clear(self) -> None:
+        if self._turn_open:
+            self._emit_turn_summary("clear")
+            self._turn_open = False
+        self._reset_turn_stats()
         self._ring.clear()
         self._resampler = None
         self._active = False
@@ -168,41 +257,116 @@ class ClockedPlayout:
         self.clears += 1
         self._underrun_open = False
         self._first_frame = False
+        self._buffering = True
+        self._buf_target_ms = PLAYOUT_START_MS
+        self._buffering_t0 = 0.0
         trace_stream("speech", "playout.clear", clears=self.clears)
 
     def take_frame(self, now: float | None = None) -> bytes | None:
         now = time.monotonic() if now is None else now
         need = WEBRTC_FRAME_BYTES
+
+        # --- Jitter buffer gate: while buffering, hold real audio and feed
+        # silence until the ring reaches the target (or the source stops, or
+        # we hit the safety cap).  This is what makes playback smooth. ---
+        if self._buffering and self._ring:
+            fill_ms = self.ring_ms
+            if self._buffering_t0 == 0.0:
+                self._buffering_t0 = now
+            waited_ms = (now - self._buffering_t0) * 1000.0
+            ready = (
+                fill_ms >= self._buf_target_ms
+                or not self.source_active
+                or waited_ms >= PLAYOUT_MAX_WAIT_MS
+            )
+            if not ready:
+                self.silence_frames += 1
+                return self._silence
+            self._buffering = False
+            self._buffering_t0 = 0.0
+            trace_stream(
+                "speech",
+                "playout.resume",
+                ring_ms=round(fill_ms, 1),
+                target_ms=int(self._buf_target_ms),
+                waited_ms=int(waited_ms),
+                source_active=self.source_active,
+            )
+
         if len(self._ring) >= need:
             frame = bytes(self._ring[:need])
             del self._ring[:need]
             self.frames += 1
             self._active = True
+            if not self._turn_open:
+                self._turn_open = True
+                self._reset_turn_stats()
+            self._turn_frames += 1
+            rm = self.ring_ms
+            if self._ring_ms_min < 0 or rm < self._ring_ms_min:
+                self._ring_ms_min = rm
             if self._underrun_open:
                 self._underrun_open = False
-                trace_stream("speech", "playout.recover", ring_ms=round(self.ring_ms, 1))
+                episode_ms = (now - self._underrun_t0) * 1000.0 if self._underrun_t0 else 0.0
+                self._underrun_total_ms += episode_ms
+                if episode_ms > self._longest_underrun_ms:
+                    self._longest_underrun_ms = episode_ms
+                trace_stream(
+                    "speech",
+                    "playout.recover",
+                    ring_ms=round(rm, 1),
+                    underrun_ms=int(episode_ms),
+                    silence_frames_episode=self._underrun_frames,
+                )
             if not self._first_frame:
                 self._first_frame = True
-                trace_stream("speech", "playout.first_frame", bytes=len(frame), ring_ms=round(self.ring_ms, 1))
+                trace_stream("speech", "playout.first_frame", bytes=len(frame), ring_ms=round(rm, 1))
             return frame
+
         if self._ring:
             frame = bytes(self._ring) + self._silence[len(self._ring) :]
             self._ring.clear()
             self.frames += 1
+            if not self._turn_open:
+                self._turn_open = True
+                self._reset_turn_stats()
+            self._turn_frames += 1
             return frame[:need]
+
         if self._active and self._last_push and (now - self._last_push) <= HOLD_SILENCE_S:
             self.silence_frames += 1
+            self._turn_silence += 1
             if not self._underrun_open:
                 self._underrun_open = True
+                self._underrun_episodes += 1
+                self.underruns_total += 1
+                self._underrun_t0 = now
+                self._underrun_frames = 0
+                # Enter re-buffer mode so the next batch of audio accumulates
+                # before we start draining again.
+                if not self._buffering:
+                    self._buffering = True
+                    self._buf_target_ms = PLAYOUT_REBUFFER_MS
+                    self._buffering_t0 = now
                 trace_stream(
                     "speech",
                     "playout.underrun",
                     hold=True,
                     since_push_ms=int((now - self._last_push) * 1000),
+                    episode=self._underrun_episodes,
                 )
+            self._underrun_frames += 1
             return self._silence
+
         if self._active:
-            trace_stream("speech", "playout.idle", since_push_ms=int((now - self._last_push) * 1000) if self._last_push else -1)
+            trace_stream(
+                "speech",
+                "playout.idle",
+                since_push_ms=int((now - self._last_push) * 1000) if self._last_push else -1,
+            )
+            if self._turn_open:
+                self._emit_turn_summary("idle")
+                self._turn_open = False
         self._active = False
         self._underrun_open = False
         self.idle_ticks += 1
@@ -225,12 +389,17 @@ class ClockedPlayout:
             clock_slips=self.clock_slips,
             clears=self.clears,
             underrun=underrun,
+            underrun_episodes=self._underrun_episodes,
+            slip_max_ms=int(self._slip_max_ms),
+            late_ticks=self._late_ticks,
         )
         self.frames = 0
         self.silence_frames = 0
         self.idle_ticks = 0
         self.capture_timeouts = 0
         self.clock_slips = 0
+        self._slip_max_ms = 0.0
+        self._late_ticks = 0
 
     async def run(self, capture: Callable[[bytes, int], Awaitable[None]]) -> None:
         self._running = True
@@ -244,7 +413,12 @@ class ClockedPlayout:
                         await asyncio.wait_for(capture(frame, WEBRTC_RATE), timeout=CAPTURE_TIMEOUT_S)
                     except TimeoutError:
                         self.capture_timeouts += 1
-                        trace_stream("speech", "playout.block", block_ms=int(CAPTURE_TIMEOUT_S * 1000), where="capture_timeout")
+                        if self._capto_rl.due():
+                            trace_stream(
+                                "speech",
+                                "playout.capture_timeout",
+                                ms=int(CAPTURE_TIMEOUT_S * 1000),
+                            )
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -258,9 +432,21 @@ class ClockedPlayout:
                 delay = next_t - time.monotonic()
                 if delay > 0:
                     await asyncio.sleep(delay)
-                elif delay < -0.10:
-                    self.clock_slips += 1
-                    next_t = time.monotonic()
+                else:
+                    late_ms = -delay * 1000.0
+                    if late_ms > self._slip_max_ms:
+                        self._slip_max_ms = late_ms
+                    self._late_ticks += 1
+                    if self._slip_rl.due():
+                        trace_stream(
+                            "speech",
+                            "playout.clock_slip",
+                            late_ms=int(late_ms),
+                            late_ticks=self._late_ticks,
+                        )
+                    if delay < -0.10:
+                        self.clock_slips += 1
+                        next_t = time.monotonic()
         except asyncio.CancelledError:
             raise
         finally:

@@ -13,7 +13,7 @@ from duplex_model import MiniCPMDuplexEngine
 from livekit_room import LiveKitBotRoom, cancel_task_robust
 from qwen_omni import QwenOmniEngine
 from tokens import BOT_IDENTITY, token_for_bot
-from trace import StreamMeter, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
+from trace import RateLimiter, StreamMeter, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
 from video import FrameSampler
 
 LOG = logging.getLogger("agent")
@@ -96,6 +96,9 @@ class SpeechSession:
         self._gap_open = False
         self._pull_n = 0
         self._pull_bytes = 0
+        self._pull_last_t = 0.0
+        self._empty_polls = 0
+        self._pull_chunk_rl = RateLimiter(2.0)
         self._mic_meter = StreamMeter("speech", "stream.mic_in", kind="in")
         self._pull_meter = StreamMeter("speech", "stream.playout_pull", kind="out")
 
@@ -227,14 +230,41 @@ class SpeechSession:
             while self._running:
                 chunks = await self.engine.pull_audio()
                 pulled = 0
+                # Tell the jitter buffer whether the model is still producing,
+                # so it waits for the prebuffer while generating but flushes the
+                # tail of a short reply immediately when generation stops.
+                self.playout.source_active = bool(getattr(self.engine, "generating", False))
                 for pcm, rate in chunks:
                     self.vad.bot_playing = True
                     self.playout.push(pcm, int(rate) or 24000)
                     pulled += len(pcm)
                 if pulled:
+                    now = time.monotonic()
+                    pull_gap_ms = int((now - self._pull_last_t) * 1000) if self._pull_last_t else -1
+                    self._pull_last_t = now
                     self._pull_n += 1
                     self._pull_bytes += pulled
-                    self._pull_meter.add(chunks=len(chunks), bytes=pulled, ring_ms=self.playout.ring_ms)
+                    ring_ms = self.playout.ring_ms
+                    self._pull_meter.add(
+                        chunks=len(chunks),
+                        bytes=pulled,
+                        ring_ms=ring_ms,
+                        pull_gap_ms=pull_gap_ms,
+                        empty_polls=self._empty_polls,
+                    )
+                    if self._pull_n <= 5 or pull_gap_ms >= 250 or self._pull_chunk_rl.due():
+                        trace_stream(
+                            "speech",
+                            "pull.chunk",
+                            pull_gap_ms=pull_gap_ms,
+                            empty_polls=self._empty_polls,
+                            chunks=len(chunks),
+                            bytes=pulled,
+                            ring_ms=round(ring_ms, 1),
+                        )
+                    self._empty_polls = 0
+                elif getattr(self.engine, "generating", False):
+                    self._empty_polls += 1
                 if not chunks and not getattr(self.engine, "generating", False):
                     self.vad.bot_playing = False
                 await asyncio.sleep(0.01)
@@ -272,6 +302,7 @@ class SpeechSession:
                         "vad_rms": self.vad.last_rms,
                         "bot_playing": self.vad.bot_playing,
                         "ring_ms": round(self.playout.ring_ms, 1),
+                        "underruns_total": getattr(self.playout, "underruns_total", 0),
                         "lk_mic_age_ms": mic_age_ms,
                         "mic_first": self._mic_first,
                         "pull_n": self._pull_n,

@@ -18,6 +18,11 @@ from trace import RateLimiter, StreamMeter, TypeCounter, trace_exc, trace_stream
 
 LOG = logging.getLogger("duplex")
 CHUNK_MS = int(os.environ.get("AUDIO_CHUNK_MS", "100"))
+# How long (ms) to tolerate no audio delta before cancelling + reconnecting.
+# HiFT eager-fallback on vLLM-Omni 0.30.0 produces 5–30 s gaps between
+# deltas on live turns; the vocoder DOES come back. Set high enough to ride
+# those out, low enough to recover from true zombie sessions.
+STALL_CANCEL_MS = int(os.environ.get("STALL_CANCEL_MS", "20000"))
 
 _AUDIO_DELTA_TYPES = frozenset(
     {
@@ -192,6 +197,11 @@ class MiniCPMDuplexEngine:
         self._delta_bytes = 0
         self._turn_deltas = 0
         self._turn_bytes = 0
+        self._turn_audio_ms = 0
+        self._turn_max_gap_ms = -1
+        self._turn_gen_t0 = 0.0
+        self._last_rtf = 0.0
+        self._delta_timing_rl = RateLimiter(2.0)
         self._text_n = 0
         self._bin_n = 0
         self._acks_tx = 0
@@ -311,7 +321,7 @@ class MiniCPMDuplexEngine:
             "ref_audio": ref,
             "extra_body": {
                 "auto_response": True,
-                "force_listen_count": 3,
+                "force_listen_count": 0,
                 "ref_audio": ref,
                 "sliding_window_mode": "basic",
                 "basic_window_high_tokens": 3000,
@@ -459,7 +469,9 @@ class MiniCPMDuplexEngine:
                         # Hung mid-utterance after context overflow: the server
                         # drops the error and leaves a zombie session that then
                         # speaks Chinese (system prefix gone). Reopen.
-                        if gap >= 4000:
+                        # HiFT eager-fallback gaps are 5–30 s; only cancel
+                        # after STALL_CANCEL_MS to avoid chopping real speech.
+                        if gap >= STALL_CANCEL_MS:
                             trace_stream(
                                 "speech",
                                 "duplex.stall_cancel",
@@ -552,6 +564,9 @@ class MiniCPMDuplexEngine:
             self._t_speak = time.monotonic()
             self._turn_deltas = 0
             self._turn_bytes = 0
+            self._turn_audio_ms = 0
+            self._turn_max_gap_ms = -1
+            self._turn_gen_t0 = 0.0
             if typ == "response.speak":
                 self._speaking = True
                 from_speech = _age_ms(self._t_user_speech, self._t_speak)
@@ -660,13 +675,20 @@ class MiniCPMDuplexEngine:
             pcm = pcm[44:]
         now = time.monotonic()
         first = (not self._speaking) or self._turn_deltas == 0
+        # Inter-delta gap: time the ring sat waiting for this delta.
+        gap_ms = -1 if first else _age_ms(self._t_last_delta, now)
+        dur_ms = int(1000.0 * (len(pcm) / 2.0) / max(self._out_rate, 1))
         self._speaking = True
         self._delta_n += 1
         self._delta_bytes += len(pcm)
         self._turn_deltas += 1
         self._turn_bytes += len(pcm)
+        self._turn_audio_ms += dur_ms
+        if gap_ms > self._turn_max_gap_ms:
+            self._turn_max_gap_ms = gap_ms
         self._t_last_delta = now
         if first:
+            self._turn_gen_t0 = now
             lat = _age_ms(self._t_speak, now) if self._t_speak else -1
             from_speech = _age_ms(self._t_user_speech, now)
             from_ready = _age_ms(self._t_ready, now)
@@ -682,8 +704,26 @@ class MiniCPMDuplexEngine:
                 qsize=self._out.qsize() + 1,
             )
             if lat >= 0:
-                # Keep the older event name so existing Grafana panels still plot.
                 trace_stream("speech", "duplex.speak", latency_ms=lat, bytes=len(pcm), first_audio=True)
+        # RTF = audio produced / wall time since first delta.  RTF < 1 means
+        # the model emits slower than real time — underruns are fundamental.
+        gen_wall_ms = _age_ms(self._turn_gen_t0, now) if self._turn_gen_t0 else 0
+        rtf = round(self._turn_audio_ms / gen_wall_ms, 2) if gen_wall_ms > 0 else 0.0
+        self._last_rtf = rtf
+        if self._turn_deltas <= 5 or gap_ms >= 250 or self._delta_timing_rl.due():
+            trace_stream(
+                "speech",
+                "duplex.delta_timing",
+                gap_ms=gap_ms,
+                dur_ms=dur_ms,
+                bytes=len(pcm),
+                qsize=self._out.qsize() + 1,
+                turn_audio_ms=self._turn_audio_ms,
+                gen_wall_ms=gen_wall_ms,
+                rtf=rtf,
+                deltas=self._turn_deltas,
+                response_id=self._response_id[:16],
+            )
         self._delta_meter.add(deltas=1, bytes=len(pcm), qsize=self._out.qsize() + 1, rms=pcm_rms(pcm))
         await self._out.put((pcm, self._out_rate))
 
