@@ -14,6 +14,7 @@ from typing import Any
 import websockets
 
 from audio import MODEL_RATE, pcm_rms
+from session_watchdog import TurnWatchdog
 from trace import RateLimiter, StreamMeter, TypeCounter, hires_enabled, trace_exc, trace_stream
 
 LOG = logging.getLogger("duplex")
@@ -220,7 +221,9 @@ class MiniCPMDuplexEngine:
         self._mic_drop_rl = RateLimiter(1.0)
         self._listen_duplicates = 0
         self._watchdog: asyncio.Task | None = None
+        self._turn = TurnWatchdog()
         self._reconnect_reason = ""
+        self._last_reconnect_reason = ""
         self._last_reconnect = 0.0
         self._closing = False
 
@@ -257,6 +260,8 @@ class MiniCPMDuplexEngine:
             "turn_deltas": self._turn_deltas,
             "turn_max_gap_ms": self._turn_max_gap_ms,
             "rtf": self._last_rtf,
+            "reconnect_reason": self._last_reconnect_reason[:80],
+            **self._turn.snapshot(now),
         }
 
     def _eid(self) -> str:
@@ -372,24 +377,67 @@ class MiniCPMDuplexEngine:
             raise RuntimeError(f"duplex handshake failed: {self._handshake_error}")
         if not self._ready.is_set():
             raise RuntimeError("model-server never sent session.created")
+        generation = self._turn.note_session()
+        trace_stream(
+            "speech",
+            "duplex.session_ready",
+            session_generation=generation,
+            reconnect_reason=self._last_reconnect_reason[:80],
+        )
         self._hb = asyncio.create_task(self._heartbeat())
 
     def _request_reconnect(self, reason: str) -> None:
         if self._closing or self._reconnect_reason:
             return
         self._reconnect_reason = reason[:120]
-        trace_stream("speech", "duplex.reconnect_request", reason=self._reconnect_reason)
+        self._last_reconnect_reason = self._reconnect_reason
+        trace_stream(
+            "speech",
+            "duplex.reconnect_request",
+            reason=self._reconnect_reason,
+            session_generation=self._turn.generation,
+            turn_waiting=self._turn.armed,
+        )
+
+    def _note_decision(self, kind: str) -> None:
+        now = time.monotonic()
+        if not self._turn.clear(now, kind):
+            return
+        wait_ms = _age_ms(self._turn.t_commit, now) if self._turn.t_commit else -1
+        trace_stream(
+            "speech",
+            "duplex.turn_decision",
+            decision=kind,
+            commit_to_decision_ms=wait_ms,
+            session_generation=self._turn.generation,
+        )
 
     async def _watchdog_loop(self) -> None:
         try:
             while not self._closing:
                 await asyncio.sleep(0.5)
+                now = time.monotonic()
+                timeout_reason = self._turn.poll(now)
+                if timeout_reason:
+                    wait_ms = _age_ms(self._turn.t_commit, now)
+                    self._ready.clear()
+                    trace_stream(
+                        "speech",
+                        "duplex.dead_session",
+                        reason=timeout_reason,
+                        commit_age_ms=wait_ms,
+                        session_generation=self._turn.generation,
+                        ws_open=self._ws is not None,
+                    )
+                    self._request_reconnect(timeout_reason)
                 reason = self._reconnect_reason
                 if not reason:
                     continue
-                now = time.monotonic()
-                if now - self._last_reconnect < 15.0:
-                    self._reconnect_reason = ""
+                dead = reason.startswith("decision_timeout") or reason == "hidden_state_crash"
+                cooldown = 2.0 if dead else 15.0
+                if now - self._last_reconnect < cooldown:
+                    if not dead:
+                        self._reconnect_reason = ""
                     continue
                 self._reconnect_reason = ""
                 self._last_reconnect = now
@@ -401,13 +449,23 @@ class MiniCPMDuplexEngine:
             raise
 
     async def _reconnect(self, reason: str) -> None:
-        trace_stream("speech", "duplex.reconnect", reason=reason)
+        trace_stream(
+            "speech",
+            "duplex.reconnect",
+            reason=reason,
+            session_generation=self._turn.generation,
+        )
         self._ready.clear()
         self._speaking = False
         await self._teardown_socket(cancel_watchdog=False)
         self._reset_stream_state()
         await self._connect_and_handshake()
-        trace_stream("speech", "duplex.reconnected", reason=reason)
+        trace_stream(
+            "speech",
+            "duplex.reconnected",
+            reason=reason,
+            session_generation=self._turn.generation,
+        )
 
     def _reset_stream_state(self) -> None:
         self._buf.clear()
@@ -421,6 +479,7 @@ class MiniCPMDuplexEngine:
         self._response_id = ""
         self._t_last_delta = 0.0
         self._t_speak = 0.0
+        self._turn.reset_turn()
         while not self._out.empty():
             try:
                 self._out.get_nowait()
@@ -607,6 +666,7 @@ class MiniCPMDuplexEngine:
             self._turn_max_gap_ms = -1
             self._turn_gen_t0 = 0.0
             self._listen_duplicates = 0
+            self._note_decision("speak" if typ == "response.speak" else "created")
             if typ == "response.speak":
                 self._speaking = True
                 from_speech = _age_ms(self._t_user_speech, self._t_speak)
@@ -634,6 +694,7 @@ class MiniCPMDuplexEngine:
             since_speak_ms = _age_ms(self._t_speak, now) if self._t_speak else -1
             was_speaking = self._speaking
             self._speaking = False
+            self._note_decision("listen")
             if was_speaking:
                 self._listen_duplicates = 0
             else:
@@ -689,12 +750,14 @@ class MiniCPMDuplexEngine:
                 response_id=self._response_id[:16],
             )
             self._speaking = False
+            self._note_decision("done")
             return
         if typ in ("error", "response.error"):
             summary = _ev_summary(ev)
             summary.pop("type", None)
             summary.pop("error", None)
             err = _err_text(ev)
+            self._note_decision("error")
             trace_stream("speech", "error.duplex", error=err, type=typ, **summary)
             if not self._ready.is_set():
                 self._handshake_error = err
@@ -712,6 +775,18 @@ class MiniCPMDuplexEngine:
                     speaking=self._speaking,
                 )
                 self._request_reconnect(err[:80])
+                return
+            if "hidden states" in low or "own-token" in low:
+                self._ready.clear()
+                trace_stream(
+                    "speech",
+                    "duplex.dead_session",
+                    reason="hidden_state_crash",
+                    error=err[:200],
+                    session_generation=self._turn.generation,
+                    ws_open=self._ws is not None,
+                )
+                self._request_reconnect("hidden_state_crash")
             return
         if typ in _SPEECH_START_TYPES:
             trace_stream("speech", "duplex.model_speech_start", ev_type=typ, keys=",".join(list(ev.keys())[:12]))
@@ -765,6 +840,7 @@ class MiniCPMDuplexEngine:
         self._t_last_delta = now
         if first:
             self._turn_gen_t0 = now
+            self._note_decision("first_audio")
             lat = _age_ms(self._t_speak, now) if self._t_speak else -1
             from_speech = _age_ms(self._t_user_speech, now)
             from_ready = _age_ms(self._t_ready, now)
@@ -860,7 +936,16 @@ class MiniCPMDuplexEngine:
             return
         self._commit_pending = False
         await self._send({"type": "input_audio_buffer.commit"})
-        trace_stream("speech", "duplex.commit", audio_end_ms=self._audio_end_ms)
+        now = time.monotonic()
+        self._turn.arm(now)
+        trace_stream(
+            "speech",
+            "duplex.commit",
+            audio_end_ms=self._audio_end_ms,
+            session_generation=self._turn.generation,
+            turn_waiting=True,
+            decision_timeout_ms=self._turn.timeout_ms,
+        )
 
     async def _append(self, pcm16: bytes, is_speech: bool = True, *, force_video: bool = False) -> None:
         if self._ws is None:
@@ -987,6 +1072,7 @@ class MiniCPMDuplexEngine:
         was = self._speaking
         q = self._out.qsize()
         self._speaking = False
+        self._note_decision("cancel")
         while not self._out.empty():
             try:
                 self._out.get_nowait()

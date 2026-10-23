@@ -129,6 +129,11 @@
           "refId": "overflow",
           "legendFormat": "context_overflow",
           "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.context_overflow\"}[1m]))"
+        },
+        {
+          "refId": "dead",
+          "legendFormat": "duplex.dead_session",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.dead_session\"}[1m]))"
         }
       ]
     },
@@ -309,7 +314,7 @@
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\", event=~\"stream\\\\.stall|duplex\\\\.(stall_cancel|cancel|reconnect.*|context_overflow|ws_close)|error\\\\.(duplex.*|brain|playout.*)\"}",
+          "expr": "{compose_project=\"speechagent\", event=~\"stream\\\\.stall|duplex\\\\.(stall_cancel|cancel|reconnect.*|context_overflow|ws_close|dead_session|turn_decision|session_ready)|error\\\\.(duplex.*|brain|playout.*)\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -626,6 +631,75 @@
           "queryType": "range",
           "refId": "A",
           "maxLines": 10000
+        }
+      ]
+    },
+    {
+      "id": 106,
+      "type": "row",
+      "title": "Dead-session recovery",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 150 },
+      "collapsed": false
+    },
+    {
+      "id": 28,
+      "title": "Commit to model decision (ms)",
+      "description": "Time from input_audio_buffer.commit to listen/speak/first-audio/error. Native listen is a valid decision.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 151 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "avg",
+          "legendFormat": "avg commit→decision",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"duplex.turn_decision\"} | json | unwrap commit_to_decision_ms | __error__=\"\" [1m])"
+        },
+        {
+          "refId": "max",
+          "legendFormat": "max commit→decision",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"duplex.turn_decision\"} | json | unwrap commit_to_decision_ms | __error__=\"\" [1m])"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "title": "Dead-session reconnects + hidden-state crashes",
+      "description": "Client watchdog reconnects when a commit gets no listen/speak/audio. Hidden-state errors come from the model-server log.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 151 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "cpm" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "dead",
+          "legendFormat": "duplex.dead_session",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.dead_session\"}[1m]))"
+        },
+        {
+          "refId": "reconnect",
+          "legendFormat": "duplex.reconnect",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"duplex.reconnect\"}[1m]))"
+        },
+        {
+          "refId": "hidden",
+          "legendFormat": "missing own-token hidden states",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\"} |= \"missing own-token hidden states\" [1m]))"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "Dead-session + hidden-state logs",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 159 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\"} |~ \"duplex\\\\.(dead_session|turn_decision|reconnect|session_ready)|missing own-token hidden states\"",
+          "queryType": "range",
+          "refId": "A"
         }
       ]
     }
