@@ -138,6 +138,12 @@ case "${MODEL}" in
   *MiniCPM*|*minicpm*)
     DEPLOY="$(find_yaml minicpmo_4_5.yaml || true)"
     install_minicpm_vocoder
+    if [ "${MINICPM_REQUIRE_RESPONSE:-1}" != "0" ]; then
+      echo "model-server applying MiniCPM require-response patch (MINICPM_REQUIRE_RESPONSE=${MINICPM_REQUIRE_RESPONSE:-1})"
+    else
+      echo "model-server MiniCPM require-response kill switch is off; still installing no-op-capable patch"
+    fi
+    python /patches/apply.py
     ;;
   *Qwen2.5-Omni*|*qwen2.5-omni*|*Qwen2_5*)
     DEPLOY="$(find_yaml qwen2_5_omni.yaml || true)"

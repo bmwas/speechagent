@@ -158,10 +158,12 @@ services:
       # children would look for cuda:1, fall back to CPU, and report 0.0 GiB KV.
       CUDA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      MINICPM_REQUIRE_RESPONSE: "${MINICPM_REQUIRE_RESPONSE:-1}"
     volumes:
       - ./models:/models
       - ./model-server/entrypoint.sh:/entrypoint.sh:ro
       - ./model-server/deploy:/deploy:ro
+      - ./model-server/patches:/patches:ro
     ports: ["${MODEL_PORT:-8199}:${MODEL_PORT:-8199}"]
     shm_size: "8gb"
     ipc: host
@@ -208,6 +210,8 @@ services:
       VIDEO_FPS: ${VIDEO_FPS:-1}
       VIDEO_MAX_SIDE: ${VIDEO_MAX_SIDE:-448}
       AUDIO_CHUNK_MS: ${AUDIO_CHUNK_MS:-100}
+      MINICPM_REQUIRE_RESPONSE: ${MINICPM_REQUIRE_RESPONSE:-1}
+      MINICPM_UNANSWERED_MS: ${MINICPM_UNANSWERED_MS:-8000}
       QWEN_VIDEO_FPS: ${QWEN_VIDEO_FPS:-5}
       QWEN_VIDEO_NUM_FRAMES: ${QWEN_VIDEO_NUM_FRAMES:-40}
       QWEN_VIDEO_MAX_FRAMES: ${QWEN_VIDEO_MAX_FRAMES:-50}
