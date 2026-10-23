@@ -296,7 +296,11 @@ See [`.env`](.env). Important knobs:
 | `FREE_ADA_GPU` | `1` | Stop other Ada GPU users before vLLM loads |
 | `MODEL_NAME` | `openbmb/MiniCPM-o-4_5` | Which omni weights to load |
 | `HUGGINGFACE_TOKEN` | bashrc | Hub auth for weight download. Read from the GPU-box shell, not `.env` |
-| `AUDIO_SOURCE_QUEUE_MS` | `120` | LiveKit speaker queue depth |
+| `AUDIO_SOURCE_QUEUE_MS` | `80` | LiveKit speaker queue depth |
+| `PLAYOUT_HOLD_S` | `0.25` | Brief silence bridge after real audio drains; longer stalls are treated as idle |
+| `PLAYOUT_MAX_WAIT_MS` | `300` | Maximum prebuffer wait for a short delta that cannot reach the 150 ms waterline |
+| `BOT_AUDIBLE_GRACE_MS` | `120` | Recent-real-audio window used for barge-in detection |
+| `STALL_CANCEL_MS` | `45000` | Last-resort cancellation threshold for a genuinely stuck model response |
 | `VAD_STOP_SECS` | `0.80` | Silence before a Qwen turn ends |
 | `VIDEO_FPS` | `1` | MiniCPM-o camera cadence (~1 JPEG per 1 s audio unit). Do not raise this for Qwen. |
 | `VIDEO_MAX_SIDE` | `448` | MiniCPM JPEG long-side cap so vision tokens fit the sliding window |

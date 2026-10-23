@@ -22,7 +22,7 @@ CHUNK_MS = int(os.environ.get("AUDIO_CHUNK_MS", "100"))
 # HiFT eager-fallback on vLLM-Omni 0.30.0 produces 5–30 s gaps between
 # deltas on live turns; the vocoder DOES come back. Set high enough to ride
 # those out, low enough to recover from true zombie sessions.
-STALL_CANCEL_MS = int(os.environ.get("STALL_CANCEL_MS", "20000"))
+STALL_CANCEL_MS = int(os.environ.get("STALL_CANCEL_MS", "45000"))
 
 _AUDIO_DELTA_TYPES = frozenset(
     {
@@ -218,6 +218,7 @@ class MiniCPMDuplexEngine:
         self._stall_rl = RateLimiter(2.0)
         self._ws_tx_rl = RateLimiter(1.0)
         self._mic_drop_rl = RateLimiter(1.0)
+        self._listen_duplicates = 0
         self._watchdog: asyncio.Task | None = None
         self._reconnect_reason = ""
         self._last_reconnect = 0.0
@@ -604,6 +605,7 @@ class MiniCPMDuplexEngine:
             self._turn_audio_ms = 0
             self._turn_max_gap_ms = -1
             self._turn_gen_t0 = 0.0
+            self._listen_duplicates = 0
             if typ == "response.speak":
                 self._speaking = True
                 from_speech = _age_ms(self._t_user_speech, self._t_speak)
@@ -629,19 +631,33 @@ class MiniCPMDuplexEngine:
             now = time.monotonic()
             since_delta_ms = _age_ms(self._t_last_delta, now)
             since_speak_ms = _age_ms(self._t_speak, now) if self._t_speak else -1
-            trace_stream(
-                "speech",
-                "duplex.listen",
-                response_id=self._response_id[:16],
-                turn_bytes=self._turn_bytes,
-                turn_deltas=self._turn_deltas,
-                turn_audio_ms=self._turn_audio_ms,
-                played_ms=self._played_ms,
-                since_delta_ms=since_delta_ms,
-                since_speak_ms=since_speak_ms,
-                was_speaking=self._speaking,
-            )
+            was_speaking = self._speaking
             self._speaking = False
+            if was_speaking:
+                self._listen_duplicates = 0
+            else:
+                self._listen_duplicates += 1
+            # Every raw packet remains available as duplex.ws_rx. Emit the
+            # semantic state event on the transition and periodically only.
+            emit_listen = (
+                was_speaking
+                or self._listen_duplicates in (1, 5)
+                or self._listen_duplicates % 10 == 0
+            )
+            if emit_listen:
+                trace_stream(
+                    "speech",
+                    "duplex.listen",
+                    response_id=self._response_id[:16],
+                    turn_bytes=self._turn_bytes,
+                    turn_deltas=self._turn_deltas,
+                    turn_audio_ms=self._turn_audio_ms,
+                    played_ms=self._played_ms,
+                    since_delta_ms=since_delta_ms,
+                    since_speak_ms=since_speak_ms,
+                    was_speaking=was_speaking,
+                    duplicates=self._listen_duplicates,
+                )
             return
         if typ in ("response.audio.done", "response.output_audio.done"):
             trace_stream(

@@ -173,17 +173,30 @@ class SpeechSession:
                 identity=identity,
                 brain_ready=self._brain_started and bool(getattr(self.engine, "ready", True)),
             )
-        self.vad.bot_playing = bool(getattr(self.engine, "generating", False))
+        # A stalled model can remain `generating=True` for tens of seconds
+        # after its real audio drained. Only audible playout is a barge-in;
+        # speech during model dead air must keep flowing without cancelling.
+        self.vad.bot_playing = self.playout.audible
         edge = self.vad.feed(pcm16)
         if edge == "start":
+            generating = bool(getattr(self.engine, "generating", False))
             trace_stream(
                 "speech",
                 "stream.user_utt_start",
                 rms=self.vad.last_rms,
                 identity=identity,
                 bot_playing=self.vad.bot_playing,
+                generating=generating,
                 engine_ready=bool(getattr(self.engine, "ready", False)),
             )
+            if generating and not self.vad.bot_playing:
+                trace_stream(
+                    "speech",
+                    "turn.speech_during_model_stall",
+                    identity=identity,
+                    ring_ms=round(self.playout.ring_ms, 1),
+                    source_active=self.playout.source_active,
+                )
         if edge == "start" and self.vad.bot_playing:
             await self.engine.interrupt()
             self.playout.clear()
@@ -256,7 +269,6 @@ class SpeechSession:
                     )
                     self._prev_source_active = generating
                 for pcm, rate in chunks:
-                    self.vad.bot_playing = True
                     self.playout.push(pcm, int(rate) or 24000)
                     pulled += len(pcm)
                 if pulled:
@@ -293,8 +305,7 @@ class SpeechSession:
                             empty_polls=self._empty_polls,
                             ring_ms=round(self.playout.ring_ms, 1),
                         )
-                if not chunks and not getattr(self.engine, "generating", False):
-                    self.vad.bot_playing = False
+                self.vad.bot_playing = self.playout.audible
                 await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             raise
@@ -329,6 +340,7 @@ class SpeechSession:
                         "vad_speaking": self.vad.speaking,
                         "vad_rms": self.vad.last_rms,
                         "bot_playing": self.vad.bot_playing,
+                        "playout_audible": self.playout.audible,
                         "ring_ms": round(self.playout.ring_ms, 1),
                         "underruns_total": getattr(self.playout, "underruns_total", 0),
                         "lk_mic_age_ms": mic_age_ms,

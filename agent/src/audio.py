@@ -6,9 +6,9 @@ Jitter buffer design matches the Runtype Persona AudioWorklet
 200-400 ms gaps between them; HiFT eager-fallback on vLLM-Omni 0.30.0
 can pause 5-30 s between deltas (#5069 / #5657 warmup still pending).
 
-The prebuffer absorbs normal inter-chunk jitter.  PLAYOUT_HOLD_S
-fills silence during longer gaps so the turn does not end and
-trigger a fresh prebuffer cycle.
+The prebuffer absorbs normal inter-chunk jitter. PLAYOUT_HOLD_S only keeps
+the transport clock warm briefly; longer model stalls become true idle so
+VAD does not mistake user speech during dead air for a barge-in.
 """
 
 from __future__ import annotations
@@ -39,11 +39,13 @@ PLAYOUT_START_MS = float(os.environ.get("PLAYOUT_START_MS", "150"))
 # Rebuffer after an underrun.  Runtype uses same as start (150).
 PLAYOUT_REBUFFER_MS = float(os.environ.get("PLAYOUT_REBUFFER_MS", "150"))
 # Safety cap: max ms the prebuffer gate can hold before flushing anyway.
-PLAYOUT_MAX_WAIT_MS = float(os.environ.get("PLAYOUT_MAX_WAIT_MS", "3000"))
-# After the last push, how long to fill silence before declaring idle.
-# Must be long enough to bridge HiFT eager-fallback gaps (5-30 s) so the
-# turn stays open and does not trigger a fresh prebuffer cycle.
-HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "2.0"))
+# A short first/final delta may never reach the 150 ms target. Never hold it
+# for seconds while the model is stalled; release after one small jitter span.
+PLAYOUT_MAX_WAIT_MS = float(os.environ.get("PLAYOUT_MAX_WAIT_MS", "300"))
+# Briefly keep the LiveKit clock warm after real audio drains. Longer model
+# stalls are not bridgeable with silence and must not count as bot playback.
+HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "0.25"))
+BOT_AUDIBLE_GRACE_MS = float(os.environ.get("BOT_AUDIBLE_GRACE_MS", "120"))
 
 CAPTURE_TIMEOUT_S = float(os.environ.get("PLAYOUT_CAPTURE_TIMEOUT_S", "0.08"))
 STATS_EVERY_S = hires_period(5.0) if not hires_enabled() else 0.5
@@ -157,6 +159,7 @@ class ClockedPlayout:
         self._ring = bytearray()
         self._resampler: LinearResampler | None = None
         self._last_push = 0.0
+        self._last_real_frame = 0.0
         self._active = False
         self._running = False
         self.frames = 0
@@ -202,6 +205,17 @@ class ClockedPlayout:
     @property
     def ring_ms(self) -> float:
         return 1000.0 * (len(self._ring) / 2.0) / WEBRTC_RATE
+
+    @property
+    def audible(self) -> bool:
+        """True only while real bot audio is playing or queued for playout."""
+        now = time.monotonic()
+        queued = bool(self._ring) and not self._buffering
+        recent = (
+            self._last_real_frame > 0.0
+            and (now - self._last_real_frame) * 1000.0 <= BOT_AUDIBLE_GRACE_MS
+        )
+        return queued or recent
 
     def push(self, pcm: bytes, sample_rate: int) -> None:
         if not pcm:
@@ -267,6 +281,7 @@ class ClockedPlayout:
         self._resampler = None
         self._active = False
         self._last_push = 0.0
+        self._last_real_frame = 0.0
         self._first_push = True
         self.clears += 1
         self._underrun_open = False
@@ -334,6 +349,7 @@ class ClockedPlayout:
                 self._turn_open = True
                 self._reset_turn_stats()
             self._turn_frames += 1
+            self._last_real_frame = now
             rm = self.ring_ms
             if self._ring_ms_min < 0 or rm < self._ring_ms_min:
                 self._ring_ms_min = rm
@@ -363,6 +379,7 @@ class ClockedPlayout:
                 self._turn_open = True
                 self._reset_turn_stats()
             self._turn_frames += 1
+            self._last_real_frame = now
             return frame[:need]
 
         if self._active and self._last_push and (now - self._last_push) <= HOLD_SILENCE_S:
