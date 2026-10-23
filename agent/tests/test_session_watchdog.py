@@ -110,7 +110,7 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(eng._reconnect_reason, "")
         self.assertTrue(eng._ready.is_set())
 
-    async def test_commit_during_speak_does_not_arm(self) -> None:
+    async def test_commit_always_arms_even_while_speaking(self) -> None:
         eng = MiniCPMDuplexEngine()
         sent: list[dict] = []
 
@@ -124,9 +124,9 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
         eng._send = fake_send  # type: ignore[method-assign]
         await eng._commit_input()
         self.assertEqual(sent[0]["type"], "input_audio_buffer.commit")
-        self.assertFalse(eng._turn.armed)
+        self.assertTrue(eng._turn.armed)
 
-    async def test_watchdog_ignores_timeout_while_speaking(self) -> None:
+    async def test_speaking_flag_does_not_cancel_timeout(self) -> None:
         eng = MiniCPMDuplexEngine()
         eng._ready.set()
         eng._speaking = True
@@ -136,14 +136,18 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_reconnect(reason: str) -> None:
             reconnects.append(reason)
+            eng._ready.set()
+            eng._turn.note_session()
 
         eng._reconnect = fake_reconnect  # type: ignore[method-assign]
         task = asyncio.create_task(eng._watchdog_loop())
         try:
-            await asyncio.sleep(0.7)
-            self.assertEqual(reconnects, [])
-            self.assertFalse(eng._turn.armed)
-            self.assertTrue(eng._ready.is_set())
+            for _ in range(20):
+                if reconnects:
+                    break
+                await asyncio.sleep(0.1)
+            self.assertTrue(reconnects, "watchdog did not request reconnect")
+            self.assertTrue(reconnects[0].startswith("decision_timeout_"))
         finally:
             eng._closing = True
             task.cancel()

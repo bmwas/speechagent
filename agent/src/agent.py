@@ -73,7 +73,8 @@ class SpeechSession:
         prompt = system_prompt()
         self.engine: MiniCPMDuplexEngine | QwenOmniEngine
         if self.minicpm:
-            self.engine = MiniCPMDuplexEngine(prompt, voice_id=spec.id, ref_path=asset_path(spec))
+            ref = None if spec.id == DEFAULT_VOICE_ID else asset_path(spec)
+            self.engine = MiniCPMDuplexEngine(prompt, voice_id=spec.id, ref_path=ref)
         else:
             self.engine = QwenOmniEngine(prompt)
         self.vad = EnergyVad()

@@ -117,6 +117,14 @@ class VoiceCatalogTests(unittest.TestCase):
         self.assertEqual(eng.voice_id, "original")
         self.assertIsNone(eng._ref_path)
 
+    def test_original_handshake_ignores_clone_ref_path(self) -> None:
+        voice = resolve_voice("heart")
+        path = asset_path(voice)
+        original = MiniCPMDuplexEngine("hello", voice_id="original", ref_path=path)
+        self.assertIsNone(original._handshake_ref_path())
+        clone = MiniCPMDuplexEngine("hello", voice_id="heart", ref_path=path)
+        self.assertEqual(clone._handshake_ref_path(), path)
+
     def test_original_duplex_handshake_still_locked(self) -> None:
         src = (Path(__file__).resolve().parents[1] / "src" / "duplex_model.py").read_text(encoding="utf-8")
         for token in (

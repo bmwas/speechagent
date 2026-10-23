@@ -300,6 +300,12 @@ class MiniCPMDuplexEngine:
             **self._turn.snapshot(now),
         }
 
+    def _handshake_ref_path(self) -> Path | None:
+        """Original keeps the locked HT lookup; clones pass a catalog WAV."""
+        if self.voice_id == DEFAULT_VOICE_ID:
+            return None
+        return self._ref_path
+
     def _eid(self) -> str:
         self._evt += 1
         return f"evt_{self._evt:04d}"
@@ -328,7 +334,7 @@ class MiniCPMDuplexEngine:
     async def _connect_and_handshake(self) -> None:
         url = _model_ws_url()
         model = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-o-4_5")
-        ref, ref_source, ref_meta = _ref_audio_data_url(self._ref_path)
+        ref, ref_source, ref_meta = _ref_audio_data_url(self._handshake_ref_path())
         self._ref_sha = str(ref_meta.get("sha256") or "")
         self._ref_duration_ms = int(ref_meta.get("duration_ms") or -1)
         instructions = self.system_prompt or (
@@ -464,10 +470,6 @@ class MiniCPMDuplexEngine:
             while not self._closing:
                 await asyncio.sleep(0.5)
                 now = time.monotonic()
-                # Live audio (including HiFT gaps while _speaking) is not a
-                # dead session. Only time out a commit that got no decision.
-                if self._speaking and self._turn.armed:
-                    self._note_decision("speaking")
                 timeout_reason = self._turn.poll(now)
                 if timeout_reason:
                     wait_ms = _age_ms(self._turn.t_commit, now)
@@ -892,8 +894,6 @@ class MiniCPMDuplexEngine:
         if first:
             self._turn_gen_t0 = now
             self._note_decision("first_audio")
-        elif self._turn.armed:
-            self._note_decision("audio")
             lat = _age_ms(self._t_speak, now) if self._t_speak else -1
             from_speech = _age_ms(self._t_user_speech, now)
             from_ready = _age_ms(self._t_ready, now)
@@ -911,6 +911,9 @@ class MiniCPMDuplexEngine:
             )
             if lat >= 0:
                 trace_stream("speech", "duplex.speak", latency_ms=lat, bytes=len(pcm), first_audio=True)
+        elif self._turn.armed:
+            # A later commit re-armed the 8s timer; live PCM is still a decision.
+            self._note_decision("audio")
         # RTF = audio produced / wall time since first delta.  RTF < 1 means
         # the model emits slower than real time — underruns are fundamental.
         gen_wall_ms = _age_ms(self._turn_gen_t0, now) if self._turn_gen_t0 else 0
@@ -990,21 +993,13 @@ class MiniCPMDuplexEngine:
         self._commit_pending = False
         await self._send({"type": "input_audio_buffer.commit"})
         now = time.monotonic()
-        waiting = False
-        if self._speaking:
-            # A follow-up commit during generation must not start an 8s
-            # death timer; HiFT gaps are 5–30s and audio is still coming.
-            pass
-        else:
-            self._turn.arm(now)
-            waiting = True
+        self._turn.arm(now)
         trace_stream(
             "speech",
             "duplex.commit",
             audio_end_ms=self._audio_end_ms,
             session_generation=self._turn.generation,
-            turn_waiting=waiting,
-            speaking=self._speaking,
+            turn_waiting=True,
             decision_timeout_ms=self._turn.timeout_ms,
         )
 
