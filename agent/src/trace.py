@@ -80,10 +80,6 @@ _METER_MAX_KEYS = {
     "block_ms",
     "utt_ms",
     "stall_ms",
-    "from_commit_ms",
-    "from_terminal_ms",
-    "attach_us",
-    "json_us",
 }
 _METER_LAST_KEYS = {"rate", "src_rate", "sample_rate"}
 

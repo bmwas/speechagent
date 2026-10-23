@@ -14,7 +14,6 @@ from typing import Any
 import websockets
 
 from audio import MODEL_RATE, pcm_rms
-from require_response import TurnResponseTracker, require_response_enabled
 from trace import RateLimiter, StreamMeter, TypeCounter, hires_enabled, trace_exc, trace_stream
 
 LOG = logging.getLogger("duplex")
@@ -224,9 +223,6 @@ class MiniCPMDuplexEngine:
         self._reconnect_reason = ""
         self._last_reconnect = 0.0
         self._closing = False
-        self._turns = TurnResponseTracker(enabled=require_response_enabled())
-        self._require_meter = StreamMeter("speech", "duplex.require_rt")
-        self._require_wait_rl = RateLimiter(1.0)
 
     @property
     def generating(self) -> bool:
@@ -261,15 +257,6 @@ class MiniCPMDuplexEngine:
             "turn_deltas": self._turn_deltas,
             "turn_max_gap_ms": self._turn_max_gap_ms,
             "rtf": self._last_rtf,
-            "require_turn_id": self._turns.turn_id,
-            "require_state": self._turns.state,
-            "require_waiting": int(self._turns.waiting()),
-            "require_enabled": int(self._turns.enabled),
-            "from_commit_ms": self._turns.from_commit_ms(now),
-            "marked_appends": self._turns.marked_appends,
-            "extra_bytes_total": self._turns.extra_bytes_total,
-            "listen_while_waiting": self._turns.listen_while_waiting,
-            "attach_us_max": self._turns.attach_us_max,
         }
 
     def _eid(self) -> str:
@@ -280,34 +267,14 @@ class MiniCPMDuplexEngine:
         if self._ws is None:
             return
         body.setdefault("event_id", self._eid())
-        t_json = time.perf_counter()
         payload = json.dumps(body)
-        json_us = int((time.perf_counter() - t_json) * 1_000_000)
-        typ = str(body.get("type") or "")
-        if typ in {"input_audio_buffer.append", "input_audio_buffer.commit"}:
-            self._require_meter.add(
-                tx=1,
-                tx_bytes=len(payload),
-                json_us=json_us,
-                extra_bytes=int(self._turns.last_extra_bytes),
-                marked=int(bool(body.get("response_required"))),
-                waiting=int(self._turns.waiting()),
-                attach_us=self._turns.last_attach_us,
-                from_commit_ms=self._turns.from_commit_ms() if self._turns.waiting() else 0,
-            )
         if hires_enabled() or self._ws_tx_rl.due():
-            extra = {}
-            if "turn_id" in body:
-                extra["turn_id"] = body.get("turn_id")
-                extra["response_required"] = int(bool(body.get("response_required")))
-            extra["json_us"] = json_us
             trace_stream(
                 "speech",
                 "duplex.ws_tx",
-                type=typ,
+                type=str(body.get("type") or ""),
                 bytes=len(payload),
                 event_id=str(body.get("event_id") or ""),
-                **extra,
             )
         await self._ws.send(payload)
 
@@ -376,7 +343,6 @@ class MiniCPMDuplexEngine:
                 "sliding_window_mode": "basic",
                 "basic_window_high_tokens": 3000,
                 "basic_window_low_tokens": 2000,
-                "require_response": self._turns.enabled,
             },
         }
         trace_stream("speech", "voice.ref_loaded", source=ref_source[-120:], bytes=len(ref))
@@ -397,14 +363,6 @@ class MiniCPMDuplexEngine:
             window_low=2000,
             instructions_len=len(instructions),
             chunk_ms=CHUNK_MS,
-            require_response=int(self._turns.enabled),
-        )
-        trace_stream(
-            "speech",
-            "duplex.require_config",
-            enabled=int(self._turns.enabled),
-            unanswered_ms=self._turns.unanswered_ms,
-            kill_switch="MINICPM_REQUIRE_RESPONSE",
         )
         try:
             await asyncio.wait_for(self._handshake.wait(), timeout=30.0)
@@ -443,14 +401,13 @@ class MiniCPMDuplexEngine:
             raise
 
     async def _reconnect(self, reason: str) -> None:
-        snap = self._turns.reset_session(reason=reason)
-        trace_stream("speech", "duplex.reconnect", reason=reason, **snap)
+        trace_stream("speech", "duplex.reconnect", reason=reason)
         self._ready.clear()
         self._speaking = False
         await self._teardown_socket(cancel_watchdog=False)
         self._reset_stream_state()
         await self._connect_and_handshake()
-        trace_stream("speech", "duplex.reconnected", reason=reason, turn_id=self._turns.turn_id)
+        trace_stream("speech", "duplex.reconnected", reason=reason)
 
     def _reset_stream_state(self) -> None:
         self._buf.clear()
@@ -547,23 +504,6 @@ class MiniCPMDuplexEngine:
                             )
                             await self.interrupt()
                             self._request_reconnect(f"stall_{gap}ms")
-                    unanswered = self._turns.maybe_unanswered(now)
-                    if unanswered:
-                        trace_stream("speech", "duplex.unanswered", **unanswered)
-                    if self._turns.waiting() and self._require_wait_rl.due():
-                        trace_stream(
-                            "speech",
-                            "duplex.require_waiting",
-                            from_commit_ms=self._turns.from_commit_ms(now),
-                            out_q=self._out.qsize(),
-                            rtf=self._last_rtf,
-                            speaking=int(self._speaking),
-                            listen_while_waiting=self._turns.listen_while_waiting,
-                            marked_appends=self._turns.marked_appends,
-                            extra_bytes_total=self._turns.extra_bytes_total,
-                            attach_us_max=self._turns.attach_us_max,
-                            **self._turns.hot_fields(),
-                        )
                     if ticks % 10 == 0:
                         await self._send({"type": "session.heartbeat"})
                         trace_stream(
@@ -572,12 +512,6 @@ class MiniCPMDuplexEngine:
                             rx_age_ms=_age_ms(self._t_last_rx, now),
                             delta_age_ms=_age_ms(self._t_last_delta, now),
                             speaking=self._speaking,
-                            turn_id=self._turns.turn_id,
-                            require_state=self._turns.state,
-                            require_waiting=int(self._turns.waiting()),
-                            from_commit_ms=self._turns.from_commit_ms(now),
-                            extra_bytes_total=self._turns.extra_bytes_total,
-                            attach_us_max=self._turns.attach_us_max,
                         )
                 except Exception:
                     return
@@ -673,16 +607,6 @@ class MiniCPMDuplexEngine:
             self._turn_max_gap_ms = -1
             self._turn_gen_t0 = 0.0
             self._listen_duplicates = 0
-            dup = self._turns.on_response_created(self._response_id, now=self._t_speak)
-            turn_fields = self._turns.snapshot()
-            if dup == "duplicate":
-                trace_stream(
-                    "speech",
-                    "duplex.duplicate_response",
-                    response_id=self._response_id[:16],
-                    ev_type=typ,
-                    **turn_fields,
-                )
             if typ == "response.speak":
                 self._speaking = True
                 from_speech = _age_ms(self._t_user_speech, self._t_speak)
@@ -691,23 +615,9 @@ class MiniCPMDuplexEngine:
                     "duplex.speak",
                     response_id=self._response_id[:16],
                     from_speech_ms=from_speech,
-                    **turn_fields,
                 )
             else:
-                trace_stream(
-                    "speech",
-                    "duplex.response_created",
-                    response_id=self._response_id[:16],
-                    **turn_fields,
-                )
-            trace_stream(
-                "speech",
-                "duplex.first_decision",
-                decision="speak",
-                response_id=self._response_id[:16],
-                duplicate=int(dup == "duplicate"),
-                **turn_fields,
-            )
+                trace_stream("speech", "duplex.response_created", response_id=self._response_id[:16])
             return
         if typ in _AUDIO_DELTA_TYPES:
             await self._on_audio_delta(ev)
@@ -736,8 +646,6 @@ class MiniCPMDuplexEngine:
                 or self._listen_duplicates % 10 == 0
             )
             if emit_listen:
-                waiting = self._turns.waiting()
-                listen_n = self._turns.note_listen_while_waiting()
                 trace_stream(
                     "speech",
                     "duplex.listen",
@@ -750,19 +658,7 @@ class MiniCPMDuplexEngine:
                     since_speak_ms=since_speak_ms,
                     was_speaking=was_speaking,
                     duplicates=self._listen_duplicates,
-                    turn_id=self._turns.turn_id,
-                    waiting=int(waiting),
-                    listen_while_waiting=listen_n,
                 )
-                if waiting and self._listen_duplicates in (1, 5):
-                    trace_stream(
-                        "speech",
-                        "duplex.first_decision",
-                        decision="listen",
-                        waiting=1,
-                        duplicates=self._listen_duplicates,
-                        **self._turns.snapshot(),
-                    )
             return
         if typ in ("response.audio.done", "response.output_audio.done"):
             trace_stream(
@@ -824,12 +720,7 @@ class MiniCPMDuplexEngine:
             trace_stream("speech", "duplex.model_speech_stop", **_ev_summary(ev))
             return
         if typ in _COMMIT_TYPES:
-            trace_stream(
-                "speech",
-                "duplex.committed",
-                audio_end_ms=self._audio_end_ms,
-                **self._turns.snapshot(),
-            )
+            trace_stream("speech", "duplex.committed", audio_end_ms=self._audio_end_ms)
             return
         if typ == "playback.acknowledged":
             self._acks_rx += 1
@@ -877,9 +768,6 @@ class MiniCPMDuplexEngine:
             lat = _age_ms(self._t_speak, now) if self._t_speak else -1
             from_speech = _age_ms(self._t_user_speech, now)
             from_ready = _age_ms(self._t_ready, now)
-            self._turns.on_first_audio(now)
-            turn_fields = self._turns.snapshot()
-            inferred_override = int(self._turns.listen_while_waiting > 0)
             trace_stream(
                 "speech",
                 "duplex.first_audio",
@@ -887,30 +775,11 @@ class MiniCPMDuplexEngine:
                 latency_ms=lat,
                 from_speech_ms=from_speech,
                 from_ready_ms=from_ready,
-                from_commit_ms=turn_fields.get("from_commit_ms", -1),
                 bytes=len(pcm),
                 rate=self._out_rate,
                 response_id=self._response_id[:16],
                 qsize=self._out.qsize() + 1,
-                inferred_override=inferred_override,
-                **turn_fields,
             )
-            trace_stream(
-                "speech",
-                "duplex.require_outcome",
-                outcome="answered",
-                inferred_override=inferred_override,
-                listen_while_waiting=self._turns.listen_while_waiting,
-                extra_bytes_total=self._turns.extra_bytes_total,
-                attach_us_max=self._turns.attach_us_max,
-                **turn_fields,
-            )
-            if inferred_override:
-                trace_stream(
-                    "speech",
-                    "duplex.require_override_inferred",
-                    **turn_fields,
-                )
             if lat >= 0:
                 trace_stream("speech", "duplex.speak", latency_ms=lat, bytes=len(pcm), first_audio=True)
         # RTF = audio produced / wall time since first delta.  RTF < 1 means
@@ -990,26 +859,8 @@ class MiniCPMDuplexEngine:
         if not self._commit_pending:
             return
         self._commit_pending = False
-        self._turns.mark_commit()
-        body: dict[str, Any] = {"type": "input_audio_buffer.commit"}
-        body.update(self._turns.marker_fields())
-        if self._turns.consume_first_marker():
-            trace_stream(
-                "speech",
-                "duplex.marker_attach",
-                extra_bytes=self._turns.last_extra_bytes,
-                attach_us=self._turns.last_attach_us,
-                audio_end_ms=self._audio_end_ms,
-                where="commit",
-                **self._turns.hot_fields(),
-            )
-        await self._send(body)
-        trace_stream(
-            "speech",
-            "duplex.commit",
-            audio_end_ms=self._audio_end_ms,
-            **self._turns.snapshot(),
-        )
+        await self._send({"type": "input_audio_buffer.commit"})
+        trace_stream("speech", "duplex.commit", audio_end_ms=self._audio_end_ms)
 
     async def _append(self, pcm16: bytes, is_speech: bool = True, *, force_video: bool = False) -> None:
         if self._ws is None:
@@ -1017,27 +868,6 @@ class MiniCPMDuplexEngine:
         duration_ms = int(1000.0 * (len(pcm16) / 2.0) / MODEL_RATE)
         self._audio_end_ms += duration_ms
         video_attached = False
-        now = time.monotonic()
-        rms = pcm_rms(pcm16)
-        if is_speech and not self._last_is_speech:
-            self._t_user_speech = now
-            self._commit_pending = True
-            prev = self._turns.on_speech_start(now)
-            if prev.get("state") == "waiting":
-                trace_stream("speech", "duplex.unanswered", superseded=1, **prev)
-            trace_stream("speech", "duplex.turn_armed", **self._turns.snapshot())
-            trace_stream(
-                "speech",
-                "duplex.append_speech",
-                rms=rms,
-                duration_ms=duration_ms,
-                audio_end_ms=self._audio_end_ms,
-                video_attached=video_attached,
-                turn_id=self._turns.turn_id,
-            )
-        t_mark = time.perf_counter()
-        marker = self._turns.marker_fields(is_speech=bool(is_speech))
-        self._turns.note_attach_us(int((time.perf_counter() - t_mark) * 1_000_000))
         body: dict[str, Any] = {
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(pcm16).decode("ascii"),
@@ -1047,16 +877,6 @@ class MiniCPMDuplexEngine:
             "audio_end_ms": self._audio_end_ms,
             "is_speech": bool(is_speech),
         }
-        body.update(marker)
-        if self._turns.consume_first_marker():
-            trace_stream(
-                "speech",
-                "duplex.marker_attach",
-                extra_bytes=self._turns.last_extra_bytes,
-                attach_us=self._turns.last_attach_us,
-                audio_end_ms=self._audio_end_ms,
-                **self._turns.hot_fields(),
-            )
         # Native duplex expects ~1 JPEG per 1 s audio unit. Attach the latest
         # camera still on that cadence so vision rides the live mic stream.
         if self._video_pending and (
@@ -1078,14 +898,25 @@ class MiniCPMDuplexEngine:
                 is_speech=int(bool(is_speech)),
             )
         await self._send(body)
+        now = time.monotonic()
         self._append_n += 1
         self._append_bytes += len(pcm16)
         self._t_last_append = now
+        rms = pcm_rms(pcm16)
+        if is_speech and not self._last_is_speech:
+            self._t_user_speech = now
+            self._commit_pending = True
+            trace_stream(
+                "speech",
+                "duplex.append_speech",
+                rms=rms,
+                duration_ms=duration_ms,
+                audio_end_ms=self._audio_end_ms,
+                video_attached=video_attached,
+            )
         speech_ended = self._last_is_speech and not is_speech
         self._last_is_speech = bool(is_speech)
         if speech_ended:
-            if self._turns.mark_terminal(now):
-                trace_stream("speech", "duplex.terminal_marker", **self._turns.snapshot())
             await self._commit_input()
         if hires_enabled():
             trace_stream(
@@ -1098,8 +929,6 @@ class MiniCPMDuplexEngine:
                 rms=rms,
                 is_speech=int(bool(is_speech)),
                 video_attached=int(video_attached),
-                turn_id=self._turns.turn_id,
-                response_required=int(bool(body.get("response_required"))),
             )
         self._append_meter.add(
             chunks=1,
@@ -1112,8 +941,6 @@ class MiniCPMDuplexEngine:
 
     async def end_of_speech(self) -> None:
         """Flush leftover PCM (with latest camera still) and commit the turn."""
-        if self._turns.mark_terminal():
-            trace_stream("speech", "duplex.terminal_marker", **self._turns.snapshot())
         if self._buf:
             piece = bytes(self._buf)
             self._buf.clear()
@@ -1169,7 +996,6 @@ class MiniCPMDuplexEngine:
             return
         try:
             await self._send({"type": "response.cancel"})
-            snap = self._turns.on_cancel("cancel")
             trace_stream(
                 "speech",
                 "duplex.cancel",
@@ -1180,7 +1006,6 @@ class MiniCPMDuplexEngine:
                 turn_max_gap_ms=self._turn_max_gap_ms,
                 played_ms=self._played_ms,
                 response_id=self._response_id[:16],
-                **snap,
             )
         except Exception as exc:
             trace_exc("speech", "error.duplex_cancel", exc)
@@ -1188,14 +1013,7 @@ class MiniCPMDuplexEngine:
     async def close(self) -> None:
         self._closing = True
         self._reconnect_reason = ""
-        for meter in (
-            self._rx_types,
-            self._append_meter,
-            self._delta_meter,
-            self._drop_meter,
-            self._video_drop,
-            self._require_meter,
-        ):
+        for meter in (self._rx_types, self._append_meter, self._delta_meter, self._drop_meter, self._video_drop):
             try:
                 meter.flush()
             except Exception:
