@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import io
+import math
 import os
 import sys
 import unittest
@@ -70,13 +72,20 @@ class VoiceCatalogTests(unittest.TestCase):
         for vid in ("heart", "bella", "nicole", "michael", "ryan", "joe", "lessac", "amy"):
             voice = resolve_voice(vid)
             info = validate_catalog_voice(voice)
-            self.assertEqual(info["rate"], 16000)
-            self.assertEqual(info["channels"], 1)
-            self.assertGreaterEqual(info["duration_s"], 3.0)
-            self.assertLessEqual(info["duration_s"], 10.0)
             path = asset_path(voice)
             self.assertIsNotNone(path)
             assert path is not None
+            self.assertEqual(info["rate"], 16000)
+            self.assertEqual(info["channels"], 1)
+            self.assertGreaterEqual(info["duration_s"], 3.0)
+            self.assertLessEqual(info["duration_s"], 6.5)
+            with wave.open(str(path), "rb") as handle:
+                samples = array.array("h")
+                samples.frombytes(handle.readframes(handle.getnframes()))
+            peak = max(abs(x) for x in samples)
+            peak_db = 20 * math.log10(peak / 32768)
+            self.assertLessEqual(peak_db, -5.0)
+            self.assertGreaterEqual(peak_db, -7.0)
             self.assertEqual(info["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
 
     def test_validate_wav_rejects_bad_format(self) -> None:
@@ -107,6 +116,21 @@ class VoiceCatalogTests(unittest.TestCase):
         eng = MiniCPMDuplexEngine()
         self.assertEqual(eng.voice_id, "original")
         self.assertIsNone(eng._ref_path)
+
+    def test_original_duplex_handshake_still_locked(self) -> None:
+        src = (Path(__file__).resolve().parents[1] / "src" / "duplex_model.py").read_text(encoding="utf-8")
+        for token in (
+            '"overlap_policy": "listen_only"',
+            '"playback_commit_policy": "ack_only"',
+            '"auto_response": True',
+            '"force_listen_count": 0',
+            '"sliding_window_mode": "basic"',
+            '"basic_window_high_tokens": 3000',
+            '"basic_window_low_tokens": 2000',
+        ):
+            self.assertIn(token, src)
+        yaml = Path(__file__).resolve().parents[2] / "model-server" / "deploy" / "minicpmo_4_5.yaml"
+        self.assertIn("codec_chunk_frames: 24", yaml.read_text(encoding="utf-8"))
 
     def test_ref_loader_reads_explicit_path(self) -> None:
         tmp = Path(self._tmp())
