@@ -10,6 +10,14 @@ import {
   Track,
 } from "livekit-client";
 import { isFailedToFetch, livekitConnectUrl, upgradeLanHttp } from "./upgradeHttps";
+import VoicePicker from "./VoicePicker";
+import {
+  DEFAULT_VOICE_ID,
+  FALLBACK_VOICES,
+  loadStoredVoiceId,
+  storeVoiceId,
+  type VoiceInfo,
+} from "./voices";
 
 const ROOM = "default";
 const PATH = "/patient";
@@ -112,6 +120,8 @@ export default function App() {
   const [state, setState] = useState("idle");
   const [lkOn, setLkOn] = useState(false);
   const [model, setModel] = useState("");
+  const [voices, setVoices] = useState<VoiceInfo[]>(FALLBACK_VOICES);
+  const [voiceId, setVoiceId] = useState(DEFAULT_VOICE_ID);
   const localRef = useRef<HTMLVideoElement>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
   const lkRoomRef = useRef<Room | null>(null);
@@ -137,6 +147,24 @@ export default function App() {
         if (!cancelled) {
           setModel(j.model || "");
           setError(null);
+        }
+        try {
+          const vr = await fetch("/api/voices", { signal: AbortSignal.timeout(8000) });
+          const vj = (await vr.json()) as { ok?: boolean; default?: string; voices?: VoiceInfo[] };
+          if (!cancelled && vj.ok && Array.isArray(vj.voices) && vj.voices.length) {
+            setVoices(vj.voices);
+            const stored = loadStoredVoiceId();
+            const allowed = new Set(vj.voices.map((v) => v.id));
+            const next = allowed.has(stored) ? stored : vj.default || DEFAULT_VOICE_ID;
+            setVoiceId(next);
+            storeVoiceId(next);
+          }
+        } catch {
+          if (!cancelled) {
+            const stored = loadStoredVoiceId();
+            const allowed = new Set(FALLBACK_VOICES.map((v) => v.id));
+            setVoiceId(allowed.has(stored) ? stored : DEFAULT_VOICE_ID);
+          }
         }
       } catch (err) {
         if (cancelled) return;
@@ -219,7 +247,7 @@ export default function App() {
     const localTracks = await acquireLocalTracks();
     const micTrack = localTracks.find((t) => t.kind === Track.Kind.Audio);
     const micDeviceId = micTrack?.mediaStreamTrack.getSettings().deviceId;
-    const tokenUrl = `/api/livekit/token?role=patient&room=${ROOM}&consent=1`;
+    const tokenUrl = `/api/livekit/token?role=patient&room=${ROOM}&consent=1&voice=${encodeURIComponent(voiceId)}`;
     try {
       const r = await fetch(tokenUrl, {
         method: "POST",
@@ -232,6 +260,7 @@ export default function App() {
         identity?: string;
         error?: string;
         model?: string;
+        voice_id?: string;
       } = {};
       try {
         body = (await r.json()) as typeof body;
@@ -244,6 +273,10 @@ export default function App() {
       }
       if (!r.ok || !body.token) throw new Error(body.error || `token HTTP ${r.status}`);
       if (body.model) setModel(body.model);
+      if (body.voice_id) {
+        setVoiceId(body.voice_id);
+        storeVoiceId(body.voice_id);
+      }
       let diag = "";
       try {
         const d = await fetch("/lk-diag", { signal: AbortSignal.timeout(4000) });
@@ -352,7 +385,7 @@ export default function App() {
       }
       if (lk) lk.disconnect().catch(() => undefined);
     }
-  }, [insecure]);
+  }, [insecure, voiceId]);
 
   const disconnect = useCallback(async () => {
     const lk = lkRoomRef.current;
@@ -378,15 +411,17 @@ export default function App() {
   }, []);
 
   const connected = state !== "idle" && state !== "disconnected";
+  const voiceLocked = connected || state === "connecting";
+  const voiceName = voices.find((v) => v.id === voiceId)?.name || "Original";
 
   return (
     <div className="shell">
       <div className="eyebrow">speechagent · livekit · /patient</div>
       <h1>Talk to the agent</h1>
       <p className="muted">
-        Headphones on. Open this page over HTTPS, click Connect, allow camera and mic, then speak.
-        The agent sees you and answers in speech.
-        {model ? ` Model: ${model}.` : ""}
+        Headphones on. Open this page over HTTPS, pick a voice, click Connect, allow camera and mic,
+        then speak. The agent sees you and answers in speech.
+        {model ? ` Model: ${model}.` : ""} Voice: {voiceName}.
       </p>
       {insecure || httpPage ? (
         <div className="warn">
@@ -394,6 +429,15 @@ export default function App() {
           a secure context, so camera/mic stay blocked.
         </div>
       ) : null}
+      <VoicePicker
+        voices={voices}
+        selectedId={voiceId}
+        disabled={voiceLocked}
+        onSelect={(id) => {
+          setVoiceId(id);
+          storeVoiceId(id);
+        }}
+      />
       <div className="row">
         <button type="button" onClick={() => void connect()} disabled={state === "connecting"}>
           {connected ? "Reconnect" : "Connect"}

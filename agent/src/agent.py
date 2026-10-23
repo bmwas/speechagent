@@ -15,6 +15,7 @@ from qwen_omni import QwenOmniEngine
 from tokens import BOT_IDENTITY, token_for_bot
 from trace import RateLimiter, StreamMeter, hires_enabled, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
 from video import FrameSampler
+from voices import DEFAULT_VOICE_ID, asset_path, resolve_voice
 
 LOG = logging.getLogger("agent")
 
@@ -61,16 +62,18 @@ def system_prompt() -> str:
 
 
 class SpeechSession:
-    def __init__(self, room_id: str, on_stopped=None) -> None:
+    def __init__(self, room_id: str, on_stopped=None, *, voice_id: str = DEFAULT_VOICE_ID) -> None:
         self.room_id = room_id
         self.session_id = f"lk-{room_id}"
         self._on_stopped = on_stopped
         self.model_name = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-o-4_5")
         self.minicpm = is_minicpm(self.model_name)
+        spec = resolve_voice(voice_id)
+        self.voice_id = spec.id
         prompt = system_prompt()
         self.engine: MiniCPMDuplexEngine | QwenOmniEngine
         if self.minicpm:
-            self.engine = MiniCPMDuplexEngine(prompt)
+            self.engine = MiniCPMDuplexEngine(prompt, voice_id=spec.id, ref_path=asset_path(spec))
         else:
             self.engine = QwenOmniEngine(prompt)
         self.vad = EnergyVad()
@@ -117,6 +120,7 @@ class SpeechSession:
             room=self.room_id,
             model=self.model_name,
             path="minicpm" if self.minicpm else "qwen",
+            voice_id=self.voice_id,
         )
         token = token_for_bot(self.room_id)
         self.bot = LiveKitBotRoom(
@@ -137,7 +141,13 @@ class SpeechSession:
         self._brain_started = True
         try:
             await self.engine.start()
-            trace_stream("speech", "session.brain_ready", model=self.model_name, path="minicpm" if self.minicpm else "qwen")
+            trace_stream(
+                "speech",
+                "session.brain_ready",
+                model=self.model_name,
+                path="minicpm" if self.minicpm else "qwen",
+                voice_id=self.voice_id,
+            )
         except Exception as exc:
             trace_exc("speech", "error.brain", exc)
             await self.stop()
@@ -372,6 +382,7 @@ class SpeechSession:
                         "mic_first": self._mic_first,
                         "pull_n": self._pull_n,
                         "pull_bytes": self._pull_bytes,
+                        "voice_id": self.voice_id,
                     }
                 )
                 trace_stream("speech", "stream.health", **fields)

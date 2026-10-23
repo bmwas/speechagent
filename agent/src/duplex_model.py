@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import io
 import json
 import logging
 import os
 import time
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,7 @@ import websockets
 from audio import MODEL_RATE, pcm_rms
 from session_watchdog import TurnWatchdog
 from trace import RateLimiter, StreamMeter, TypeCounter, hires_enabled, trace_exc, trace_stream
+from voices import DEFAULT_VOICE_ID
 
 LOG = logging.getLogger("duplex")
 CHUNK_MS = int(os.environ.get("AUDIO_CHUNK_MS", "100"))
@@ -102,27 +106,47 @@ def _find_bundled_ref_audio() -> Path | None:
     return None
 
 
-def _ref_audio_data_url() -> tuple[str, str]:
-    """Return (data_url, source_label). v0.30.0 duplex requires this for audio out."""
-    override = (os.environ.get("REF_AUDIO_PATH") or "").strip()
-    if override:
-        path = Path(override)
+def _wav_duration_ms(raw: bytes) -> int:
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as handle:
+            rate = handle.getframerate() or 1
+            return int(1000.0 * handle.getnframes() / rate)
+    except Exception:
+        return -1
+
+
+def _ref_audio_data_url(path: Path | None = None) -> tuple[str, str, dict[str, Any]]:
+    """Return (data_url, source_label, meta). v0.30.0 duplex requires this for audio out."""
+    if path is not None:
         if not path.is_file():
-            raise FileNotFoundError(f"REF_AUDIO_PATH missing: {path}")
-        source = "REF_AUDIO_PATH"
-    else:
-        path = _find_bundled_ref_audio()
-        if path is None:
-            raise FileNotFoundError(
-                "MiniCPM-o duplex requires ref_audio. Set REF_AUDIO_PATH to a "
-                "16 kHz mono WAV, or keep the bundled assets/HT_ref_audio.wav "
-                "in the HuggingFace snapshot under /models/hf."
-            )
+            raise FileNotFoundError(f"ref_audio missing: {path}")
         source = str(path)
+    else:
+        override = (os.environ.get("REF_AUDIO_PATH") or "").strip()
+        if override:
+            path = Path(override)
+            if not path.is_file():
+                raise FileNotFoundError(f"REF_AUDIO_PATH missing: {path}")
+            source = "REF_AUDIO_PATH"
+        else:
+            path = _find_bundled_ref_audio()
+            if path is None:
+                raise FileNotFoundError(
+                    "MiniCPM-o duplex requires ref_audio. Set REF_AUDIO_PATH to a "
+                    "16 kHz mono WAV, or keep the bundled assets/HT_ref_audio.wav "
+                    "in the HuggingFace snapshot under /models/hf."
+                )
+            source = str(path)
     raw = path.read_bytes()
     if len(raw) < 64 or raw[:4] != b"RIFF":
         raise ValueError(f"ref_audio is not a WAV file: {path}")
-    return f"data:audio/wav;base64,{base64.b64encode(raw).decode('ascii')}", source
+    sha = hashlib.sha256(raw).hexdigest()
+    meta = {
+        "bytes": len(raw),
+        "sha256": sha[:12],
+        "duration_ms": _wav_duration_ms(raw),
+    }
+    return f"data:audio/wav;base64,{base64.b64encode(raw).decode('ascii')}", source, meta
 
 
 def _err_text(ev: dict[str, Any]) -> str:
@@ -162,8 +186,17 @@ class MiniCPMDuplexEngine:
 
     input_rate = MODEL_RATE
 
-    def __init__(self, system_prompt: str = "") -> None:
+    def __init__(
+        self,
+        system_prompt: str = "",
+        voice_id: str = DEFAULT_VOICE_ID,
+        ref_path: Path | str | None = None,
+    ) -> None:
         self.system_prompt = system_prompt.strip()
+        self.voice_id = (voice_id or DEFAULT_VOICE_ID).strip().lower() or DEFAULT_VOICE_ID
+        self._ref_path = Path(ref_path) if ref_path else None
+        self._ref_sha = ""
+        self._ref_duration_ms = -1
         self._ws: Any = None
         self._out: asyncio.Queue[tuple[bytes, int]] = asyncio.Queue()
         self._reader: asyncio.Task | None = None
@@ -261,6 +294,9 @@ class MiniCPMDuplexEngine:
             "turn_max_gap_ms": self._turn_max_gap_ms,
             "rtf": self._last_rtf,
             "reconnect_reason": self._last_reconnect_reason[:80],
+            "voice_id": self.voice_id,
+            "voice_sha": self._ref_sha,
+            "voice_duration_ms": self._ref_duration_ms,
             **self._turn.snapshot(now),
         }
 
@@ -292,7 +328,9 @@ class MiniCPMDuplexEngine:
     async def _connect_and_handshake(self) -> None:
         url = _model_ws_url()
         model = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-o-4_5")
-        ref, ref_source = _ref_audio_data_url()
+        ref, ref_source, ref_meta = _ref_audio_data_url(self._ref_path)
+        self._ref_sha = str(ref_meta.get("sha256") or "")
+        self._ref_duration_ms = int(ref_meta.get("duration_ms") or -1)
         instructions = self.system_prompt or (
             "Clone the voice in the provided audio prompt. Please assist users "
             "while maintaining this voice style. Please answer the user's questions "
@@ -350,7 +388,15 @@ class MiniCPMDuplexEngine:
                 "basic_window_low_tokens": 2000,
             },
         }
-        trace_stream("speech", "voice.ref_loaded", source=ref_source[-120:], bytes=len(ref))
+        trace_stream(
+            "speech",
+            "voice.ref_loaded",
+            voice_id=self.voice_id,
+            source=ref_source[-120:],
+            bytes=int(ref_meta.get("bytes") or 0),
+            sha256=self._ref_sha,
+            duration_ms=self._ref_duration_ms,
+        )
         self._handshake.clear()
         self._handshake_error = ""
         self._ready.clear()
@@ -368,6 +414,7 @@ class MiniCPMDuplexEngine:
             window_low=2000,
             instructions_len=len(instructions),
             chunk_ms=CHUNK_MS,
+            voice_id=self.voice_id,
         )
         try:
             await asyncio.wait_for(self._handshake.wait(), timeout=30.0)
