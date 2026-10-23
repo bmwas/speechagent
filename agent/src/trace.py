@@ -20,9 +20,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import sys
+import threading
 import time
 import traceback
 import uuid
+import atexit
 from contextvars import ContextVar
 from typing import Any
 
@@ -39,8 +43,16 @@ _DISABLED = (os.environ.get("SA_TRACE_DISABLED") or "").strip().lower() in _TRUT
 _DEBUG = (os.environ.get("TRACE_DEBUG") or "1").strip().lower() in _TRUTHY
 _STREAM = (os.environ.get("STREAM_TRACE") or "1").strip().lower() in _TRUTHY
 _HIRES = (os.environ.get("TRACE_HIRES") or "").strip().lower() in _TRUTHY
+_ASYNC_WRITE = (os.environ.get("TRACE_ASYNC_WRITE") or "1").strip().lower() in _TRUTHY
 _MONO_T0 = time.monotonic()
 HIRES_PERIOD_S = 0.1
+_TRACE_QUEUE_MAX = int(os.environ.get("TRACE_QUEUE_MAX", "20000"))
+_TRACE_BATCH_MAX = int(os.environ.get("TRACE_BATCH_MAX", "256"))
+_TRACE_FLUSH_MS = float(os.environ.get("TRACE_FLUSH_MS", "20"))
+_trace_queue: queue.Queue[str | None] = queue.Queue(maxsize=max(_TRACE_QUEUE_MAX, 100))
+_trace_writer: threading.Thread | None = None
+_trace_writer_lock = threading.Lock()
+_trace_dropped = 0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -116,6 +128,80 @@ def mono_ms() -> int:
     return int((time.monotonic() - _MONO_T0) * 1000)
 
 
+def _trace_writer_loop() -> None:
+    while True:
+        try:
+            first = _trace_queue.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        if first is None:
+            _trace_queue.task_done()
+            break
+        batch = [first]
+        if _TRACE_FLUSH_MS > 0:
+            time.sleep(_TRACE_FLUSH_MS / 1000.0)
+        while len(batch) < _TRACE_BATCH_MAX:
+            try:
+                line = _trace_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                _trace_queue.task_done()
+                break
+            batch.append(line)
+        try:
+            sys.stdout.write("\n".join(batch) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            for line in batch:
+                _LOG.info(line)
+        finally:
+            for _ in batch:
+                _trace_queue.task_done()
+
+
+def _ensure_trace_writer() -> None:
+    global _trace_writer
+    if _trace_writer is not None and _trace_writer.is_alive():
+        return
+    with _trace_writer_lock:
+        if _trace_writer is not None and _trace_writer.is_alive():
+            return
+        _trace_writer = threading.Thread(
+            target=_trace_writer_loop,
+            name="sa-trace-writer",
+            daemon=True,
+        )
+        _trace_writer.start()
+
+
+def flush_traces(timeout_s: float = 1.0) -> None:
+    """Best-effort drain used at shutdown and by diagnostics."""
+    if not _ASYNC_WRITE or _trace_writer is None:
+        return
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    while _trace_queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+
+def _write_trace_line(line: str) -> bool:
+    if not _ASYNC_WRITE:
+        try:
+            print(line, flush=True)
+        except Exception:
+            _LOG.info(line)
+        return True
+    _ensure_trace_writer()
+    try:
+        _trace_queue.put_nowait(line)
+        return True
+    except queue.Full:
+        return False
+
+
+atexit.register(flush_traces)
+
+
 def _next_seq(agent: str) -> int:
     n = _seq.get(agent, 0) + 1
     _seq[agent] = n
@@ -143,6 +229,7 @@ def trace_stream(agent: str, event: str, **fields: Any) -> None:
 
 
 def trace(agent: str, event: str, **fields: Any) -> None:
+    global _trace_dropped
     if _DISABLED:
         return
     payload: dict[str, Any] = {
@@ -159,6 +246,10 @@ def trace(agent: str, event: str, **fields: Any) -> None:
         payload["session_id"] = sid
     if _HOSTNAME:
         payload["host"] = _HOSTNAME
+    if _HIRES and _ASYNC_WRITE:
+        payload["trace_queue_depth"] = _trace_queue.qsize()
+    if _trace_dropped:
+        payload["trace_queue_dropped"] = _trace_dropped
     if fields:
         for key, value in fields.items():
             payload[key] = _clip(value)
@@ -177,11 +268,13 @@ def trace(agent: str, event: str, **fields: Any) -> None:
             },
             separators=(",", ":"),
         )
-    # Entire stdout line is SA_TRACE + JSON so Promtail / Grafana `| json` works.
-    try:
-        print(line, flush=True)
-    except Exception:
-        _LOG.info(line)
+    # Queue stdout writes off the realtime event loop. The writer preserves
+    # ordering and batches flushes so packet-level diagnostics cannot become
+    # the source of the audio stalls being measured.
+    if _write_trace_line(line):
+        _trace_dropped = 0
+    else:
+        _trace_dropped += 1
 
 
 def trace_exc(agent: str, event: str, exc: BaseException | None = None, **fields: Any) -> None:

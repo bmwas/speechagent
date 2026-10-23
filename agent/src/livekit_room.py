@@ -105,6 +105,8 @@ class LiveKitBotRoom:
         self._quality_rl = RateLimiter(5.0)
         self._audio_in_rl = RateLimiter(0.1)
         self._capture_rl = RateLimiter(0.1)
+        self._audio_in_seq = 0
+        self._capture_seq = 0
         self._pub_meter = StreamMeter("speech", "stream.livekit_out", kind="out")
 
     def _spawn(self, coro) -> asyncio.Task:
@@ -250,10 +252,12 @@ class LiveKitBotRoom:
                 channels = int(getattr(frame, "num_channels", 1) or 1)
                 if channels >= 2:
                     pcm = downmix_to_mono(pcm, channels)
-                if hires_enabled() and self._audio_in_rl.due():
+                self._audio_in_seq += 1
+                if hires_enabled() or self._audio_in_rl.due():
                     trace_stream(
                         "speech",
                         "livekit.audio_in",
+                        packet_seq=self._audio_in_seq,
                         bytes=len(pcm),
                         rate=rate,
                         channels=channels,
@@ -305,14 +309,24 @@ class LiveKitBotRoom:
             except RuntimeError:
                 return
             block_ms = (time.monotonic() - t0) * 1000.0
+            self._capture_seq += 1
             self._pub_meter.add(frames=1, bytes=len(chunk), block_ms=block_ms)
-            if hires_enabled() and self._capture_rl.due():
+            if hires_enabled() or self._capture_rl.due():
+                queued_duration = getattr(self.source, "queued_duration", None)
+                queued_ms = (
+                    round(float(queued_duration) * 1000.0, 1)
+                    if isinstance(queued_duration, (int, float))
+                    else -1
+                )
                 trace_stream(
                     "speech",
                     "livekit.capture",
+                    frame_seq=self._capture_seq,
                     bytes=len(chunk),
                     block_ms=round(block_ms, 1),
                     out_buf_bytes=len(self._out_buf),
+                    queued_ms=queued_ms,
+                    source_queue_ms=SOURCE_QUEUE_MS,
                 )
             if block_ms >= 50:
                 trace_stream("speech", "playout.block", block_ms=int(block_ms), where="livekit_capture")

@@ -311,7 +311,8 @@ See [`.env`](.env). Important knobs:
 | `QWEN_VIDEO_MAX_SIDE` | `448` | Qwen JPEG long-side cap (3B token budget) |
 | `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
 | `STREAM_TRACE` | `1` | Realtime pipeline traces (`lane=stream`) for the Grafana **Realtime stream** dashboard |
-| `TRACE_HIRES` | `1` | Per-packet / 10 Hz traces for chopping debug. Grafana: **Audio pipeline debug**. Set `0` for 1 Hz aggregation. |
+| `TRACE_HIRES` | `1` | Every packet/frame plus 10 Hz state samples for chopping debug. Grafana: **Audio pipeline debug**. Set `0` for aggregation. |
+| `TRACE_ASYNC_WRITE` | `1` | Batch trace writes off the realtime event loop; required for continuous frame-level logging |
 | `GPU_STATS_INTERVAL_S` | `2` | `nvidia-smi` sample period (`gpu.sample`) |
 | `GPU_STATS_SUMMARY_S` | `30` | Rolling 1m/5m/15m stats line (`gpu.summary`) |
 | `GPU_STATS_VERDICT_S` | `300` | Lifetime avg/p95/peak + “would another model fit?” (`gpu.verdict`) |

@@ -92,6 +92,7 @@ class SpeechSession:
         self._health_task: asyncio.Task | None = None
         self._humans: set[str] = set()
         self._mic_first = False
+        self._mic_packet_seq = 0
         self._last_mic = 0.0
         self._gap_open = False
         self._pull_n = 0
@@ -178,6 +179,21 @@ class SpeechSession:
         # speech during model dead air must keep flowing without cancelling.
         self.vad.bot_playing = self.playout.audible
         edge = self.vad.feed(pcm16)
+        self._mic_packet_seq += 1
+        if hires_enabled():
+            trace_stream(
+                "speech",
+                "stream.mic_packet",
+                packet_seq=self._mic_packet_seq,
+                bytes=len(pcm16),
+                src_rate=int(rate) or 48000,
+                dst_rate=MODEL_RATE,
+                rms=self.vad.last_rms,
+                edge=edge or "",
+                is_speech=bool(self.vad.speaking or edge in ("start", "stop")),
+                bot_playing=self.vad.bot_playing,
+                generating=bool(getattr(self.engine, "generating", False)),
+            )
         if edge == "start":
             generating = bool(getattr(self.engine, "generating", False))
             trace_stream(
@@ -278,6 +294,13 @@ class SpeechSession:
                     self._pull_n += 1
                     self._pull_bytes += pulled
                     ring_ms = self.playout.ring_ms
+                    snap = {}
+                    getter = getattr(self.engine, "stream_snapshot", None)
+                    if callable(getter):
+                        try:
+                            snap = getter() or {}
+                        except Exception:
+                            snap = {}
                     self._pull_meter.add(
                         chunks=len(chunks),
                         bytes=pulled,
@@ -294,6 +317,8 @@ class SpeechSession:
                             chunks=len(chunks),
                             bytes=pulled,
                             ring_ms=round(ring_ms, 1),
+                            response_id=snap.get("response_id", ""),
+                            turn_deltas=snap.get("turn_deltas", -1),
                         )
                     self._empty_polls = 0
                 elif generating:

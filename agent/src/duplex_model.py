@@ -238,6 +238,7 @@ class MiniCPMDuplexEngine:
             "ws_open": self._ws is not None,
             "ready": self._ready.is_set(),
             "speaking": self._speaking,
+            "response_id": self._response_id[:16],
             "out_q": self._out.qsize(),
             "buf_ms": int(1000.0 * (len(self._buf) / 2.0) / MODEL_RATE) if self._buf else 0,
             "audio_end_ms": self._audio_end_ms,
@@ -770,6 +771,7 @@ class MiniCPMDuplexEngine:
             trace_stream(
                 "speech",
                 "duplex.first_audio",
+                packet_seq=self._delta_n,
                 latency_ms=lat,
                 from_speech_ms=from_speech,
                 from_ready_ms=from_ready,
@@ -789,6 +791,7 @@ class MiniCPMDuplexEngine:
             trace_stream(
                 "speech",
                 "duplex.delta_timing",
+                packet_seq=self._delta_n,
                 gap_ms=gap_ms,
                 dur_ms=dur_ms,
                 bytes=len(pcm),
@@ -919,6 +922,7 @@ class MiniCPMDuplexEngine:
             trace_stream(
                 "speech",
                 "duplex.append",
+                packet_seq=self._append_n,
                 bytes=len(pcm16),
                 duration_ms=duration_ms,
                 audio_end_ms=self._audio_end_ms,

@@ -7,7 +7,7 @@ import os
 import time
 
 from audio import pcm_rms
-from trace import StreamMeter, STREAM_PERIOD_S, trace_stream
+from trace import STREAM_PERIOD_S, StreamMeter, hires_enabled, trace_stream
 
 LOG = logging.getLogger("barge_in")
 
@@ -30,6 +30,7 @@ class EnergyVad:
         self._quiet_since: float | None = None
         self._speech_start: float | None = None
         self.last_rms = 0
+        self.frame_seq = 0
         self._stats = StreamMeter("speech", "vad.stats", period_s=STREAM_PERIOD_S)
 
     def _open_thresh(self) -> float:
@@ -40,6 +41,20 @@ class EnergyVad:
         self.last_rms = rms
         now = time.monotonic()
         open_t = self._open_thresh()
+        self.frame_seq += 1
+        if hires_enabled():
+            trace_stream(
+                "speech",
+                "vad.frame",
+                frame_seq=self.frame_seq,
+                bytes=len(pcm16),
+                rms=rms,
+                open_thresh=int(open_t),
+                close_thresh=int(open_t * 0.6),
+                speaking=self.speaking,
+                bot_playing=self.bot_playing,
+                noise_ema=int(self._noise_ema),
+            )
         self._stats.add(
             frames=1,
             rms=rms,

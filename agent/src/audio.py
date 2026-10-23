@@ -168,6 +168,8 @@ class ClockedPlayout:
         self.capture_timeouts = 0
         self.clock_slips = 0
         self.clears = 0
+        self.frame_seq = 0
+        self.push_seq = 0
         self._stats_t = time.monotonic()
         self._silence = b"\x00" * WEBRTC_FRAME_BYTES
         self._first_push = True
@@ -234,11 +236,13 @@ class ClockedPlayout:
         self._ring.extend(pcm)
         self._last_push = time.monotonic()
         self._active = True
+        self.push_seq += 1
         if first or hires_enabled() or self._push_rl.due():
             dur_ms = int(1000.0 * (len(pcm) / 2.0) / WEBRTC_RATE)
             trace_stream(
                 "speech",
                 "playout.push",
+                packet_seq=self.push_seq,
                 bytes=len(pcm),
                 rate=rate,
                 ring_ms=round(self.ring_ms, 1),
@@ -256,6 +260,34 @@ class ClockedPlayout:
         self._underrun_open = False
         self._underrun_t0 = 0.0
         self._underrun_frames = 0
+
+    def _trace_frame(
+        self,
+        kind: str,
+        frame: bytes,
+        *,
+        ring_before_ms: float,
+        real_bytes: int,
+        now: float,
+    ) -> None:
+        if not hires_enabled():
+            return
+        self.frame_seq += 1
+        trace_stream(
+            "speech",
+            "playout.frame",
+            frame_seq=self.frame_seq,
+            kind=kind,
+            bytes=len(frame),
+            real_bytes=real_bytes,
+            rms=pcm_rms(frame) if real_bytes else 0,
+            ring_before_ms=round(ring_before_ms, 1),
+            ring_ms=round(self.ring_ms, 1),
+            buffering=self._buffering,
+            source_active=self.source_active,
+            audible=self.audible,
+            since_push_ms=int((now - self._last_push) * 1000) if self._last_push else -1,
+        )
 
     def _emit_turn_summary(self, reason: str) -> None:
         if self._turn_frames <= 0:
@@ -294,6 +326,7 @@ class ClockedPlayout:
     def take_frame(self, now: float | None = None) -> bytes | None:
         now = time.monotonic() if now is None else now
         need = WEBRTC_FRAME_BYTES
+        ring_before_ms = self.ring_ms
 
         if hires_enabled() and self._ring_sample_rl.due():
             trace_stream(
@@ -328,6 +361,13 @@ class ClockedPlayout:
                         target_ms=int(self._buf_target_ms),
                         waited_ms=int(waited_ms),
                     )
+                self._trace_frame(
+                    "prebuffer_silence",
+                    self._silence,
+                    ring_before_ms=ring_before_ms,
+                    real_bytes=0,
+                    now=now,
+                )
                 return self._silence
             self._buffering = False
             self._buffering_t0 = 0.0
@@ -369,10 +409,18 @@ class ClockedPlayout:
             if not self._first_frame:
                 self._first_frame = True
                 trace_stream("speech", "playout.first_frame", bytes=len(frame), ring_ms=round(rm, 1))
+            self._trace_frame(
+                "real",
+                frame,
+                ring_before_ms=ring_before_ms,
+                real_bytes=len(frame),
+                now=now,
+            )
             return frame
 
         if self._ring:
-            frame = bytes(self._ring) + self._silence[len(self._ring) :]
+            real_bytes = len(self._ring)
+            frame = bytes(self._ring) + self._silence[real_bytes:]
             self._ring.clear()
             self.frames += 1
             if not self._turn_open:
@@ -380,6 +428,13 @@ class ClockedPlayout:
                 self._reset_turn_stats()
             self._turn_frames += 1
             self._last_real_frame = now
+            self._trace_frame(
+                "real_padded",
+                frame[:need],
+                ring_before_ms=ring_before_ms,
+                real_bytes=real_bytes,
+                now=now,
+            )
             return frame[:need]
 
         if self._active and self._last_push and (now - self._last_push) <= HOLD_SILENCE_S:
@@ -405,6 +460,13 @@ class ClockedPlayout:
                     episode=self._underrun_episodes,
                 )
             self._underrun_frames += 1
+            self._trace_frame(
+                "underrun_silence",
+                self._silence,
+                ring_before_ms=ring_before_ms,
+                real_bytes=0,
+                now=now,
+            )
             return self._silence
 
         if self._active:

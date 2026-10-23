@@ -447,9 +447,190 @@
           "maxLines": 5000
         }
       ]
+    },
+    {
+      "id": 105,
+      "type": "row",
+      "title": "Continuous frame-level diagnostics",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 99 },
+      "collapsed": false
+    },
+    {
+      "id": 19,
+      "title": "Playout frames/sec by kind",
+      "description": "Every emitted 20 ms frame. real/real_padded is speech; prebuffer_silence and underrun_silence are generated silence.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 100 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{kind}}",
+          "expr": "sum by (kind) (count_over_time({compose_project=\"speechagent\", event=\"playout.frame\"} | json [1s]))"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Real audio vs generated silence (frames/5s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 100 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "real",
+          "legendFormat": "real audio",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.frame\"} | json | kind=~\"real.*\" [5s]))"
+        },
+        {
+          "refId": "silence",
+          "legendFormat": "generated silence",
+          "expr": "sum(count_over_time({compose_project=\"speechagent\", event=\"playout.frame\"} | json | kind=~\".*silence\" [5s]))"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "LiveKit capture blocking + queued audio",
+      "description": "Every outbound 20 ms frame. block_ms reveals SDK backpressure; queued_ms reveals hidden AudioSource buffering.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 108 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "block",
+          "legendFormat": "capture block_ms",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"livekit.capture\"} | json | unwrap block_ms | __error__=\"\" [2s])"
+        },
+        {
+          "refId": "queue",
+          "legendFormat": "AudioSource queued_ms",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"livekit.capture\"} | json | unwrap queued_ms | __error__=\"\" [2s])"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Prebuffer wait and fill",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 108 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "wait",
+          "legendFormat": "waited_ms",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"playout.resume\"} | json | unwrap waited_ms | __error__=\"\" [10s])"
+        },
+        {
+          "refId": "fill",
+          "legendFormat": "fill_ms",
+          "expr": "max_over_time({compose_project=\"speechagent\", event=\"playout.buffering\"} | json | unwrap fill_ms | __error__=\"\" [2s])"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "HiFT / CFM graph capture and eager fallback",
+      "description": "Model-server events that can block Code2Wav and create multi-second output gaps.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 116 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", service=\"model-server\"} |~ \"Lazily capturing|Captured HiFT|Captured CFM|Falling back to eager\"",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 5000
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "Speech during model dead air (cancel avoided)",
+      "description": "User speech while generating=true but no real bot audio is audible. These turns are no longer falsely cancelled.",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 116 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"turn\\\\.speech_during_model_stall|turn\\\\.barge_in|duplex\\\\.cancel\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 5000
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "Every playout + LiveKit output frame",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 16, "x": 0, "y": 126 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "timeFrom": "2m",
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"playout\\\\.frame|livekit\\\\.capture\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 10000
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "Trace writer health",
+      "description": "Any value above zero means stdout/Loki could not keep up and trace lines were dropped.",
+      "type": "timeseries",
+      "gridPos": { "h": 12, "w": 8, "x": 16, "y": 126 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "drops",
+          "legendFormat": "dropped trace lines",
+          "expr": "max_over_time({compose_project=\"speechagent\", lane=\"stream\"} | json | unwrap trace_queue_dropped | __error__=\"\" [10s])"
+        },
+        {
+          "refId": "depth",
+          "legendFormat": "writer queue depth",
+          "expr": "max_over_time({compose_project=\"speechagent\", lane=\"stream\"} | json | unwrap trace_queue_depth | __error__=\"\" [2s])"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "title": "Every mic input + VAD decision frame",
+      "description": "LiveKit packet, post-resample agent packet, and VAD decision for every incoming audio frame.",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 138 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "timeFrom": "2m",
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"livekit\\\\.audio_in|stream\\\\.mic_packet|vad\\\\.frame\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 10000
+        }
+      ]
     }
   ],
-  "refresh": "5s",
+  "refresh": "2s",
   "schemaVersion": 39,
   "tags": ["speechagent", "audio", "debug"],
   "templating": { "list": [] },
