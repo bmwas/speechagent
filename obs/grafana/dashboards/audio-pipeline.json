@@ -88,6 +88,11 @@
           "refId": "pull",
           "legendFormat": "ring_ms (pull)",
           "expr": "avg_over_time({compose_project=\"speechagent\", event=\"pull.chunk\"} | json | unwrap ring_ms | __error__=\"\" [15s])"
+        },
+        {
+          "refId": "sample",
+          "legendFormat": "ring_ms (10 Hz sample)",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"playout.ring_sample\"} | json | unwrap ring_ms | __error__=\"\" [5s])"
         }
       ]
     },
@@ -289,7 +294,7 @@
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\", event=~\"playout\\\\.(underrun|recover|resume|idle|first_frame|clear|turn_summary|clock_slip|capture_timeout)\"}",
+          "expr": "{compose_project=\"speechagent\", event=~\"playout\\\\.(underrun|recover|resume|idle|first_frame|clear|turn_summary|clock_slip|capture_timeout|buffering|push|ring_sample)\"}",
           "queryType": "range",
           "refId": "A"
         }
@@ -319,9 +324,127 @@
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\", event=~\"pull\\\\.chunk|duplex\\\\.(speak|listen|response_done|response_created)|stream\\\\.(user_utt_start|user_utt_end)|turn\\\\.barge_in\"}",
+          "expr": "{compose_project=\"speechagent\", event=~\"pull\\\\.(chunk|empty)|playout\\\\.source_active_change|duplex\\\\.(speak|listen|response_done|response_created)|stream\\\\.(user_utt_start|user_utt_end)|turn\\\\.barge_in\"}",
           "queryType": "range",
           "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 104,
+      "type": "row",
+      "title": "Packet timeline (TRACE_HIRES)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
+      "collapsed": false
+    },
+    {
+      "id": 13,
+      "title": "Packet timeline — every stream event",
+      "description": "Primary debug view. Every SA_TRACE stream event with mono_ms relative clock.",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 57 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "timeFrom": "2m",
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", lane=\"stream\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 5000
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "WS message timeline (rx + tx)",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 69 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "timeFrom": "2m",
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"duplex\\\\.ws_rx|duplex\\\\.ws_tx\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 5000
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Ring depth (sub-second, 10 Hz)",
+      "description": "playout.ring_sample every 100 ms. Drops to 0 immediately before an underrun.",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 69 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "timeFrom": "5m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "pointSize": 3, "showPoints": "auto" },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 50 }, { "color": "green", "value": 150 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "ring_ms",
+          "expr": "avg_over_time({compose_project=\"speechagent\", event=\"playout.ring_sample\"} | json | unwrap ring_ms | __error__=\"\" [2s])"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Delta packet timeline",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 79 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "timeFrom": "2m",
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"duplex\\\\.delta_timing|duplex\\\\.first_audio\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 5000
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Mic append timeline",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 79 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "timeFrom": "2m",
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"duplex\\\\.append|duplex\\\\.mic_drop|duplex\\\\.commit\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 5000
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Source-active + pull timeline",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 89 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
+      "timeFrom": "2m",
+      "targets": [
+        {
+          "expr": "{compose_project=\"speechagent\", event=~\"pull\\\\.(chunk|empty)|playout\\\\.source_active_change\"}",
+          "queryType": "range",
+          "refId": "A",
+          "maxLines": 5000
         }
       ]
     }

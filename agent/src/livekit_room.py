@@ -11,7 +11,7 @@ from typing import Any
 
 from audio import WEBRTC_CHANNELS, WEBRTC_FRAME_BYTES, WEBRTC_FRAME_SAMPLES, WEBRTC_RATE, LinearResampler, downmix_to_mono
 from tokens import BOT_IDENTITY, livekit_url
-from trace import RateLimiter, StreamMeter, trace_exc, trace_stream
+from trace import RateLimiter, StreamMeter, hires_enabled, trace_exc, trace_stream
 
 LOG = logging.getLogger("livekit_room")
 SOURCE_QUEUE_MS = int(os.environ.get("AUDIO_SOURCE_QUEUE_MS", "120"))
@@ -103,6 +103,8 @@ class LiveKitBotRoom:
         self._out_resampler: LinearResampler | None = None
         self._rtc: Any = None
         self._quality_rl = RateLimiter(5.0)
+        self._audio_in_rl = RateLimiter(0.1)
+        self._capture_rl = RateLimiter(0.1)
         self._pub_meter = StreamMeter("speech", "stream.livekit_out", kind="out")
 
     def _spawn(self, coro) -> asyncio.Task:
@@ -248,6 +250,15 @@ class LiveKitBotRoom:
                 channels = int(getattr(frame, "num_channels", 1) or 1)
                 if channels >= 2:
                     pcm = downmix_to_mono(pcm, channels)
+                if hires_enabled() and self._audio_in_rl.due():
+                    trace_stream(
+                        "speech",
+                        "livekit.audio_in",
+                        bytes=len(pcm),
+                        rate=rate,
+                        channels=channels,
+                        identity=identity,
+                    )
                 if self.on_audio:
                     await self.on_audio(pcm, rate, identity)
         except asyncio.CancelledError:
@@ -295,6 +306,14 @@ class LiveKitBotRoom:
                 return
             block_ms = (time.monotonic() - t0) * 1000.0
             self._pub_meter.add(frames=1, bytes=len(chunk), block_ms=block_ms)
+            if hires_enabled() and self._capture_rl.due():
+                trace_stream(
+                    "speech",
+                    "livekit.capture",
+                    bytes=len(chunk),
+                    block_ms=round(block_ms, 1),
+                    out_buf_bytes=len(self._out_buf),
+                )
             if block_ms >= 50:
                 trace_stream("speech", "playout.block", block_ms=int(block_ms), where="livekit_capture")
 

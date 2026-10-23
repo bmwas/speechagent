@@ -13,7 +13,7 @@ from duplex_model import MiniCPMDuplexEngine
 from livekit_room import LiveKitBotRoom, cancel_task_robust
 from qwen_omni import QwenOmniEngine
 from tokens import BOT_IDENTITY, token_for_bot
-from trace import RateLimiter, StreamMeter, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
+from trace import RateLimiter, StreamMeter, hires_enabled, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
 from video import FrameSampler
 
 LOG = logging.getLogger("agent")
@@ -99,6 +99,8 @@ class SpeechSession:
         self._pull_last_t = 0.0
         self._empty_polls = 0
         self._pull_chunk_rl = RateLimiter(2.0)
+        self._pull_empty_rl = RateLimiter(0.1)
+        self._prev_source_active: bool | None = None
         self._mic_meter = StreamMeter("speech", "stream.mic_in", kind="in")
         self._pull_meter = StreamMeter("speech", "stream.playout_pull", kind="out")
 
@@ -233,7 +235,26 @@ class SpeechSession:
                 # Tell the jitter buffer whether the model is still producing,
                 # so it waits for the prebuffer while generating but flushes the
                 # tail of a short reply immediately when generation stops.
-                self.playout.source_active = bool(getattr(self.engine, "generating", False))
+                generating = bool(getattr(self.engine, "generating", False))
+                self.playout.source_active = generating
+                if generating != self._prev_source_active:
+                    snap = {}
+                    getter = getattr(self.engine, "stream_snapshot", None)
+                    if callable(getter):
+                        try:
+                            snap = getter() or {}
+                        except Exception:
+                            snap = {}
+                    trace_stream(
+                        "speech",
+                        "playout.source_active_change",
+                        source_active=generating,
+                        prev=self._prev_source_active,
+                        ring_ms=round(self.playout.ring_ms, 1),
+                        generating=generating,
+                        turn_deltas=snap.get("turn_deltas", -1),
+                    )
+                    self._prev_source_active = generating
                 for pcm, rate in chunks:
                     self.vad.bot_playing = True
                     self.playout.push(pcm, int(rate) or 24000)
@@ -252,7 +273,7 @@ class SpeechSession:
                         pull_gap_ms=pull_gap_ms,
                         empty_polls=self._empty_polls,
                     )
-                    if self._pull_n <= 5 or pull_gap_ms >= 250 or self._pull_chunk_rl.due():
+                    if hires_enabled() or self._pull_n <= 5 or pull_gap_ms >= 250 or self._pull_chunk_rl.due():
                         trace_stream(
                             "speech",
                             "pull.chunk",
@@ -263,8 +284,15 @@ class SpeechSession:
                             ring_ms=round(ring_ms, 1),
                         )
                     self._empty_polls = 0
-                elif getattr(self.engine, "generating", False):
+                elif generating:
                     self._empty_polls += 1
+                    if hires_enabled() and self._pull_empty_rl.due():
+                        trace_stream(
+                            "speech",
+                            "pull.empty",
+                            empty_polls=self._empty_polls,
+                            ring_ms=round(self.playout.ring_ms, 1),
+                        )
                 if not chunks and not getattr(self.engine, "generating", False):
                     self.vad.bot_playing = False
                 await asyncio.sleep(0.01)

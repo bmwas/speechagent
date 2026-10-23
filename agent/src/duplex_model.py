@@ -14,7 +14,7 @@ from typing import Any
 import websockets
 
 from audio import MODEL_RATE, pcm_rms
-from trace import RateLimiter, StreamMeter, TypeCounter, trace_exc, trace_stream
+from trace import RateLimiter, StreamMeter, TypeCounter, hires_enabled, trace_exc, trace_stream
 
 LOG = logging.getLogger("duplex")
 CHUNK_MS = int(os.environ.get("AUDIO_CHUNK_MS", "100"))
@@ -216,6 +216,8 @@ class MiniCPMDuplexEngine:
         self._text_rl = RateLimiter(1.0)
         self._unknown_rl = RateLimiter(2.0)
         self._stall_rl = RateLimiter(2.0)
+        self._ws_tx_rl = RateLimiter(1.0)
+        self._mic_drop_rl = RateLimiter(1.0)
         self._watchdog: asyncio.Task | None = None
         self._reconnect_reason = ""
         self._last_reconnect = 0.0
@@ -263,7 +265,16 @@ class MiniCPMDuplexEngine:
         if self._ws is None:
             return
         body.setdefault("event_id", self._eid())
-        await self._ws.send(json.dumps(body))
+        payload = json.dumps(body)
+        if hires_enabled() or self._ws_tx_rl.due():
+            trace_stream(
+                "speech",
+                "duplex.ws_tx",
+                type=str(body.get("type") or ""),
+                bytes=len(payload),
+                event_id=str(body.get("event_id") or ""),
+            )
+        await self._ws.send(payload)
 
     async def start(self) -> None:
         self._closing = False
@@ -513,8 +524,10 @@ class MiniCPMDuplexEngine:
                 if isinstance(raw, bytes):
                     self._bin_n += 1
                     if raw:
-                        if self._bin_n == 1:
-                            trace_stream("speech", "duplex.binary_frame", bytes=len(raw), n=1)
+                        if self._bin_n == 1 or hires_enabled():
+                            trace_stream("speech", "duplex.binary_frame", bytes=len(raw), n=self._bin_n)
+                        if hires_enabled():
+                            trace_stream("speech", "duplex.ws_rx", type="binary", bytes=len(raw), n=self._bin_n)
                         await self._out.put((raw, self._out_rate))
                     continue
                 try:
@@ -522,6 +535,19 @@ class MiniCPMDuplexEngine:
                 except json.JSONDecodeError:
                     trace_stream("speech", "duplex.bad_json", bytes=len(raw) if isinstance(raw, str) else 0)
                     continue
+                if hires_enabled():
+                    rx_type = str(ev.get("type") or "empty")
+                    extra: dict[str, Any] = {}
+                    if rx_type in _AUDIO_DELTA_TYPES:
+                        blob = ev.get("delta") or ev.get("audio") or ""
+                        extra["delta_chars"] = len(str(blob))
+                    trace_stream(
+                        "speech",
+                        "duplex.ws_rx",
+                        type=rx_type,
+                        bytes=len(raw) if isinstance(raw, str) else 0,
+                        **extra,
+                    )
                 await self._handle(ev)
         except asyncio.CancelledError:
             raise
@@ -596,7 +622,7 @@ class MiniCPMDuplexEngine:
         if typ in _TEXT_DELTA_TYPES:
             self._text_n += 1
             text = str(ev.get("delta") or ev.get("text") or "")[:80]
-            if self._text_n == 1 or self._text_rl.due():
+            if hires_enabled() or self._text_n == 1 or self._text_rl.due():
                 trace_stream("speech", "duplex.text_delta", n=self._text_n, text=text, chars=len(text))
             return
         if typ in ("response.listen",) or ev.get("decision") == "listen":
@@ -743,7 +769,7 @@ class MiniCPMDuplexEngine:
         gen_wall_ms = _age_ms(self._turn_gen_t0, now) if self._turn_gen_t0 else 0
         rtf = round(self._turn_audio_ms / gen_wall_ms, 2) if gen_wall_ms > 0 else 0.0
         self._last_rtf = rtf
-        if self._turn_deltas <= 5 or gap_ms >= 250 or self._delta_timing_rl.due():
+        if hires_enabled() or self._turn_deltas <= 5 or gap_ms >= 250 or self._delta_timing_rl.due():
             trace_stream(
                 "speech",
                 "duplex.delta_timing",
@@ -780,7 +806,16 @@ class MiniCPMDuplexEngine:
         # because is_speech=True. Drop leftover silence so it is not dumped
         # the moment the model yields.
         if not is_speech and self._speaking:
+            dropped = len(self._buf)
             self._buf.clear()
+            if hires_enabled() or (dropped and self._mic_drop_rl.due()):
+                trace_stream(
+                    "speech",
+                    "duplex.mic_drop",
+                    bytes=dropped + len(pcm16),
+                    speaking=True,
+                    audio_end_ms=self._audio_end_ms,
+                )
             return
         self._buf.extend(pcm16)
         chunk_bytes = int(MODEL_RATE * (CHUNK_MS / 1000.0) * 2)
@@ -864,6 +899,17 @@ class MiniCPMDuplexEngine:
         self._last_is_speech = bool(is_speech)
         if speech_ended:
             await self._commit_input()
+        if hires_enabled():
+            trace_stream(
+                "speech",
+                "duplex.append",
+                bytes=len(pcm16),
+                duration_ms=duration_ms,
+                audio_end_ms=self._audio_end_ms,
+                rms=rms,
+                is_speech=int(bool(is_speech)),
+                video_attached=int(video_attached),
+            )
         self._append_meter.add(
             chunks=1,
             bytes=len(pcm16),

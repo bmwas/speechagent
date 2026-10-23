@@ -21,7 +21,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 
-from trace import RateLimiter, trace_stream
+from trace import RateLimiter, hires_enabled, hires_period, trace_stream
 
 LOG = logging.getLogger("audio")
 
@@ -46,7 +46,7 @@ PLAYOUT_MAX_WAIT_MS = float(os.environ.get("PLAYOUT_MAX_WAIT_MS", "3000"))
 HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "2.0"))
 
 CAPTURE_TIMEOUT_S = float(os.environ.get("PLAYOUT_CAPTURE_TIMEOUT_S", "0.08"))
-STATS_EVERY_S = 5.0
+STATS_EVERY_S = hires_period(5.0) if not hires_enabled() else 0.5
 SILENCE_RMS = int(os.environ.get("LEADING_SILENCE_RMS", "80"))
 
 
@@ -195,6 +195,9 @@ class ClockedPlayout:
         self._late_ticks = 0
         self._slip_rl = RateLimiter(2.0)
         self._capto_rl = RateLimiter(2.0)
+        self._ring_sample_rl = RateLimiter(0.1)
+        self._buffering_rl = RateLimiter(0.1)
+        self._push_rl = RateLimiter(1.0)
 
     @property
     def ring_ms(self) -> float:
@@ -204,10 +207,10 @@ class ClockedPlayout:
         if not pcm:
             return
         rate = int(sample_rate) or WEBRTC_RATE
+        first = self._first_push
         if self._first_push:
             pcm = trim_leading_silence(pcm)
             self._first_push = False
-            trace_stream("speech", "playout.push", bytes=len(pcm), rate=rate, first=True)
         if rate != WEBRTC_RATE:
             if self._resampler is None or self._resampler.dst_rate != WEBRTC_RATE:
                 self._resampler = LinearResampler(WEBRTC_RATE)
@@ -217,6 +220,17 @@ class ClockedPlayout:
         self._ring.extend(pcm)
         self._last_push = time.monotonic()
         self._active = True
+        if first or hires_enabled() or self._push_rl.due():
+            dur_ms = int(1000.0 * (len(pcm) / 2.0) / WEBRTC_RATE)
+            trace_stream(
+                "speech",
+                "playout.push",
+                bytes=len(pcm),
+                rate=rate,
+                ring_ms=round(self.ring_ms, 1),
+                dur_ms=dur_ms,
+                first=first,
+            )
 
     def _reset_turn_stats(self) -> None:
         self._turn_frames = 0
@@ -266,6 +280,16 @@ class ClockedPlayout:
         now = time.monotonic() if now is None else now
         need = WEBRTC_FRAME_BYTES
 
+        if hires_enabled() and self._ring_sample_rl.due():
+            trace_stream(
+                "speech",
+                "playout.ring_sample",
+                ring_ms=round(self.ring_ms, 1),
+                buffering=self._buffering,
+                source_active=self.source_active,
+                active=self._active,
+            )
+
         # --- Jitter buffer gate: while buffering, hold real audio and feed
         # silence until the ring reaches the target (or the source stops, or
         # we hit the safety cap).  This is what makes playback smooth. ---
@@ -281,6 +305,14 @@ class ClockedPlayout:
             )
             if not ready:
                 self.silence_frames += 1
+                if hires_enabled() and self._buffering_rl.due():
+                    trace_stream(
+                        "speech",
+                        "playout.buffering",
+                        fill_ms=round(fill_ms, 1),
+                        target_ms=int(self._buf_target_ms),
+                        waited_ms=int(waited_ms),
+                    )
                 return self._silence
             self._buffering = False
             self._buffering_t0 = 0.0

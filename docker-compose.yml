@@ -216,6 +216,7 @@ services:
       TRACE_DEBUG: ${TRACE_DEBUG:-1}
       STREAM_TRACE: ${STREAM_TRACE:-1}
       STREAM_TRACE_PERIOD_S: ${STREAM_TRACE_PERIOD_S:-1}
+      TRACE_HIRES: ${TRACE_HIRES:-1}
       PORT: "${AGENT_PORT:-8860}"
     volumes:
       - ./models:/models:ro

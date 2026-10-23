@@ -38,6 +38,9 @@ STREAM_LANE = "stream"
 _DISABLED = (os.environ.get("SA_TRACE_DISABLED") or "").strip().lower() in _TRUTHY
 _DEBUG = (os.environ.get("TRACE_DEBUG") or "1").strip().lower() in _TRUTHY
 _STREAM = (os.environ.get("STREAM_TRACE") or "1").strip().lower() in _TRUTHY
+_HIRES = (os.environ.get("TRACE_HIRES") or "").strip().lower() in _TRUTHY
+_MONO_T0 = time.monotonic()
+HIRES_PERIOD_S = 0.1
 
 
 def _env_float(name: str, default: float) -> float:
@@ -50,7 +53,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-STREAM_PERIOD_S = _env_float("STREAM_TRACE_PERIOD_S", 1.0)
+STREAM_PERIOD_S = HIRES_PERIOD_S if _HIRES else _env_float("STREAM_TRACE_PERIOD_S", 1.0)
 # Fields that should be max'd (not summed) inside a StreamMeter window.
 _METER_MAX_KEYS = {
     "rms",
@@ -100,6 +103,19 @@ def stream_enabled() -> bool:
     return _STREAM and not _DISABLED
 
 
+def hires_enabled() -> bool:
+    return _HIRES and not _DISABLED
+
+
+def hires_period(normal_s: float) -> float:
+    """Return 0.1 s when TRACE_HIRES is on, otherwise *normal_s*."""
+    return HIRES_PERIOD_S if _HIRES else normal_s
+
+
+def mono_ms() -> int:
+    return int((time.monotonic() - _MONO_T0) * 1000)
+
+
 def _next_seq(agent: str) -> int:
     n = _seq.get(agent, 0) + 1
     _seq[agent] = n
@@ -131,6 +147,7 @@ def trace(agent: str, event: str, **fields: Any) -> None:
         return
     payload: dict[str, Any] = {
         "ts": time.time(),
+        "mono_ms": mono_ms(),
         "agent": agent,
         "event": event,
     }
@@ -152,6 +169,7 @@ def trace(agent: str, event: str, **fields: Any) -> None:
         line = TRACE_PREFIX + json.dumps(
             {
                 "ts": time.time(),
+                "mono_ms": mono_ms(),
                 "agent": agent,
                 "event": "trace.serialize_error",
                 "trace_id": tid,
@@ -194,7 +212,7 @@ class RateLimiter:
     """First call always fires; then at most once per *period_s*."""
 
     def __init__(self, period_s: float = 1.0) -> None:
-        self.period_s = period_s
+        self.period_s = hires_period(period_s)
         self._last = 0.0
         self._first = True
 

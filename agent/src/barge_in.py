@@ -7,7 +7,7 @@ import os
 import time
 
 from audio import pcm_rms
-from trace import StreamMeter, trace_stream
+from trace import StreamMeter, STREAM_PERIOD_S, trace_stream
 
 LOG = logging.getLogger("barge_in")
 
@@ -30,7 +30,7 @@ class EnergyVad:
         self._quiet_since: float | None = None
         self._speech_start: float | None = None
         self.last_rms = 0
-        self._stats = StreamMeter("speech", "vad.stats")
+        self._stats = StreamMeter("speech", "vad.stats", period_s=STREAM_PERIOD_S)
 
     def _open_thresh(self) -> float:
         return max(MIC_GATE_MIN, self._noise_ema * MIC_GATE_MULT, MIC_GATE_RMS)

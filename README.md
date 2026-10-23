@@ -245,7 +245,7 @@ Promtail parses the prefix, labels `agent` + `event` + `lane`, and stores `sessi
 | `voice.ref_loaded` | Which WAV / Qwen speaker |
 | `error.*` | Failures with traceback |
 
-`TRACE_DEBUG=1` and `STREAM_TRACE=1` (defaults) emit VAD-edge plus 1 Hz pipeline meters (`lane=stream` in Loki). Per-packet PCM/JPEG is not logged. Raw PCM and JPEG are never logged.
+`TRACE_DEBUG=1` and `STREAM_TRACE=1` (defaults) emit VAD-edge plus 1 Hz pipeline meters (`lane=stream` in Loki). `TRACE_HIRES=1` logs every WebSocket message, audio delta, mic append, playout push, and 10 Hz ring/LiveKit samples. Raw PCM and JPEG are never logged.
 
 On `docker compose down`, `log-janitor` deletes `./logs/**` (Loki chunks + collector files). Docker json-file logs die with the containers. Weights in `./models` are kept.
 
@@ -307,6 +307,7 @@ See [`.env`](.env). Important knobs:
 | `QWEN_VIDEO_MAX_SIDE` | `448` | Qwen JPEG long-side cap (3B token budget) |
 | `TRACE_DEBUG` | `1` | Extra debug traces (VAD edges). Dropped video/audio chunks are not logged. |
 | `STREAM_TRACE` | `1` | Realtime pipeline traces (`lane=stream`) for the Grafana **Realtime stream** dashboard |
+| `TRACE_HIRES` | `1` | Per-packet / 10 Hz traces for chopping debug. Grafana: **Audio pipeline debug**. Set `0` for 1 Hz aggregation. |
 | `GPU_STATS_INTERVAL_S` | `2` | `nvidia-smi` sample period (`gpu.sample`) |
 | `GPU_STATS_SUMMARY_S` | `30` | Rolling 1m/5m/15m stats line (`gpu.summary`) |
 | `GPU_STATS_VERDICT_S` | `300` | Lifetime avg/p95/peak + “would another model fit?” (`gpu.verdict`) |
