@@ -464,6 +464,10 @@ class MiniCPMDuplexEngine:
             while not self._closing:
                 await asyncio.sleep(0.5)
                 now = time.monotonic()
+                # Live audio (including HiFT gaps while _speaking) is not a
+                # dead session. Only time out a commit that got no decision.
+                if self._speaking and self._turn.armed:
+                    self._note_decision("speaking")
                 timeout_reason = self._turn.poll(now)
                 if timeout_reason:
                     wait_ms = _age_ms(self._turn.t_commit, now)
@@ -888,6 +892,8 @@ class MiniCPMDuplexEngine:
         if first:
             self._turn_gen_t0 = now
             self._note_decision("first_audio")
+        elif self._turn.armed:
+            self._note_decision("audio")
             lat = _age_ms(self._t_speak, now) if self._t_speak else -1
             from_speech = _age_ms(self._t_user_speech, now)
             from_ready = _age_ms(self._t_ready, now)
@@ -984,13 +990,21 @@ class MiniCPMDuplexEngine:
         self._commit_pending = False
         await self._send({"type": "input_audio_buffer.commit"})
         now = time.monotonic()
-        self._turn.arm(now)
+        waiting = False
+        if self._speaking:
+            # A follow-up commit during generation must not start an 8s
+            # death timer; HiFT gaps are 5–30s and audio is still coming.
+            pass
+        else:
+            self._turn.arm(now)
+            waiting = True
         trace_stream(
             "speech",
             "duplex.commit",
             audio_end_ms=self._audio_end_ms,
             session_generation=self._turn.generation,
-            turn_waiting=True,
+            turn_waiting=waiting,
+            speaking=self._speaking,
             decision_timeout_ms=self._turn.timeout_ms,
         )
 

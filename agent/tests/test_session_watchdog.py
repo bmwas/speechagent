@@ -110,6 +110,56 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(eng._reconnect_reason, "")
         self.assertTrue(eng._ready.is_set())
 
+    async def test_commit_during_speak_does_not_arm(self) -> None:
+        eng = MiniCPMDuplexEngine()
+        sent: list[dict] = []
+
+        async def fake_send(body: dict) -> None:
+            sent.append(dict(body))
+
+        eng._ws = object()
+        eng._ready.set()
+        eng._speaking = True
+        eng._commit_pending = True
+        eng._send = fake_send  # type: ignore[method-assign]
+        await eng._commit_input()
+        self.assertEqual(sent[0]["type"], "input_audio_buffer.commit")
+        self.assertFalse(eng._turn.armed)
+
+    async def test_watchdog_ignores_timeout_while_speaking(self) -> None:
+        eng = MiniCPMDuplexEngine()
+        eng._ready.set()
+        eng._speaking = True
+        eng._turn.note_session()
+        eng._turn.arm(time.monotonic() - 9.0)
+        reconnects: list[str] = []
+
+        async def fake_reconnect(reason: str) -> None:
+            reconnects.append(reason)
+
+        eng._reconnect = fake_reconnect  # type: ignore[method-assign]
+        task = asyncio.create_task(eng._watchdog_loop())
+        try:
+            await asyncio.sleep(0.7)
+            self.assertEqual(reconnects, [])
+            self.assertFalse(eng._turn.armed)
+            self.assertTrue(eng._ready.is_set())
+        finally:
+            eng._closing = True
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_audio_delta_clears_armed_watchdog(self) -> None:
+        eng = MiniCPMDuplexEngine()
+        eng._turn.arm(time.monotonic())
+        eng._speaking = True
+        eng._note_decision("audio")
+        self.assertFalse(eng._turn.armed)
+        self.assertEqual(eng._turn.decision, "audio")
+
     async def test_commit_body_has_no_protocol_extras(self) -> None:
         eng = MiniCPMDuplexEngine()
         sent: list[dict] = []
