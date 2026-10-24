@@ -77,7 +77,15 @@ class SpeechSession:
             self.engine = MiniCPMDuplexEngine(prompt, voice_id=spec.id, ref_path=ref)
         else:
             self.engine = QwenOmniEngine(prompt)
-        self.vad = EnergyVad()
+        # MiniCPM commits the user turn on VAD stop. 0.80 s chops mid-thought
+        # pauses into extra commits; the model then `listen`s and the user
+        # has to repeat. Qwen still uses VAD_STOP_SECS (turn generate).
+        vad_stop = (
+            _env_float("MINICPM_VAD_STOP_SECS", 1.2)
+            if self.minicpm
+            else _env_float("VAD_STOP_SECS", 0.80)
+        )
+        self.vad = EnergyVad(stop_secs=vad_stop)
         self.playout = ClockedPlayout()
         if self.minicpm:
             self.frames = FrameSampler()
@@ -122,6 +130,7 @@ class SpeechSession:
             model=self.model_name,
             path="minicpm" if self.minicpm else "qwen",
             voice_id=self.voice_id,
+            vad_stop_secs=self.vad.stop_secs,
         )
         token = token_for_bot(self.room_id)
         self.bot = LiveKitBotRoom(

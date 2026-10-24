@@ -120,7 +120,9 @@ install_minicpm_vocoder() {
 # v0.30.0 MiniCPM-o live-duplex tunings that are not YAML knobs:
 # 1) HiFT max_lazy_graphs is hardcoded at 8. After 8 unseen chunk
 #    shapes, Code2Wav falls back to eager HiFT (5-15 s holes).
-# 2) A Talker ledger miss raises and kills the duplex session; skip
+# 2) Predefined HiFT buckets are only (48,0)/(56,3840). Live first/last
+#    chunks use even sizes 10-54; each new shape recaptures mid-utterance.
+# 3) A Talker ledger miss raises and kills the duplex session; skip
 #    that one handoff instead so the socket stays up.
 tune_minicpm_omni() {
   python - <<'PY'
@@ -191,11 +193,44 @@ def wrap_talker_handoff(path: Path) -> None:
 
 
 for root in roots:
+    hift = root / "model_executor/models/minicpmo_4_5/cuda_graph_wrapper.py"
     patch_one(
-        root / "model_executor/models/minicpmo_4_5/cuda_graph_wrapper.py",
+        hift,
         "self.max_lazy_graphs = 8",
         "self.max_lazy_graphs = 32",
         "hift-lazy-graphs-32",
+    )
+    patch_one(
+        hift,
+        """    def capture(self):
+        for batch_size in self.capture_batch_sizes:
+            for mel_frames, source_cache_len in zip(
+                self.capture_bucket_size,
+                self.capture_source_cache_len,
+                strict=True,
+            ):
+                self._capture(batch_size, mel_frames, source_cache_len)
+""",
+        """    def capture(self):
+        # Live first/last codec chunks miss the 48/56 body buckets and
+        # were recaptured mid-utterance. Warm even 10-56 at boot instead.
+        frames = sorted(set(int(x) for x in self.capture_bucket_size) | set(range(10, 57, 2)))
+        caches = sorted(set(int(x) for x in self.capture_source_cache_len))
+        for batch_size in self.capture_batch_sizes:
+            for mel_frames in frames:
+                for source_cache_len in caches:
+                    try:
+                        self._capture(batch_size, mel_frames, source_cache_len)
+                    except Exception as exc:
+                        logger.warning(
+                            "HiFT warmup skip shape (%s, %s, %s): %s",
+                            batch_size,
+                            mel_frames,
+                            source_cache_len,
+                            exc,
+                        )
+""",
+        "hift-warmup-even-frames",
     )
     wrap_talker_handoff(
         root / "model_executor/stage_input_processors/minicpmo_4_5_omni.py"

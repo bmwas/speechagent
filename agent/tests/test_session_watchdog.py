@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from session_watchdog import TurnWatchdog  # noqa: E402
 from duplex_model import MiniCPMDuplexEngine  # noqa: E402
+from barge_in import EnergyVad, VAD_START_SECS, VAD_STOP_SECS  # noqa: E402
 
 
 class TurnWatchdogTests(unittest.TestCase):
@@ -182,6 +183,50 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("require_response", sent[0])
         self.assertTrue(eng._turn.armed)
 
+    async def test_commit_skipped_while_awaiting_decision(self) -> None:
+        eng = MiniCPMDuplexEngine()
+        sent: list[dict] = []
+
+        async def fake_send(body: dict) -> None:
+            sent.append(dict(body))
+
+        eng._ws = object()
+        eng._ready.set()
+        eng._send = fake_send  # type: ignore[method-assign]
+        eng._commit_pending = True
+        await eng._commit_input()
+        self.assertEqual(sum(1 for s in sent if s["type"] == "input_audio_buffer.commit"), 1)
+        self.assertTrue(eng._turn.armed)
+        eng._commit_pending = True
+        await eng._commit_input()
+        self.assertEqual(sum(1 for s in sent if s["type"] == "input_audio_buffer.commit"), 1)
+        self.assertTrue(eng._commit_pending)
+
+    async def test_listen_flushes_skipped_commit(self) -> None:
+        eng = MiniCPMDuplexEngine()
+        sent: list[dict] = []
+
+        async def fake_send(body: dict) -> None:
+            sent.append(dict(body))
+
+        eng._ws = object()
+        eng._ready.set()
+        eng._send = fake_send  # type: ignore[method-assign]
+        eng._commit_pending = True
+        eng._last_is_speech = False
+        await eng._commit_input()
+        eng._commit_pending = True
+        await eng._commit_input()
+        self.assertEqual(sum(1 for s in sent if s["type"] == "input_audio_buffer.commit"), 1)
+        await eng._handle({"type": "response.listen"})
+        await eng._handle({"type": "response.listen"})
+        self.assertIsNotNone(eng._listen_flush_task)
+        await asyncio.sleep(0.25)
+        commits = [s for s in sent if s["type"] == "input_audio_buffer.commit"]
+        self.assertEqual(len(commits), 2)
+        self.assertTrue(eng._turn.armed)
+        self.assertFalse(eng._commit_pending)
+
     async def test_hidden_state_error_reconnects(self) -> None:
         eng = MiniCPMDuplexEngine()
         eng._ready.set()
@@ -230,6 +275,19 @@ class BaselineProtocolTests(unittest.TestCase):
         self.assertNotIn("model-server/patches", compose)
         entry = (root / "model-server" / "entrypoint.sh").read_text(encoding="utf-8")
         self.assertNotIn("apply.py", entry)
+        self.assertIn("hift-warmup-even-frames", entry)
+        self.assertIn("hift-lazy-graphs-32", entry)
+
+
+class EnergyVadTests(unittest.TestCase):
+    def test_minicpm_stop_secs_override(self) -> None:
+        vad = EnergyVad(stop_secs=1.2)
+        self.assertEqual(vad.stop_secs, 1.2)
+        self.assertEqual(vad.start_secs, VAD_START_SECS)
+
+    def test_qwen_default_stop_secs(self) -> None:
+        vad = EnergyVad()
+        self.assertEqual(vad.stop_secs, VAD_STOP_SECS)
 
 
 if __name__ == "__main__":

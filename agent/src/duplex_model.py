@@ -23,6 +23,9 @@ from voices import DEFAULT_VOICE_ID
 
 LOG = logging.getLogger("duplex")
 CHUNK_MS = int(os.environ.get("AUDIO_CHUNK_MS", "100"))
+# After MiniCPM `listen`s a commit, leftover speech that arrived while we
+# were still waiting is committed once duplicate listen packets have passed.
+LISTEN_COMMIT_FLUSH_S = float(os.environ.get("MINICPM_LISTEN_COMMIT_FLUSH_S", "0.20"))
 # How long (ms) to tolerate no audio delta before cancelling + reconnecting.
 # HiFT eager-fallback on vLLM-Omni 0.30.0 produces 5–30 s gaps between
 # deltas on live turns; the vocoder DOES come back. Set high enough to ride
@@ -227,6 +230,8 @@ class MiniCPMDuplexEngine:
         self._out_rate = 24000
         self._last_is_speech = False
         self._commit_pending = False
+        self._utt_speech_ms = 0
+        self._listen_flush_task: asyncio.Task | None = None
         self._delta_n = 0
         self._delta_bytes = 0
         self._turn_deltas = 0
@@ -521,12 +526,17 @@ class MiniCPMDuplexEngine:
         )
 
     def _reset_stream_state(self) -> None:
+        task = self._listen_flush_task
+        self._listen_flush_task = None
+        if task is not None and not task.done():
+            task.cancel()
         self._buf.clear()
         self._audio_end_ms = 0
         self._played_ms = 0
         self._last_video_ms = -1_000
         self._commit_pending = False
         self._last_is_speech = False
+        self._utt_speech_ms = 0
         self._turn_deltas = 0
         self._turn_bytes = 0
         self._response_id = ""
@@ -540,7 +550,7 @@ class MiniCPMDuplexEngine:
                 break
 
     async def _teardown_socket(self, *, cancel_watchdog: bool) -> None:
-        tasks = ["_hb", "_reader"]
+        tasks = ["_hb", "_reader", "_listen_flush_task"]
         if cancel_watchdog:
             tasks.append("_watchdog")
         current = asyncio.current_task()
@@ -772,7 +782,13 @@ class MiniCPMDuplexEngine:
                     since_speak_ms=since_speak_ms,
                     was_speaking=was_speaking,
                     duplicates=self._listen_duplicates,
+                    commit_pending=self._commit_pending,
                 )
+            # Duplicate listen packets must not steal a commit we flush next.
+            # Wait a beat, then commit leftover speech from a chopped pause.
+            if self._commit_pending and not self._last_is_speech:
+                if self._listen_flush_task is None or self._listen_flush_task.done():
+                    self._listen_flush_task = asyncio.create_task(self._flush_commit_after_listen())
             return
         if typ in ("response.audio.done", "response.output_audio.done"):
             trace_stream(
@@ -985,10 +1001,30 @@ class MiniCPMDuplexEngine:
             else:
                 await self._commit_input()
 
+    async def _flush_commit_after_listen(self) -> None:
+        try:
+            await asyncio.sleep(LISTEN_COMMIT_FLUSH_S)
+        except asyncio.CancelledError:
+            return
+        if self._closing or self._turn.armed:
+            return
+        if self._commit_pending and not self._last_is_speech:
+            await self._commit_input()
+
     async def _commit_input(self) -> None:
         if self._ws is None or not self._ready.is_set():
             return
         if not self._commit_pending:
+            return
+        if self._turn.armed:
+            trace_stream(
+                "speech",
+                "duplex.commit_skip",
+                reason="awaiting_decision",
+                audio_end_ms=self._audio_end_ms,
+                utt_speech_ms=self._utt_speech_ms,
+                session_generation=self._turn.generation,
+            )
             return
         self._commit_pending = False
         await self._send({"type": "input_audio_buffer.commit"})
@@ -998,10 +1034,12 @@ class MiniCPMDuplexEngine:
             "speech",
             "duplex.commit",
             audio_end_ms=self._audio_end_ms,
+            utt_speech_ms=self._utt_speech_ms,
             session_generation=self._turn.generation,
             turn_waiting=True,
             decision_timeout_ms=self._turn.timeout_ms,
         )
+        self._utt_speech_ms = 0
 
     async def _append(self, pcm16: bytes, is_speech: bool = True, *, force_video: bool = False) -> None:
         if self._ws is None:
@@ -1044,17 +1082,20 @@ class MiniCPMDuplexEngine:
         self._append_bytes += len(pcm16)
         self._t_last_append = now
         rms = pcm_rms(pcm16)
-        if is_speech and not self._last_is_speech:
-            self._t_user_speech = now
-            self._commit_pending = True
-            trace_stream(
-                "speech",
-                "duplex.append_speech",
-                rms=rms,
-                duration_ms=duration_ms,
-                audio_end_ms=self._audio_end_ms,
-                video_attached=video_attached,
-            )
+        if is_speech:
+            if not self._last_is_speech:
+                self._t_user_speech = now
+                self._commit_pending = True
+                self._utt_speech_ms = 0
+                trace_stream(
+                    "speech",
+                    "duplex.append_speech",
+                    rms=rms,
+                    duration_ms=duration_ms,
+                    audio_end_ms=self._audio_end_ms,
+                    video_attached=video_attached,
+                )
+            self._utt_speech_ms += duration_ms
         speech_ended = self._last_is_speech and not is_speech
         self._last_is_speech = bool(is_speech)
         if speech_ended:

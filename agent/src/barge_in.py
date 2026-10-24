@@ -22,7 +22,14 @@ INTERRUPT_MIN_S = 0.50
 class EnergyVad:
     """RMS hangover VAD. Returns 'start' / 'stop' on edges, else None."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        start_secs: float | None = None,
+        stop_secs: float | None = None,
+    ) -> None:
+        self.start_secs = float(VAD_START_SECS if start_secs is None else start_secs)
+        self.stop_secs = float(VAD_STOP_SECS if stop_secs is None else stop_secs)
         self.speaking = False
         self.bot_playing = False
         self._noise_ema = 400.0
@@ -70,7 +77,7 @@ class EnergyVad:
             if self._loud_since is None:
                 self._loud_since = now
             self._quiet_since = None
-            if not self.speaking and (now - self._loud_since) >= VAD_START_SECS:
+            if not self.speaking and (now - self._loud_since) >= self.start_secs:
                 if self.bot_playing:
                     held = now - self._loud_since
                     if held < INTERRUPT_MIN_S:
@@ -96,7 +103,7 @@ class EnergyVad:
             return None
         if self._quiet_since is None:
             self._quiet_since = now
-        if (now - self._quiet_since) >= VAD_STOP_SECS:
+        if (now - self._quiet_since) >= self.stop_secs:
             dur = (now - self._speech_start) if self._speech_start else -1.0
             self.speaking = False
             self._speech_start = None
