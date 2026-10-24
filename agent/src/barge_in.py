@@ -16,7 +16,7 @@ VAD_STOP_SECS = float(os.environ.get("VAD_STOP_SECS", "0.80"))
 MIC_GATE_RMS = float(os.environ.get("VAD_MIN_VOLUME", "0.01")) * 32768.0
 MIC_GATE_MIN = 80.0
 MIC_GATE_MULT = 3.5
-INTERRUPT_MIN_S = 0.50
+INTERRUPT_MIN_S = float(os.environ.get("VAD_INTERRUPT_MIN_S", "0.50"))
 
 
 class EnergyVad:

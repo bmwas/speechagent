@@ -36,8 +36,12 @@ connectors:
       # codec_left_context_frames. (#5869). Body chunks hit 48/56; entrypoint
       # also warms even 10-56 so first/last chunks are not recaptured live.
       enable_hift_graph: true
-      enable_cfm_graph: true
-      cfm_max_graphs: 32
+      # CFM graph keys include cache tensors that change every codec step, so
+      # the 32-slot cache misses mid-utterance. Each live capture stalls
+      # Code2Wav 2-6 s (Loki: Captured CFM then duplex.delta gap_ms 5-15 s).
+      # Eager CFM is slower per chunk but does not punch holes in a sentence.
+      enable_cfm_graph: false
+      cfm_max_graphs: 0
       cfm_graph_bucket_frames: 16
 
 stages:

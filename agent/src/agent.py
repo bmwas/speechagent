@@ -194,9 +194,9 @@ class SpeechSession:
                 identity=identity,
                 brain_ready=self._brain_started and bool(getattr(self.engine, "ready", True)),
             )
-        # A stalled model can remain `generating=True` for tens of seconds
-        # after its real audio drained. Only audible playout is a barge-in;
-        # speech during model dead air must keep flowing without cancelling.
+        # Echo guard uses audible speakers only. Barge-in itself also fires
+        # when the model is still generating or has PCM queued — vocoder holes
+        # set audible=False while the rest of the reply is still coming.
         self.vad.bot_playing = self.playout.audible
         edge = self.vad.feed(pcm16)
         self._mic_packet_seq += 1
@@ -216,6 +216,12 @@ class SpeechSession:
             )
         if edge == "start":
             generating = bool(getattr(self.engine, "generating", False))
+            occupying = bool(
+                self.vad.bot_playing
+                or generating
+                or self.playout.ring_ms > 0
+                or getattr(self.playout, "source_active", False)
+            )
             trace_stream(
                 "speech",
                 "stream.user_utt_start",
@@ -223,22 +229,25 @@ class SpeechSession:
                 identity=identity,
                 bot_playing=self.vad.bot_playing,
                 generating=generating,
+                occupying=occupying,
+                ring_ms=round(self.playout.ring_ms, 1),
                 engine_ready=bool(getattr(self.engine, "ready", False)),
             )
-            if generating and not self.vad.bot_playing:
+            if occupying:
+                await self.engine.interrupt()
+                self.playout.clear()
+                if self.bot is not None:
+                    self.bot.clear_source_queue()
                 trace_stream(
                     "speech",
-                    "turn.speech_during_model_stall",
+                    "turn.barge_in",
+                    source="energy",
                     identity=identity,
+                    bot_playing=self.vad.bot_playing,
+                    generating=generating,
                     ring_ms=round(self.playout.ring_ms, 1),
-                    source_active=self.playout.source_active,
+                    during_stall=int(generating and not self.vad.bot_playing),
                 )
-        if edge == "start" and self.vad.bot_playing:
-            await self.engine.interrupt()
-            self.playout.clear()
-            if self.bot is not None:
-                self.bot.clear_source_queue()
-            trace_stream("speech", "turn.barge_in", source="energy", identity=identity)
         if edge == "stop":
             trace_stream(
                 "speech",

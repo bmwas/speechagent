@@ -232,6 +232,9 @@ class MiniCPMDuplexEngine:
         self._commit_pending = False
         self._utt_speech_ms = 0
         self._listen_flush_task: asyncio.Task | None = None
+        self._drop_output = False
+        self._drop_response_id = ""
+        self._audio_drop_rl = RateLimiter(1.0)
         self._delta_n = 0
         self._delta_bytes = 0
         self._turn_deltas = 0
@@ -537,6 +540,8 @@ class MiniCPMDuplexEngine:
         self._commit_pending = False
         self._last_is_speech = False
         self._utt_speech_ms = 0
+        self._drop_output = False
+        self._drop_response_id = ""
         self._turn_deltas = 0
         self._turn_bytes = 0
         self._response_id = ""
@@ -721,7 +726,11 @@ class MiniCPMDuplexEngine:
             self._acks_rx += 1
             return
         if typ in ("response.created", "response.speak"):
-            self._response_id = str(ev.get("response_id") or (ev.get("response") or {}).get("id") or "")
+            new_id = str(ev.get("response_id") or (ev.get("response") or {}).get("id") or "")
+            if self._drop_output and new_id and new_id != self._drop_response_id:
+                self._drop_output = False
+                self._drop_response_id = ""
+            self._response_id = new_id
             self._t_speak = time.monotonic()
             self._turn_deltas = 0
             self._turn_bytes = 0
@@ -730,7 +739,7 @@ class MiniCPMDuplexEngine:
             self._turn_gen_t0 = 0.0
             self._listen_duplicates = 0
             self._note_decision("speak" if typ == "response.speak" else "created")
-            if typ == "response.speak":
+            if typ == "response.speak" and not self._drop_output:
                 self._speaking = True
                 from_speech = _age_ms(self._t_user_speech, self._t_speak)
                 trace_stream(
@@ -819,6 +828,8 @@ class MiniCPMDuplexEngine:
                 response_id=self._response_id[:16],
             )
             self._speaking = False
+            self._drop_output = False
+            self._drop_response_id = ""
             self._note_decision("done")
             return
         if typ in ("error", "response.error"):
@@ -893,6 +904,20 @@ class MiniCPMDuplexEngine:
             return
         if pcm[:4] == b"RIFF":
             pcm = pcm[44:]
+        rid = str(ev.get("response_id") or self._response_id or "")
+        if self._drop_output and (not self._drop_response_id or not rid or rid == self._drop_response_id):
+            if hires_enabled() or self._audio_drop_rl.due():
+                trace_stream(
+                    "speech",
+                    "duplex.audio_drop",
+                    bytes=len(pcm),
+                    response_id=rid[:16],
+                    drop_response_id=self._drop_response_id[:16],
+                )
+            return
+        if self._drop_output and rid and rid != self._drop_response_id:
+            self._drop_output = False
+            self._drop_response_id = ""
         now = time.monotonic()
         first = (not self._speaking) or self._turn_deltas == 0
         # Inter-delta gap: time the ring sat waiting for this delta.
@@ -1169,6 +1194,8 @@ class MiniCPMDuplexEngine:
         was = self._speaking
         q = self._out.qsize()
         self._speaking = False
+        self._drop_output = True
+        self._drop_response_id = self._response_id
         self._note_decision("cancel")
         while not self._out.empty():
             try:

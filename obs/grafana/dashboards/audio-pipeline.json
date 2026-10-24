@@ -564,7 +564,7 @@
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" },
       "targets": [
         {
-          "expr": "{compose_project=\"speechagent\", event=~\"turn\\\\.speech_during_model_stall|turn\\\\.barge_in|duplex\\\\.cancel\"}",
+          "expr": "{compose_project=\"speechagent\", event=~\"turn\\\\.barge_in|duplex\\\\.cancel|duplex\\\\.audio_drop\"}",
           "queryType": "range",
           "refId": "A",
           "maxLines": 5000

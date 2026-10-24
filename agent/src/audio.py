@@ -6,9 +6,10 @@ Jitter buffer design matches the Runtype Persona AudioWorklet
 200-400 ms gaps between them; HiFT eager-fallback on vLLM-Omni 0.30.0
 can pause 5-30 s between deltas (#5069 / #5657 warmup still pending).
 
-The prebuffer absorbs normal inter-chunk jitter. PLAYOUT_HOLD_S only keeps
-the transport clock warm briefly; longer model stalls become true idle so
-VAD does not mistake user speech during dead air for a barge-in.
+The prebuffer absorbs normal inter-chunk jitter. PLAYOUT_HOLD_S must outlast
+the first MiniCPM codec chunk (120-360 ms) plus one vocoder gap; otherwise
+the ring drains and playout goes idle mid-sentence. Longer model stalls
+still become true idle so VAD does not treat dead air as barge-in.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ PLAYOUT_REBUFFER_MS = float(os.environ.get("PLAYOUT_REBUFFER_MS", "150"))
 PLAYOUT_MAX_WAIT_MS = float(os.environ.get("PLAYOUT_MAX_WAIT_MS", "300"))
 # Briefly keep the LiveKit clock warm after real audio drains. Longer model
 # stalls are not bridgeable with silence and must not count as bot playback.
-HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "0.25"))
+HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "1.2"))
 BOT_AUDIBLE_GRACE_MS = float(os.environ.get("BOT_AUDIBLE_GRACE_MS", "120"))
 
 CAPTURE_TIMEOUT_S = float(os.environ.get("PLAYOUT_CAPTURE_TIMEOUT_S", "0.08"))

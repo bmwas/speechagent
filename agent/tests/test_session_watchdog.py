@@ -227,6 +227,39 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(eng._turn.armed)
         self.assertFalse(eng._commit_pending)
 
+    async def test_interrupt_cancels_and_drops_late_audio(self) -> None:
+        import base64
+
+        eng = MiniCPMDuplexEngine()
+        sent: list[dict] = []
+
+        async def fake_send(body: dict) -> None:
+            sent.append(dict(body))
+
+        eng._ws = object()
+        eng._ready.set()
+        eng._send = fake_send  # type: ignore[method-assign]
+        eng._speaking = True
+        eng._response_id = "resp-old"
+        await eng._out.put((b"\x00\x00", 24000))
+        await eng.interrupt()
+        self.assertTrue(any(s.get("type") == "response.cancel" for s in sent))
+        self.assertFalse(eng._speaking)
+        self.assertTrue(eng._drop_output)
+        self.assertEqual(eng._out.qsize(), 0)
+        pcm = b"\x00\x01" * 80
+        b64 = base64.b64encode(pcm).decode("ascii")
+        await eng._on_audio_delta(
+            {"type": "response.audio.delta", "delta": b64, "response_id": "resp-old"}
+        )
+        self.assertEqual(eng._out.qsize(), 0)
+        await eng._handle({"type": "response.speak", "response_id": "resp-new"})
+        self.assertFalse(eng._drop_output)
+        await eng._on_audio_delta(
+            {"type": "response.audio.delta", "delta": b64, "response_id": "resp-new"}
+        )
+        self.assertEqual(eng._out.qsize(), 1)
+
     async def test_hidden_state_error_reconnects(self) -> None:
         eng = MiniCPMDuplexEngine()
         eng._ready.set()
@@ -288,6 +321,38 @@ class EnergyVadTests(unittest.TestCase):
     def test_qwen_default_stop_secs(self) -> None:
         vad = EnergyVad()
         self.assertEqual(vad.stop_secs, VAD_STOP_SECS)
+
+    def test_interrupt_hold_only_when_bot_playing(self) -> None:
+        import array
+
+        import barge_in as mod
+
+        loud = array.array("h", [8000] * 1600).tobytes()
+        clock = [0.0]
+        orig = mod.time.monotonic
+        mod.time.monotonic = lambda: clock[0]
+        try:
+            vad = EnergyVad(start_secs=0.15)
+            self.assertIsNone(vad.feed(loud))
+            clock[0] = 0.16
+            self.assertEqual(vad.feed(loud), "start")
+
+            vad = EnergyVad(start_secs=0.15)
+            vad.bot_playing = True
+            clock[0] = 0.0
+            self.assertIsNone(vad.feed(loud))
+            clock[0] = 0.20
+            self.assertIsNone(vad.feed(loud))
+            clock[0] = 0.51
+            self.assertEqual(vad.feed(loud), "start")
+        finally:
+            mod.time.monotonic = orig
+
+    def test_agent_barges_on_generating_not_only_audible(self) -> None:
+        src = (Path(__file__).resolve().parents[1] / "src" / "agent.py").read_text(encoding="utf-8")
+        self.assertIn("occupying", src)
+        self.assertIn("during_stall", src)
+        self.assertNotIn("turn.speech_during_model_stall", src)
 
 
 if __name__ == "__main__":

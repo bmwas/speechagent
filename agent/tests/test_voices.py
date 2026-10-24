@@ -138,7 +138,9 @@ class VoiceCatalogTests(unittest.TestCase):
         ):
             self.assertIn(token, src)
         yaml = Path(__file__).resolve().parents[2] / "model-server" / "deploy" / "minicpmo_4_5.yaml"
-        self.assertIn("codec_chunk_frames: 24", yaml.read_text(encoding="utf-8"))
+        text = yaml.read_text(encoding="utf-8")
+        self.assertIn("codec_chunk_frames: 24", text)
+        self.assertIn("enable_cfm_graph: false", text)
 
     def test_ref_loader_reads_explicit_path(self) -> None:
         tmp = Path(self._tmp())
