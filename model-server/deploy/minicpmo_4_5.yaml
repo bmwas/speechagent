@@ -1,9 +1,15 @@
 # MiniCPM-o 4.5 native duplex on one Ada GPU (cuda:0).
 # Mirrors upstream vllm-omni v0.30.0 vllm_omni/deploy/minicpmo_4_5.yaml
 # (duplex is now the default; minicpmo_4_5_turn.yaml selects turn mode).
-# Only single-GPU memory tuning is changed vs upstream:
-#   max_sessions/max_num_seqs 1, eager, stage0 0.55 + 4 GiB KV,
+# Single-GPU memory tuning vs upstream:
+#   max_sessions/max_num_seqs 1, stage0 0.55 + 4 GiB KV,
 #   stage1 0.15 + 2 GiB KV, stage2 0.18, cuda_mps false.
+# CUDA graphs match the upstream 1-GPU recipe (Ada is dedicated):
+#   Thinker + Talker enforce_eager false, Code2Wav runner stays eager.
+# Inner HiFT/CFM graphs below are independent of that runner flag.
+# Pinned KV skips vLLM's CUDA-graph memory estimate. If load OOMs,
+# drop stage-0 kv_cache_memory_bytes 4 GiB → 3 GiB (sliding window
+# is 3000 tokens; 4 GiB is far more than one session needs).
 pipeline: minicpmo_4_5
 async_chunk: true
 session_mode: duplex
@@ -40,7 +46,11 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.55
     kv_cache_memory_bytes: 4294967296
-    enforce_eager: true
+    # Decode graphs on. max_num_seqs 1 keeps capture sizes tiny.
+    enforce_eager: false
+    # Extra async frames after a chunk terminator desync the Talker
+    # hidden-state ledger (missing own-token hidden states).
+    async_scheduling: false
     # 4096 overflowed at ~4167 tokens (~2 min of 100 ms PCM + 1 JPEG/s).
     # 8192 leaves sampling room; the agent still opens with
     # sliding_window_mode=basic (trim 3000 / resume 2000) so the thinker
@@ -73,7 +83,8 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.15
     kv_cache_memory_bytes: 2147483648
-    enforce_eager: true
+    enforce_eager: false
+    async_scheduling: false
     max_num_batched_tokens: 4096
     max_model_len: 4096
     output_connectors:
@@ -95,6 +106,8 @@ stages:
     tensor_parallel_size: 1
     max_num_seqs: 1
     gpu_memory_utilization: 0.18
+    # Runner stays eager: request-owned Flow/HiFT caches are not valid
+    # outer-graph inputs. Vocoder speed is enable_hift_graph / enable_cfm_graph.
     enforce_eager: true
     enable_chunked_prefill: false
     # Upstream ships 65536; trim so the vocoder KV fits beside Thinker+Talker.
@@ -116,11 +129,13 @@ platforms:
       - stage_id: 0
         kv_cache_memory_bytes: 4294967296
         gpu_memory_utilization: 0.55
-        enforce_eager: true
+        enforce_eager: false
+        async_scheduling: false
       - stage_id: 1
         kv_cache_memory_bytes: 2147483648
         gpu_memory_utilization: 0.15
-        enforce_eager: true
+        enforce_eager: false
+        async_scheduling: false
       - stage_id: 2
         gpu_memory_utilization: 0.18
         enforce_eager: true

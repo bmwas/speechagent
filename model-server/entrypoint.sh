@@ -117,6 +117,92 @@ install_minicpm_vocoder() {
   echo "model-server MiniCPM vocoder imports ok after install"
 }
 
+# v0.30.0 MiniCPM-o live-duplex tunings that are not YAML knobs:
+# 1) HiFT max_lazy_graphs is hardcoded at 8. After 8 unseen chunk
+#    shapes, Code2Wav falls back to eager HiFT (5-15 s holes).
+# 2) A Talker ledger miss raises and kills the duplex session; skip
+#    that one handoff instead so the socket stays up.
+tune_minicpm_omni() {
+  python - <<'PY'
+from pathlib import Path
+
+roots = [
+    Path("/usr/local/lib/python3.12/dist-packages/vllm_omni"),
+    Path("/usr/local/lib/python3.11/dist-packages/vllm_omni"),
+]
+
+
+def patch_one(path: Path, needle: str, repl: str, label: str) -> None:
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    if repl in text and needle not in text:
+        print(f"model-server {label} already applied ({path})")
+        return
+    if needle not in text:
+        print(f"model-server skip {label}: pattern not in {path}")
+        return
+    path.write_text(text.replace(needle, repl, 1), encoding="utf-8")
+    print(f"model-server applied {label} ({path})")
+
+
+def wrap_talker_handoff(path: Path) -> None:
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    if "skipping talker handoff" in text:
+        print(f"model-server talker-handoff skip already applied ({path})")
+        return
+    marker = "tts_hidden_slice = _native_duplex_forwarded_hidden_rows("
+    idx = text.find(marker)
+    if idx < 0:
+        print(f"model-server skip talker-handoff wrap: call not in {path}")
+        return
+    line_start = text.rfind("\n", 0, idx) + 1
+    indent = text[line_start:idx]
+    paren = text.find("(", idx)
+    depth = 0
+    end = None
+    for j, ch in enumerate(text[paren:], start=paren):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                end = j + 1
+                break
+    if end is None:
+        print(f"model-server skip talker-handoff wrap: unterminated call in {path}")
+        return
+    call = text[idx:end]
+    wrapped = (
+        f"{indent}try:\n"
+        f"{indent}    {call}\n"
+        f"{indent}except ValueError as exc:\n"
+        f"{indent}    logger.warning(\n"
+        f'{indent}        "MiniCPM-o native duplex: skipping talker handoff (%s)",\n'
+        f"{indent}        exc,\n"
+        f"{indent}    )\n"
+        f"{indent}    tts_token_ids_slice = None\n"
+        f"{indent}    tts_hidden_slice = None"
+    )
+    path.write_text(text[:line_start] + wrapped + text[end:], encoding="utf-8")
+    print(f"model-server applied talker-handoff skip ({path})")
+
+
+for root in roots:
+    patch_one(
+        root / "model_executor/models/minicpmo_4_5/cuda_graph_wrapper.py",
+        "self.max_lazy_graphs = 8",
+        "self.max_lazy_graphs = 32",
+        "hift-lazy-graphs-32",
+    )
+    wrap_talker_handoff(
+        root / "model_executor/stage_input_processors/minicpmo_4_5_omni.py"
+    )
+PY
+}
+
 find_yaml() {
   local name="$1"
   local cand
@@ -138,6 +224,7 @@ case "${MODEL}" in
   *MiniCPM*|*minicpm*)
     DEPLOY="$(find_yaml minicpmo_4_5.yaml || true)"
     install_minicpm_vocoder
+    tune_minicpm_omni
     ;;
   *Qwen2.5-Omni*|*qwen2.5-omni*|*Qwen2_5*)
     DEPLOY="$(find_yaml qwen2_5_omni.yaml || true)"
@@ -152,6 +239,18 @@ EXTRA=(
 )
 if [ -n "${DEPLOY}" ]; then
   echo "model-server using deploy-config ${DEPLOY}"
+  python - "${DEPLOY}" <<'PY'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    import yaml
+    d = yaml.safe_load(p.read_text(encoding="utf-8"))
+    eager = [(s.get("stage_id"), s.get("enforce_eager"), s.get("async_scheduling")) for s in d.get("stages") or []]
+    print("model-server deploy stages (id, enforce_eager, async_scheduling):", eager)
+except Exception as exc:
+    print("model-server deploy parse failed:", exc)
+PY
   EXTRA+=(--deploy-config "${DEPLOY}")
 else
   echo "model-server no deploy-config; --omni auto with gpu_memory_utilization"
