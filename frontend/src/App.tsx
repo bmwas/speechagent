@@ -12,6 +12,7 @@ import {
 import { isFailedToFetch, livekitConnectUrl, upgradeLanHttp } from "./upgradeHttps";
 import VoicePicker from "./VoicePicker";
 import FloorMetrics from "./FloorMetrics";
+import SessionLab from "./SessionLab";
 import {
   DEFAULT_VOICE_ID,
   DEFAULT_QWEN_SPEAKER,
@@ -131,6 +132,7 @@ export default function App() {
   const lkRoomRef = useRef<Room | null>(null);
   const lkIdentityRef = useRef<string | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const [peerConnection, setPeerConnection] = useState<RTCPeerConnection | null>(null);
   const insecure = typeof window !== "undefined" && !navigator.mediaDevices?.getUserMedia;
   const httpPage = typeof window !== "undefined" && window.location.protocol === "http:";
   const host = typeof window !== "undefined" ? window.location.host : "host";
@@ -337,6 +339,12 @@ export default function App() {
         }
       });
       await room.connect(url, body.token, { websocketTimeout: 20000, peerConnectionTimeout: 20000 });
+      try {
+        const engine = (room as unknown as { engine?: { pcManager?: { publisher?: { pc?: RTCPeerConnection } } } }).engine;
+        setPeerConnection(engine?.pcManager?.publisher?.pc || null);
+      } catch {
+        setPeerConnection(null);
+      }
       room.remoteParticipants.forEach((p) => {
         p.trackPublications.forEach((pub) => {
           if (pub.track) attachRemote(pub.track);
@@ -380,6 +388,7 @@ export default function App() {
       setError(msg);
       setState("idle");
       setLkOn(false);
+      setPeerConnection(null);
       const lk = lkRoomRef.current;
       const identity = lkIdentityRef.current;
       lkRoomRef.current = null;
@@ -401,6 +410,7 @@ export default function App() {
     const identity = lkIdentityRef.current;
     lkIdentityRef.current = null;
     setLkOn(false);
+    setPeerConnection(null);
     if (identity) {
       fetch("/api/livekit/leave", {
         method: "POST",
@@ -457,6 +467,7 @@ export default function App() {
         <span className="status">transport: {state}</span>
       </div>
       <FloorMetrics connected={lkOn} room={ROOM} />
+      <SessionLab connected={lkOn} room={ROOM} peerConnection={peerConnection} />
       {error ? <p className="muted">error: {error}</p> : null}
       <div className="previews">
         <div className="tile">

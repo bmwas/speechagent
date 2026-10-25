@@ -230,6 +230,19 @@ class NativeMiniCPMEngine:
         self._drop_meter = StreamMeter("speech", "stream.drop_not_ready", reason="ws_not_ready")
         self._chunk_samples = int(MODEL_RATE * CHUNK_MS / 1000)
         self._chunk_bytes = self._chunk_samples * 2
+        # Per-turn latency tracking for session lab
+        self._t_first_audio_turn = 0.0
+        self._t_first_text_turn = 0.0
+        self._turn_audio_ms = 0.0
+        self._turn_max_gap_ms = -1.0
+        self._turn_ttfa_ms = -1.0
+        self._turn_ttft_ms = -1.0
+        self._turn_rtf = -1.0
+        self._last_turn_ttfa_ms = -1.0
+        self._last_turn_ttft_ms = -1.0
+        self._last_turn_rtf = -1.0
+        self._last_turn_gap_ms = -1.0
+        self._last_turn_audio_ms = 0.0
 
     @property
     def generating(self) -> bool:
@@ -243,6 +256,12 @@ class NativeMiniCPMEngine:
         now = time.monotonic()
         costs = self._unit_cost_ms[-32:]
         median = sorted(costs)[len(costs) // 2] if costs else -1.0
+        # Live RTF for current turn
+        live_rtf = -1.0
+        if self._t_first_audio_turn and self._turn_audio_ms > 0:
+            wall_ms = _age_ms(self._t_first_audio_turn, now)
+            if wall_ms > 0:
+                live_rtf = round(self._turn_audio_ms / wall_ms, 2)
         return {
             "ws_open": self._ws is not None,
             "ready": self._ready.is_set(),
@@ -269,6 +288,13 @@ class NativeMiniCPMEngine:
             "cost_all_ms_p50": round(median, 1) if median >= 0 else -1,
             "voice_id": self.voice_id,
             "kv": self._last_kv,
+            # Turn metrics for session lab
+            "ttfa_ms": self._last_turn_ttfa_ms,
+            "ttfa_anchor": "speak-start",
+            "ttft_ms": self._last_turn_ttft_ms,
+            "rtf": self._last_turn_rtf if self._last_turn_rtf >= 0 else live_rtf,
+            "gap_ms": self._last_turn_gap_ms,
+            "turn_audio_ms": self._last_turn_audio_ms,
         }
 
     def _handshake_ref_path(self) -> Path | None:
@@ -432,6 +458,24 @@ class NativeMiniCPMEngine:
             self._speaking = False
             self._speak_streak = 0
             self._speak_user_streak = 0
+            # Compute final RTF and store turn metrics for session lab
+            if was and self._t_first_audio_turn and self._turn_audio_ms > 0:
+                now = time.monotonic()
+                wall_ms = _age_ms(self._t_first_audio_turn, now)
+                self._turn_rtf = round(self._turn_audio_ms / wall_ms, 2) if wall_ms > 0 else -1.0
+                self._last_turn_ttfa_ms = self._turn_ttfa_ms
+                self._last_turn_ttft_ms = self._turn_ttft_ms
+                self._last_turn_rtf = self._turn_rtf
+                self._last_turn_gap_ms = self._turn_max_gap_ms
+                self._last_turn_audio_ms = self._turn_audio_ms
+            # Reset turn state
+            self._t_first_audio_turn = 0.0
+            self._t_first_text_turn = 0.0
+            self._turn_audio_ms = 0.0
+            self._turn_max_gap_ms = -1.0
+            self._turn_ttfa_ms = -1.0
+            self._turn_ttft_ms = -1.0
+            self._turn_rtf = -1.0
             if self._last_append_rms >= LISTEN_LOCK_RMS:
                 self._listen_speech_streak += 1
             else:
@@ -460,11 +504,18 @@ class NativeMiniCPMEngine:
             text = str(ev.get("text") or "")
             if text:
                 self._listen_speech_streak = 0
+                now = time.monotonic()
                 if not self._speaking:
                     self._speaking = True
-                    self._t_speak = time.monotonic()
+                    self._t_speak = now
                     trace_stream("speech", "native.speak", text=text[:80])
-                if hires_enabled():
+                # Track TTFT on first text of turn
+                if not self._t_first_text_turn:
+                    self._t_first_text_turn = now
+                    self._turn_ttft_ms = _age_ms(self._t_speak, now)
+                    if hires_enabled():
+                        trace_stream("speech", "native.text", chars=len(text), text=text[:80], ttft_ms=self._turn_ttft_ms)
+                elif hires_enabled():
                     trace_stream("speech", "native.text", chars=len(text), text=text[:80])
             return
         if delta_kind == "audio":
@@ -486,8 +537,15 @@ class NativeMiniCPMEngine:
             self._speak_streak += 1
             self._delta_n += 1
             self._delta_bytes += len(pcm)
+            # Track inter-delta gap for max gap metric
+            if self._t_last_delta and self._t_first_audio_turn:
+                gap = _age_ms(self._t_last_delta, now)
+                if gap > self._turn_max_gap_ms:
+                    self._turn_max_gap_ms = gap
             self._t_last_delta = now
             dur_ms = int(1000.0 * (len(pcm) / 2.0) / OUT_RATE)
+            # Track audio duration for RTF
+            self._turn_audio_ms += dur_ms
             if not self._first_audio:
                 self._first_audio = True
                 latency_ms = int((now - self._t_ready) * 1000) if self._t_ready else -1
@@ -498,6 +556,10 @@ class NativeMiniCPMEngine:
                     bytes=len(pcm),
                     duration_ms=dur_ms,
                 )
+            # Track TTFA on first audio of turn
+            if not self._t_first_audio_turn:
+                self._t_first_audio_turn = now
+                self._turn_ttfa_ms = _age_ms(self._t_speak, now)
             self._delta_meter.add(chunks=1, bytes=len(pcm), duration_ms=dur_ms)
             if hires_enabled():
                 trace_stream(

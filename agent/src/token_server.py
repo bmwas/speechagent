@@ -384,6 +384,15 @@ async def api_live(request: Request):
         agent_state = "connecting"
         floor = "none"
 
+    # Session score for session lab
+    session_score: dict[str, Any] = {}
+    session_score_fn = getattr(bot, "session_score_snapshot", None)
+    if callable(session_score_fn):
+        try:
+            session_score = session_score_fn() or {}
+        except Exception:
+            session_score = {}
+
     return {
         "ok": True,
         "room": room_id,
@@ -415,6 +424,17 @@ async def api_live(request: Request):
         # Common
         "ring_ms": round(getattr(playout, "ring_ms", 0), 1) if playout else 0,
         "mic_age_ms": snap.get("mic_age_ms"),
+        # Turn metrics for session lab (from last completed turn)
+        "turn": {
+            "ttfa_ms": snap.get("ttfa_ms", -1),
+            "ttfa_anchor": snap.get("ttfa_anchor", ""),
+            "ttft_ms": snap.get("ttft_ms", -1),
+            "rtf": snap.get("rtf", -1),
+            "gap_ms": snap.get("gap_ms", -1),
+            "turn_audio_ms": snap.get("turn_audio_ms", 0),
+        },
+        # Session score (aggregates over all turns)
+        "session": session_score,
     }
 
 

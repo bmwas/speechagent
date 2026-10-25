@@ -13,6 +13,7 @@ from duplex_model import MiniCPMDuplexEngine
 from livekit_room import LiveKitBotRoom, cancel_task_robust
 from native_minicpm import NativeMiniCPMEngine
 from qwen_omni import QwenOmniEngine
+from session_score import SessionScore, TurnSample
 from tokens import BOT_IDENTITY, token_for_bot
 from trace import RateLimiter, StreamMeter, hires_enabled, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
 from video import FrameSampler
@@ -136,6 +137,11 @@ class SpeechSession:
         self._prev_source_active: bool | None = None
         self._mic_meter = StreamMeter("speech", "stream.mic_in", kind="in")
         self._pull_meter = StreamMeter("speech", "stream.playout_pull", kind="out")
+        # Session lab turn tracking
+        self._session_score = SessionScore()
+        self._last_engine_speaking = False
+        self._t_session_start = time.monotonic()
+        self._last_turn_sample: TurnSample | None = None
 
     async def connect_and_publish(self) -> None:
         if self._running:
@@ -342,6 +348,14 @@ class SpeechSession:
                         turn_deltas=snap.get("turn_deltas", -1),
                     )
                     self._prev_source_active = generating
+                    # Collect turn sample when model stops generating.
+                    # Must not raise — this loop is the only audio path.
+                    if not generating and self._last_engine_speaking:
+                        try:
+                            self._collect_turn_sample(snap)
+                        except Exception:
+                            LOG.exception("turn sample")
+                self._last_engine_speaking = generating
                 for pcm, rate in chunks:
                     self.playout.push(pcm, int(rate) or 24000)
                     pulled += len(pcm)
@@ -480,6 +494,56 @@ class SpeechSession:
     async def _capture(self, pcm: bytes, rate: int) -> None:
         if self.bot is not None:
             await self.bot.capture_pcm16(pcm, rate)
+
+    def _collect_turn_sample(self, snap: dict) -> None:
+        """Collect turn metrics from engine snapshot and playout stats."""
+        playout_stats = self.playout.turn_stats()
+        ttfa = snap.get("ttfa_ms", -1.0)
+        ttft = snap.get("ttft_ms", -1.0)
+        rtf = snap.get("rtf", -1.0)
+        gap = snap.get("gap_ms", -1.0)
+        audio_ms = snap.get("turn_audio_ms", 0.0)
+        prebuffer = playout_stats.get("prebuffer_ms", -1.0)
+        # E2E = TTFA + prebuffer (user-perceived latency to first audible)
+        e2e = -1.0
+        if ttfa >= 0 and prebuffer >= 0:
+            e2e = ttfa + prebuffer
+        sample = TurnSample(
+            ttfa_ms=ttfa,
+            ttfa_anchor=str(snap.get("ttfa_anchor", "")),
+            ttft_ms=ttft,
+            rtf=rtf,
+            gap_ms=gap,
+            audio_ms=audio_ms,
+            prebuffer_ms=prebuffer,
+            e2e_ms=e2e,
+        )
+        self._last_turn_sample = sample
+        self._session_score.add_turn(sample)
+        # Update session-level accumulators
+        if audio_ms > 0:
+            self._session_score.agent_audible_s += audio_ms / 1000.0
+        trace_stream(
+            "speech",
+            "session.turn_sample",
+            ttfa_ms=round(ttfa, 1),
+            ttft_ms=round(ttft, 1),
+            rtf=round(rtf, 2) if rtf >= 0 else -1,
+            gap_ms=round(gap, 1) if gap >= 0 else -1,
+            prebuffer_ms=round(prebuffer, 1) if prebuffer >= 0 else -1,
+            e2e_ms=round(e2e, 1) if e2e >= 0 else -1,
+            turns=len(self._session_score.turns),
+        )
+
+    def session_score_snapshot(self) -> dict:
+        """Return session score snapshot for /api/live."""
+        now = time.monotonic()
+        duration_s = now - self._t_session_start
+        snap = self._session_score.snapshot()
+        snap["duration_s"] = round(duration_s, 1)
+        snap["underruns_total"] = self.playout.underruns_total
+        snap["clock_slips"] = self.playout.clock_slips
+        return snap
 
     async def stop(self) -> None:
         if not self._running:

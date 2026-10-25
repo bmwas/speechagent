@@ -195,6 +195,10 @@ class ClockedPlayout:
         self._underrun_t0 = 0.0
         self._underrun_frames = 0
         self.underruns_total = 0
+        # Prebuffer wait tracking for session lab
+        self._turn_prebuffer_ms = -1.0
+        self._prebuffer_waiting = False
+        self._prebuffer_t0 = 0.0
         # Clock-slip diagnostics.
         self._slip_max_ms = 0.0
         self._late_ticks = 0
@@ -260,6 +264,8 @@ class ClockedPlayout:
         self._underrun_open = False
         self._underrun_t0 = 0.0
         self._underrun_frames = 0
+        # Keep _turn_prebuffer_ms: first real frame calls this after the
+        # prebuffer gate has already recorded the wait for this turn.
 
     def _trace_frame(
         self,
@@ -289,25 +295,37 @@ class ClockedPlayout:
             since_push_ms=int((now - self._last_push) * 1000) if self._last_push else -1,
         )
 
-    def _emit_turn_summary(self, reason: str) -> None:
-        if self._turn_frames <= 0:
+    def _close_turn(self, reason: str) -> None:
+        if self._turn_open:
+            self._emit_turn_summary(reason)
+            self._turn_open = False
+        self._turn_prebuffer_ms = -1.0
+        self._prebuffer_waiting = False
+        self._prebuffer_t0 = 0.0
+
+    def _begin_turn(self) -> None:
+        if self._turn_open:
             return
-        trace_stream(
-            "speech",
-            "playout.turn_summary",
-            reason=reason,
-            frames=self._turn_frames,
-            silence_frames=self._turn_silence,
-            underrun_episodes=self._underrun_episodes,
-            underrun_total_ms=int(self._underrun_total_ms),
-            longest_underrun_ms=int(self._longest_underrun_ms),
-            ring_ms_min=round(self._ring_ms_min, 1) if self._ring_ms_min >= 0 else -1,
-        )
+        saved_prebuffer = self._turn_prebuffer_ms
+        self._turn_open = True
+        self._reset_turn_stats()
+        self._turn_prebuffer_ms = saved_prebuffer
+
+    def turn_stats(self) -> dict[str, float | int]:
+        """Return turn-level playout stats for session lab."""
+        return {
+            "prebuffer_ms": round(self._turn_prebuffer_ms, 1) if self._turn_prebuffer_ms >= 0 else -1.0,
+            "underrun_episodes": self._underrun_episodes,
+            "underrun_total_ms": round(self._underrun_total_ms, 1),
+            "longest_underrun_ms": round(self._longest_underrun_ms, 1),
+            "ring_ms_min": round(self._ring_ms_min, 1) if self._ring_ms_min >= 0 else -1.0,
+            "turn_frames": self._turn_frames,
+            "turn_silence": self._turn_silence,
+            "slip_max_ms": round(self._slip_max_ms, 1),
+        }
 
     def clear(self) -> None:
-        if self._turn_open:
-            self._emit_turn_summary("clear")
-            self._turn_open = False
+        self._close_turn("clear")
         self._reset_turn_stats()
         self._ring.clear()
         self._resampler = None
@@ -345,6 +363,10 @@ class ClockedPlayout:
             fill_ms = self.ring_ms
             if self._buffering_t0 == 0.0:
                 self._buffering_t0 = now
+            # Track prebuffer wait for session lab
+            if not self._prebuffer_waiting:
+                self._prebuffer_waiting = True
+                self._prebuffer_t0 = now
             waited_ms = (now - self._buffering_t0) * 1000.0
             ready = (
                 fill_ms >= self._buf_target_ms
@@ -371,12 +393,18 @@ class ClockedPlayout:
                 return self._silence
             self._buffering = False
             self._buffering_t0 = 0.0
+            # Record the first prebuffer wait of this turn only.
+            if self._prebuffer_waiting:
+                if self._turn_prebuffer_ms < 0:
+                    self._turn_prebuffer_ms = (now - self._prebuffer_t0) * 1000.0
+                self._prebuffer_waiting = False
             trace_stream(
                 "speech",
                 "playout.resume",
                 ring_ms=round(fill_ms, 1),
                 target_ms=int(self._buf_target_ms),
                 waited_ms=int(waited_ms),
+                prebuffer_ms=round(self._turn_prebuffer_ms, 1),
                 source_active=self.source_active,
             )
 
@@ -385,9 +413,7 @@ class ClockedPlayout:
             del self._ring[:need]
             self.frames += 1
             self._active = True
-            if not self._turn_open:
-                self._turn_open = True
-                self._reset_turn_stats()
+            self._begin_turn()
             self._turn_frames += 1
             self._last_real_frame = now
             rm = self.ring_ms
@@ -423,9 +449,7 @@ class ClockedPlayout:
             frame = bytes(self._ring) + self._silence[real_bytes:]
             self._ring.clear()
             self.frames += 1
-            if not self._turn_open:
-                self._turn_open = True
-                self._reset_turn_stats()
+            self._begin_turn()
             self._turn_frames += 1
             self._last_real_frame = now
             self._trace_frame(
@@ -489,9 +513,7 @@ class ClockedPlayout:
                 "playout.idle",
                 since_push_ms=int((now - self._last_push) * 1000) if self._last_push else -1,
             )
-            if self._turn_open:
-                self._emit_turn_summary("idle")
-                self._turn_open = False
+            self._close_turn("idle")
         self._active = False
         self._underrun_open = False
         self.idle_ticks += 1

@@ -247,6 +247,11 @@ class MiniCPMDuplexEngine:
         self._delta_timing_rl = RateLimiter(2.0)
         self._text_n = 0
         self._bin_n = 0
+        # TTFT tracking for session lab
+        self._t_first_text = 0.0
+        self._turn_ttft_ms = -1.0
+        self._last_turn_ttfa_ms = -1.0
+        self._last_turn_ttft_ms = -1.0
         self._acks_tx = 0
         self._acks_rx = 0
         self._close_code = 0
@@ -306,6 +311,11 @@ class MiniCPMDuplexEngine:
             "voice_id": self.voice_id,
             "voice_sha": self._ref_sha,
             "voice_duration_ms": self._ref_duration_ms,
+            # Turn metrics for session lab
+            "ttfa_ms": self._last_turn_ttfa_ms,
+            "ttfa_anchor": "speak",
+            "ttft_ms": self._last_turn_ttft_ms,
+            "gap_ms": self._turn_max_gap_ms,
             **self._turn.snapshot(now),
         }
 
@@ -744,6 +754,10 @@ class MiniCPMDuplexEngine:
             self._turn_max_gap_ms = -1
             self._turn_gen_t0 = 0.0
             self._listen_duplicates = 0
+            # Reset turn metrics for new turn
+            self._text_n = 0
+            self._t_first_text = 0.0
+            self._turn_ttft_ms = -1.0
             self._note_decision("speak" if typ == "response.speak" else "created")
             if typ == "response.speak" and not self._drop_output:
                 self._speaking = True
@@ -763,7 +777,13 @@ class MiniCPMDuplexEngine:
         if typ in _TEXT_DELTA_TYPES:
             self._text_n += 1
             text = str(ev.get("delta") or ev.get("text") or "")[:80]
-            if hires_enabled() or self._text_n == 1 or self._text_rl.due():
+            # Track TTFT on first text
+            if self._text_n == 1:
+                now = time.monotonic()
+                self._t_first_text = now
+                self._turn_ttft_ms = _age_ms(self._t_speak, now) if self._t_speak else -1
+                trace_stream("speech", "duplex.text_delta", n=self._text_n, text=text, chars=len(text), ttft_ms=self._turn_ttft_ms)
+            elif hires_enabled() or self._text_rl.due():
                 trace_stream("speech", "duplex.text_delta", n=self._text_n, text=text, chars=len(text))
             return
         if typ in ("response.listen",) or ev.get("decision") == "listen":
@@ -773,7 +793,9 @@ class MiniCPMDuplexEngine:
             was_speaking = self._speaking
             self._speaking = False
             self._note_decision("listen")
+            # Store TTFT for session lab snapshot when transitioning from speaking
             if was_speaking:
+                self._last_turn_ttft_ms = self._turn_ttft_ms
                 self._listen_duplicates = 0
             else:
                 self._listen_duplicates += 1
@@ -949,6 +971,7 @@ class MiniCPMDuplexEngine:
             self._turn_gen_t0 = now
             self._note_decision("first_audio")
             lat = _age_ms(self._t_speak, now) if self._t_speak else -1
+            self._last_turn_ttfa_ms = lat  # Store for session lab snapshot
             from_speech = _age_ms(self._t_user_speech, now)
             from_ready = _age_ms(self._t_ready, now)
             trace_stream(

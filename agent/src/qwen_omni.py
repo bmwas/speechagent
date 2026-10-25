@@ -234,6 +234,19 @@ class QwenOmniEngine:
         self._audio_chunks = 0
         self._close_code = 0
         self._close_reason = ""
+        # Per-turn latency tracking for session lab
+        self._t_first_audio = 0.0
+        self._t_first_text = 0.0
+        self._turn_audio_ms = 0.0
+        self._turn_max_gap_ms = -1.0
+        self._turn_ttfa_ms = -1.0
+        self._turn_ttft_ms = -1.0
+        self._turn_rtf = -1.0
+        self._last_turn_ttfa_ms = -1.0
+        self._last_turn_ttft_ms = -1.0
+        self._last_turn_rtf = -1.0
+        self._last_turn_gap_ms = -1.0
+        self._last_turn_audio_ms = 0.0
         self._buf_meter = StreamMeter("speech", "qwen.buffer", kind="in")
         self._frame_meter = StreamMeter("speech", "qwen.video_tx", kind="in")
         self._delta_meter = StreamMeter("speech", "qwen.sse", kind="out")
@@ -257,6 +270,12 @@ class QwenOmniEngine:
     def stream_snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
         not_ready_ms = _age_ms(self._not_ready_since, now) if self._not_ready_since else 0
+        # Live RTF for current turn
+        live_rtf = -1.0
+        if self._t_first_audio and self._turn_audio_ms > 0:
+            wall_ms = _age_ms(self._t_first_audio, now)
+            if wall_ms > 0:
+                live_rtf = round(self._turn_audio_ms / wall_ms, 2)
         snap = {
             "ready": self.ready,
             "speaking": self._busy,
@@ -271,6 +290,13 @@ class QwenOmniEngine:
             "ws_attempts": self._ws_attempts,
             "not_ready_ms": not_ready_ms,
             "speaker": self.speaker,
+            # Turn metrics for session lab
+            "ttfa_ms": self._last_turn_ttfa_ms,
+            "ttfa_anchor": "query",
+            "ttft_ms": self._last_turn_ttft_ms,
+            "rtf": self._last_turn_rtf if self._last_turn_rtf >= 0 else live_rtf,
+            "gap_ms": self._last_turn_gap_ms,
+            "turn_audio_ms": self._last_turn_audio_ms,
         }
         probe = self._last_probe
         if probe:
@@ -554,7 +580,13 @@ class QwenOmniEngine:
             if text:
                 self._text_n += 1
                 self._text_chars += len(text)
-                if self._text_n == 1 or self._text_rl.due():
+                # Track TTFT on first text
+                if self._text_n == 1:
+                    now = time.monotonic()
+                    self._t_first_text = now
+                    self._turn_ttft_ms = _age_ms(self._t_query, now)
+                    trace_stream("speech", "qwen.text_delta", n=self._text_chars, text=text[:80], ttft_ms=self._turn_ttft_ms)
+                elif self._text_rl.due():
                     trace_stream("speech", "qwen.text_delta", n=self._text_chars, text=text[:80])
             return
         if typ == "response.text.done":
@@ -601,14 +633,24 @@ class QwenOmniEngine:
         self._busy = True
         self._audio_bytes += len(pcm)
         self._audio_chunks += 1
+        # Track inter-delta gap for max gap metric
+        if self._t_last_delta and self._first_audio:
+            gap = _age_ms(self._t_last_delta, now)
+            if gap > self._turn_max_gap_ms:
+                self._turn_max_gap_ms = gap
         self._t_last_delta = now
+        # Track audio duration for RTF
+        dur_ms = int(1000.0 * (len(pcm) / 2.0) / max(rate, 1))
+        self._turn_audio_ms += dur_ms
         self._delta_meter.add(lines=1, audio_chunks=1, bytes=len(pcm))
         if not self._first_audio:
             self._first_audio = True
+            self._t_first_audio = now
+            self._turn_ttfa_ms = _age_ms(self._t_query, now)
             trace_stream(
                 "speech",
                 "qwen.first_audio",
-                latency_ms=_age_ms(self._t_query, now),
+                latency_ms=self._turn_ttfa_ms,
                 bytes=len(pcm),
                 rate=rate,
                 frames=self._frame_n,
@@ -619,7 +661,18 @@ class QwenOmniEngine:
         if not self._busy and reason != "error":
             return
         self._busy = False
-        latency_ms = _age_ms(self._t_query, time.monotonic())
+        now = time.monotonic()
+        latency_ms = _age_ms(self._t_query, now)
+        # Compute final RTF for this turn
+        if self._t_first_audio and self._turn_audio_ms > 0:
+            wall_ms = _age_ms(self._t_first_audio, now)
+            self._turn_rtf = round(self._turn_audio_ms / wall_ms, 2) if wall_ms > 0 else -1.0
+        # Store turn metrics for snapshot
+        self._last_turn_ttfa_ms = self._turn_ttfa_ms
+        self._last_turn_ttft_ms = self._turn_ttft_ms
+        self._last_turn_rtf = self._turn_rtf
+        self._last_turn_gap_ms = self._turn_max_gap_ms
+        self._last_turn_audio_ms = self._turn_audio_ms
         self._delta_meter.flush()
         self._rx_types.flush()
         trace_stream(
@@ -630,13 +683,26 @@ class QwenOmniEngine:
             audio_bytes=self._audio_bytes,
             audio_chunks=self._audio_chunks,
             text_chars=self._text_chars,
+            ttfa_ms=self._turn_ttfa_ms,
+            ttft_ms=self._turn_ttft_ms,
+            rtf=self._turn_rtf,
+            gap_ms=self._turn_max_gap_ms,
+            audio_ms=self._turn_audio_ms,
         )
+        # Reset turn state
         self._t_query = 0.0
         self._audio_bytes = 0
         self._audio_chunks = 0
         self._text_n = 0
         self._text_chars = 0
         self._first_audio = False
+        self._t_first_audio = 0.0
+        self._t_first_text = 0.0
+        self._turn_audio_ms = 0.0
+        self._turn_max_gap_ms = -1.0
+        self._turn_ttfa_ms = -1.0
+        self._turn_ttft_ms = -1.0
+        self._turn_rtf = -1.0
 
     async def push_audio(self, pcm16: bytes, sample_rate: int, is_speech: bool = True) -> None:
         if not pcm16:
