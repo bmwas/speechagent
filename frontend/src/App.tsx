@@ -283,7 +283,7 @@ export default function App() {
       if (body.model) setModel(body.model);
       if (body.voice_id) {
         setVoiceId(body.voice_id);
-        storeVoiceId(body.voice_id);
+        storeVoiceId(body.voice_id, family);
       }
       let diag = "";
       try {
@@ -393,7 +393,7 @@ export default function App() {
       }
       if (lk) lk.disconnect().catch(() => undefined);
     }
-  }, [insecure, voiceId]);
+  }, [insecure, voiceId, family]);
 
   const disconnect = useCallback(async () => {
     const lk = lkRoomRef.current;

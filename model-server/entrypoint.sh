@@ -281,6 +281,9 @@ case "${MODEL}" in
     # (Qwen2.5-Omni has no streaming audio). No talker pad-remap patch — that
     # TypeError is Qwen2.5-only. Thinker-only 4-bit checkpoint; stages 1/2
     # keep checkpoint precision (see deploy/qwen3_omni.yaml hf_overrides).
+    # v0.30.0 session.config has no speaker field; without this patch the
+    # talker always uses the first baked-in voice (Chelsie).
+    python /deploy/patch_qwen_speaker.py
     DEPLOY="$(find_yaml qwen3_omni.yaml || true)"
     ;;
   *Qwen2.5-Omni*|*qwen2.5-omni*|*Qwen2_5*)

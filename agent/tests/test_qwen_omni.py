@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from qwen_omni import QwenOmniEngine, _stall_s, _system_prompt  # noqa: E402
+from qwen_speakers import DEFAULT_QWEN_SPEAKER  # noqa: E402
 
 
 class QwenPromptTests(unittest.TestCase):
@@ -82,12 +83,18 @@ class QwenSpeakerTests(unittest.TestCase):
     def test_speaker_default(self) -> None:
         os.environ.pop("QWEN_SPEAKER", None)
         eng = QwenOmniEngine("test")
-        self.assertEqual(eng.speaker, "chelsie")
+        self.assertEqual(eng.speaker, DEFAULT_QWEN_SPEAKER)
 
     def test_speaker_in_snapshot(self) -> None:
         eng = QwenOmniEngine("test", speaker="aiden")
         snap = eng.stream_snapshot()
         self.assertEqual(snap["speaker"], "aiden")
+
+    def test_session_config_includes_speaker(self) -> None:
+        eng = QwenOmniEngine("test", speaker="Ethan")
+        cfg = eng._session_config()
+        self.assertEqual(cfg["type"], "session.config")
+        self.assertEqual(cfg["speaker"], "ethan")
 
 
 if __name__ == "__main__":

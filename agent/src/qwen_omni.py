@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 import websockets
 
 from audio import MODEL_RATE, LinearResampler
+from qwen_speakers import resolve_qwen_speaker
 from trace import RateLimiter, StreamMeter, TypeCounter, trace_exc, trace_stream
 
 LOG = logging.getLogger("qwen")
@@ -200,11 +201,8 @@ class QwenOmniEngine:
 
     def __init__(self, system_prompt: str = "", *, speaker: str = "") -> None:
         self.system_prompt = _system_prompt(system_prompt)
-        # Speaker can be passed explicitly or fall back to env / default
-        raw_speaker = speaker.strip() if speaker else ""
-        if not raw_speaker:
-            raw_speaker = os.environ.get("QWEN_SPEAKER", "").strip()
-        self.speaker = raw_speaker.lower() if raw_speaker else "chelsie"
+        # Allowlist only. Empty / env falls back to the checkpoint default.
+        self.speaker = resolve_qwen_speaker(speaker).id
         self._stall_s = _stall_s()
         self._resetting = False
         self.model = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-Omni-3B")
@@ -360,8 +358,8 @@ class QwenOmniEngine:
         )
         raise RuntimeError(f"model-server video stream never accepted {url}: {last_err}")
 
-    async def _send_session_config(self) -> None:
-        config: dict[str, Any] = {
+    def _session_config(self) -> dict[str, Any]:
+        return {
             "type": "session.config",
             "modalities": ["text", "audio"],
             "num_frames": self._num_frames,
@@ -369,10 +367,12 @@ class QwenOmniEngine:
             "use_audio_in_video": False,
             "enable_frame_filter": True,
             "system_prompt": self.system_prompt,
-            # Send speaker for v0.31+ (v0.30.0 ignores unknown fields).
-            # vLLM-Omni accepts lowercase speaker names (chelsie, ethan, aiden).
+            # Stock v0.30.0 drops this unless patch_qwen_speaker.py is applied.
             "speaker": self.speaker,
         }
+
+    async def _send_session_config(self) -> None:
+        config = self._session_config()
         await self._send(config)
         trace_stream(
             "speech",
