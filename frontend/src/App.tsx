@@ -11,11 +11,14 @@ import {
 } from "livekit-client";
 import { isFailedToFetch, livekitConnectUrl, upgradeLanHttp } from "./upgradeHttps";
 import VoicePicker from "./VoicePicker";
+import FloorMetrics from "./FloorMetrics";
 import {
   DEFAULT_VOICE_ID,
-  FALLBACK_VOICES,
+  DEFAULT_QWEN_SPEAKER,
+  FALLBACK_VOICES_MINICPM,
   loadStoredVoiceId,
   storeVoiceId,
+  type VoiceFamily,
   type VoiceInfo,
 } from "./voices";
 
@@ -120,7 +123,8 @@ export default function App() {
   const [state, setState] = useState("idle");
   const [lkOn, setLkOn] = useState(false);
   const [model, setModel] = useState("");
-  const [voices, setVoices] = useState<VoiceInfo[]>(FALLBACK_VOICES);
+  const [family, setFamily] = useState<VoiceFamily>("minicpm");
+  const [voices, setVoices] = useState<VoiceInfo[]>(FALLBACK_VOICES_MINICPM);
   const [voiceId, setVoiceId] = useState(DEFAULT_VOICE_ID);
   const localRef = useRef<HTMLVideoElement>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
@@ -150,19 +154,23 @@ export default function App() {
         }
         try {
           const vr = await fetch("/api/voices", { signal: AbortSignal.timeout(8000) });
-          const vj = (await vr.json()) as { ok?: boolean; default?: string; voices?: VoiceInfo[] };
+          const vj = (await vr.json()) as { ok?: boolean; default?: string; voices?: VoiceInfo[]; family?: VoiceFamily };
           if (!cancelled && vj.ok && Array.isArray(vj.voices) && vj.voices.length) {
+            const fam = vj.family || "minicpm";
+            setFamily(fam);
             setVoices(vj.voices);
-            const stored = loadStoredVoiceId();
+            const stored = loadStoredVoiceId(fam);
             const allowed = new Set(vj.voices.map((v) => v.id));
-            const next = allowed.has(stored) ? stored : vj.default || DEFAULT_VOICE_ID;
+            const defaultId = fam === "qwen" ? DEFAULT_QWEN_SPEAKER : DEFAULT_VOICE_ID;
+            const next = allowed.has(stored) ? stored : vj.default || defaultId;
             setVoiceId(next);
-            storeVoiceId(next);
+            storeVoiceId(next, fam);
           }
         } catch {
           if (!cancelled) {
-            const stored = loadStoredVoiceId();
-            const allowed = new Set(FALLBACK_VOICES.map((v) => v.id));
+            // Default to MiniCPM fallback
+            const stored = loadStoredVoiceId("minicpm");
+            const allowed = new Set(FALLBACK_VOICES_MINICPM.map((v) => v.id));
             setVoiceId(allowed.has(stored) ? stored : DEFAULT_VOICE_ID);
           }
         }
@@ -411,7 +419,7 @@ export default function App() {
   }, []);
 
   const connected = state !== "idle" && state !== "disconnected";
-  const voiceLocked = connected || state === "connecting";
+  const voiceLocked = connected; // Includes "connecting" since it's neither "idle" nor "disconnected"
   const voiceName = voices.find((v) => v.id === voiceId)?.name || "Original";
 
   return (
@@ -433,9 +441,10 @@ export default function App() {
         voices={voices}
         selectedId={voiceId}
         disabled={voiceLocked}
+        family={family}
         onSelect={(id) => {
           setVoiceId(id);
-          storeVoiceId(id);
+          storeVoiceId(id, family);
         }}
       />
       <div className="row">
@@ -447,6 +456,7 @@ export default function App() {
         </button>
         <span className="status">transport: {state}</span>
       </div>
+      <FloorMetrics connected={lkOn} room={ROOM} />
       {error ? <p className="muted">error: {error}</p> : null}
       <div className="previews">
         <div className="tile">

@@ -198,9 +198,13 @@ class QwenOmniEngine:
 
     input_rate = MODEL_RATE
 
-    def __init__(self, system_prompt: str = "") -> None:
+    def __init__(self, system_prompt: str = "", *, speaker: str = "") -> None:
         self.system_prompt = _system_prompt(system_prompt)
-        self.speaker = os.environ.get("QWEN_SPEAKER", "Chelsie").strip() or "Chelsie"
+        # Speaker can be passed explicitly or fall back to env / default
+        raw_speaker = speaker.strip() if speaker else ""
+        if not raw_speaker:
+            raw_speaker = os.environ.get("QWEN_SPEAKER", "").strip()
+        self.speaker = raw_speaker.lower() if raw_speaker else "chelsie"
         self._stall_s = _stall_s()
         self._resetting = False
         self.model = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-Omni-3B")
@@ -268,6 +272,7 @@ class QwenOmniEngine:
             "rx_age_ms": _age_ms(self._t_last_rx, now),
             "ws_attempts": self._ws_attempts,
             "not_ready_ms": not_ready_ms,
+            "speaker": self.speaker,
         }
         probe = self._last_probe
         if probe:
@@ -364,8 +369,18 @@ class QwenOmniEngine:
             "use_audio_in_video": False,
             "enable_frame_filter": True,
             "system_prompt": self.system_prompt,
+            # Send speaker for v0.31+ (v0.30.0 ignores unknown fields).
+            # vLLM-Omni accepts lowercase speaker names (chelsie, ethan, aiden).
+            "speaker": self.speaker,
         }
         await self._send(config)
+        trace_stream(
+            "speech",
+            "qwen.session_config",
+            speaker=self.speaker,
+            num_frames=self._num_frames,
+            max_frames=self._max_frames,
+        )
 
     async def start(self) -> None:
         url = _model_ws_url()

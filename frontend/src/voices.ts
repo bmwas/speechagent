@@ -1,4 +1,5 @@
 export type VoiceGender = "original" | "female" | "male";
+export type VoiceFamily = "minicpm" | "qwen";
 
 export type VoiceInfo = {
   id: string;
@@ -6,14 +7,19 @@ export type VoiceInfo = {
   gender: VoiceGender;
   blurb: string;
   featured: boolean;
-  source: string;
-  license: string;
+  source?: string;
+  license?: string;
 };
 
 export const DEFAULT_VOICE_ID = "original";
-export const VOICE_STORAGE_KEY = "speechagent.voice_id";
+export const DEFAULT_QWEN_SPEAKER = "chelsie";
+export const VOICE_STORAGE_KEY_MINICPM = "speechagent.voice_id.minicpm";
+export const VOICE_STORAGE_KEY_QWEN = "speechagent.voice_id.qwen";
 
-export const FALLBACK_VOICES: VoiceInfo[] = [
+// Legacy key for migration
+const LEGACY_VOICE_KEY = "speechagent.voice_id";
+
+export const FALLBACK_VOICES_MINICPM: VoiceInfo[] = [
   {
     id: "original",
     name: "Original",
@@ -97,29 +103,74 @@ export const FALLBACK_VOICES: VoiceInfo[] = [
   },
 ];
 
-export const GENDERS: { id: VoiceGender; label: string; hint: string }[] = [
+export const FALLBACK_VOICES_QWEN: VoiceInfo[] = [
+  {
+    id: "chelsie",
+    name: "Chelsie",
+    gender: "female",
+    blurb: "honeyed warmth with luminous clarity",
+    featured: true,
+  },
+  {
+    id: "ethan",
+    name: "Ethan",
+    gender: "male",
+    blurb: "bright energy with an approachable vibe",
+    featured: true,
+  },
+  {
+    id: "aiden",
+    name: "Aiden",
+    gender: "male",
+    blurb: "warm laid-back American charm",
+    featured: true,
+  },
+];
+
+// Legacy alias
+export const FALLBACK_VOICES = FALLBACK_VOICES_MINICPM;
+
+export const GENDERS_MINICPM: { id: VoiceGender; label: string; hint: string }[] = [
   { id: "original", label: "Original", hint: "studio" },
   { id: "female", label: "Female", hint: "she / her" },
   { id: "male", label: "Male", hint: "he / him" },
 ];
 
-export function loadStoredVoiceId(): string {
+export const GENDERS_QWEN: { id: VoiceGender; label: string; hint: string }[] = [
+  { id: "female", label: "Female", hint: "she / her" },
+  { id: "male", label: "Male", hint: "he / him" },
+];
+
+// Legacy alias
+export const GENDERS = GENDERS_MINICPM;
+
+export function loadStoredVoiceId(family: VoiceFamily = "minicpm"): string {
   try {
-    return localStorage.getItem(VOICE_STORAGE_KEY) || DEFAULT_VOICE_ID;
+    const key = family === "qwen" ? VOICE_STORAGE_KEY_QWEN : VOICE_STORAGE_KEY_MINICPM;
+    const stored = localStorage.getItem(key);
+    if (stored) return stored;
+    // Try legacy key for migration (MiniCPM only)
+    if (family === "minicpm") {
+      const legacy = localStorage.getItem(LEGACY_VOICE_KEY);
+      if (legacy) return legacy;
+    }
+    return family === "qwen" ? DEFAULT_QWEN_SPEAKER : DEFAULT_VOICE_ID;
   } catch {
-    return DEFAULT_VOICE_ID;
+    return family === "qwen" ? DEFAULT_QWEN_SPEAKER : DEFAULT_VOICE_ID;
   }
 }
 
-export function storeVoiceId(id: string): void {
+export function storeVoiceId(id: string, family: VoiceFamily = "minicpm"): void {
   try {
-    localStorage.setItem(VOICE_STORAGE_KEY, id);
+    const key = family === "qwen" ? VOICE_STORAGE_KEY_QWEN : VOICE_STORAGE_KEY_MINICPM;
+    localStorage.setItem(key, id);
   } catch {
     /* ignore quota / private mode */
   }
 }
 
 export function stickerFor(voice: VoiceInfo): string {
+  // MiniCPM voices
   if (voice.id === "original") return "★";
   if (voice.id === "heart") return "♥";
   if (voice.id === "bella") return "✦";
@@ -129,5 +180,9 @@ export function stickerFor(voice: VoiceInfo): string {
   if (voice.id === "joe") return "•";
   if (voice.id === "lessac") return "❧";
   if (voice.id === "amy") return "❀";
+  // Qwen speakers
+  if (voice.id === "chelsie") return "✿";
+  if (voice.id === "ethan") return "◈";
+  if (voice.id === "aiden") return "◉";
   return "○";
 }

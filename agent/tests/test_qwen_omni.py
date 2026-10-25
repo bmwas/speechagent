@@ -58,5 +58,37 @@ class QwenStallTests(unittest.TestCase):
         self.assertEqual(eng._t_query, 0.0)
 
 
+class QwenSpeakerTests(unittest.TestCase):
+    def test_speaker_explicit(self) -> None:
+        eng = QwenOmniEngine("test", speaker="aiden")
+        self.assertEqual(eng.speaker, "aiden")
+
+    def test_speaker_from_env(self) -> None:
+        os.environ["QWEN_SPEAKER"] = "Ethan"
+        try:
+            eng = QwenOmniEngine("test")
+            self.assertEqual(eng.speaker, "ethan")
+        finally:
+            os.environ.pop("QWEN_SPEAKER", None)
+
+    def test_speaker_explicit_beats_env(self) -> None:
+        os.environ["QWEN_SPEAKER"] = "Ethan"
+        try:
+            eng = QwenOmniEngine("test", speaker="Chelsie")
+            self.assertEqual(eng.speaker, "chelsie")
+        finally:
+            os.environ.pop("QWEN_SPEAKER", None)
+
+    def test_speaker_default(self) -> None:
+        os.environ.pop("QWEN_SPEAKER", None)
+        eng = QwenOmniEngine("test")
+        self.assertEqual(eng.speaker, "chelsie")
+
+    def test_speaker_in_snapshot(self) -> None:
+        eng = QwenOmniEngine("test", speaker="aiden")
+        snap = eng.stream_snapshot()
+        self.assertEqual(snap["speaker"], "aiden")
+
+
 if __name__ == "__main__":
     unittest.main()

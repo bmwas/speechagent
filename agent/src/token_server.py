@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from agent import SpeechSession
+from agent import SpeechSession, is_minicpm
 from tokens import livekit_url, token_for_user
 from trace import trace, trace_exc, trace_stream
 from voices import (
@@ -24,6 +24,12 @@ from voices import (
     resolve_voice,
     validate_catalog_voice,
     voice_conflict,
+)
+from qwen_speakers import (
+    QwenSpeakerNotFound,
+    default_qwen_speaker_id,
+    qwen_speakers_public,
+    resolve_qwen_speaker,
 )
 
 LOG = logging.getLogger("token_server")
@@ -158,9 +164,28 @@ async def health():
     }
 
 
+def _model_family() -> str:
+    """Return 'minicpm' or 'qwen' based on MODEL_NAME."""
+    return "minicpm" if is_minicpm() else "qwen"
+
+
 @app.get("/api/voices")
 async def api_voices():
-    return {"ok": True, "default": DEFAULT_VOICE_ID, "voices": catalog_public()}
+    family = _model_family()
+    if family == "minicpm":
+        return {
+            "ok": True,
+            "family": "minicpm",
+            "default": DEFAULT_VOICE_ID,
+            "voices": catalog_public(),
+        }
+    else:
+        return {
+            "ok": True,
+            "family": "qwen",
+            "default": default_qwen_speaker_id(),
+            "voices": qwen_speakers_public(),
+        }
 
 
 @app.post("/api/livekit/token")
@@ -172,21 +197,34 @@ async def livekit_token(request: Request):
     role = (request.query_params.get("role") or "patient").strip().lower() or "patient"
     room_id = (request.query_params.get("room") or "default").strip() or "default"
     identity = f"{role}-{uuid.uuid4().hex[:8]}"
-    try:
-        spec = resolve_voice(request.query_params.get("voice"))
-        validate_catalog_voice(spec)
-    except VoiceNotFound as exc:
-        trace_stream("speech", "voice.validate_fail", error=str(exc)[:200], room=room_id)
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-    except ValueError as exc:
-        trace_stream(
-            "speech",
-            "voice.validate_fail",
-            voice_id=getattr(spec, "id", ""),
-            error=str(exc)[:200],
-            room=room_id,
-        )
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    family = _model_family()
+    voice_id: str
+    if family == "minicpm":
+        # MiniCPM: validate against WAV catalog
+        try:
+            spec = resolve_voice(request.query_params.get("voice"))
+            validate_catalog_voice(spec)
+            voice_id = spec.id
+        except VoiceNotFound as exc:
+            trace_stream("speech", "voice.validate_fail", error=str(exc)[:200], room=room_id)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        except ValueError as exc:
+            trace_stream(
+                "speech",
+                "voice.validate_fail",
+                voice_id=getattr(spec, "id", ""),
+                error=str(exc)[:200],
+                room=room_id,
+            )
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    else:
+        # Qwen: validate against built-in speakers (no WAV)
+        try:
+            qwen_spec = resolve_qwen_speaker(request.query_params.get("voice"))
+            voice_id = qwen_spec.id
+        except QwenSpeakerNotFound as exc:
+            trace_stream("speech", "voice.validate_fail", error=str(exc)[:200], room=room_id)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     lk_ok, lk_detail = await livekit_tcp_ok()
     if not lk_ok:
         trace_stream("speech", "error.livekit_down", detail=lk_detail)
@@ -205,13 +243,13 @@ async def livekit_token(request: Request):
 
     async with _bots_lock:
         bot = _bots.get(room_id)
-        conflict = voice_conflict(bot, spec.id)
+        conflict = voice_conflict(bot, voice_id)
         if conflict:
             trace_stream(
                 "speech",
                 "voice.conflict",
                 room=room_id,
-                requested=spec.id,
+                requested=voice_id,
                 active=conflict,
             )
             return JSONResponse(
@@ -222,7 +260,7 @@ async def livekit_token(request: Request):
                         "Disconnect first, then pick a new voice and Connect again."
                     ),
                     "voice_id": conflict,
-                    "requested": spec.id,
+                    "requested": voice_id,
                 },
                 status_code=409,
             )
@@ -231,7 +269,7 @@ async def livekit_token(request: Request):
             bot = SpeechSession(
                 room_id,
                 on_stopped=lambda rid=room_id: _bots.pop(rid, None),
-                voice_id=spec.id,
+                voice_id=voice_id,
             )
             _bots[room_id] = bot
             try:
@@ -252,7 +290,7 @@ async def livekit_token(request: Request):
                 "speech",
                 "voice.accepted",
                 room=room_id,
-                voice_id=spec.id,
+                voice_id=voice_id,
                 identity=identity,
             )
 
@@ -265,9 +303,9 @@ async def livekit_token(request: Request):
         identity=identity,
         url=url,
         sfu=lk_detail,
-        voice_id=spec.id,
+        voice_id=voice_id,
     )
-    trace("speech", "session.open", role=role, room=room_id, identity=identity, voice_id=spec.id)
+    trace("speech", "session.open", role=role, room=room_id, identity=identity, voice_id=voice_id)
     return {
         "ok": True,
         "url": url,
@@ -276,7 +314,8 @@ async def livekit_token(request: Request):
         "identity": identity,
         "role": role,
         "model": os.environ.get("MODEL_NAME", ""),
-        "voice_id": spec.id,
+        "voice_id": voice_id,
+        "family": family,
     }
 
 
@@ -297,6 +336,86 @@ async def livekit_leave(request: Request):
         await bot.stop()
         _bots.pop(room_id, None)
     return {"ok": True}
+
+
+@app.get("/api/live")
+async def api_live(request: Request):
+    """Return live session snapshot for the floor and metrics strip."""
+    room_id = request.query_params.get("room") or "default"
+    bot = _bots.get(room_id)
+    if bot is None or not getattr(bot, "_running", False):
+        return {"ok": False, "error": "no active session", "room": room_id}
+
+    # Get engine snapshot
+    snap: dict[str, Any] = {}
+    engine = getattr(bot, "engine", None)
+    if engine is not None:
+        getter = getattr(engine, "stream_snapshot", None)
+        if callable(getter):
+            try:
+                snap = getter() or {}
+            except Exception:
+                snap = {}
+
+    # Basic session info
+    family = _model_family()
+    minicpm = is_minicpm()
+    backend = (os.environ.get("MODEL_BACKEND") or "vllm").strip().lower()
+
+    # Floor state
+    vad = getattr(bot, "vad", None)
+    playout = getattr(bot, "playout", None)
+    user_speaking = bool(getattr(vad, "speaking", False)) if vad else False
+    agent_audible = bool(getattr(playout, "audible", False)) if playout else False
+    engine_generating = bool(getattr(engine, "generating", False)) if engine else False
+    engine_ready = bool(getattr(engine, "ready", False)) if engine else False
+
+    # Determine floor holder and agent state
+    if agent_audible:
+        agent_state = "speaking"
+        floor = "agent"
+    elif engine_generating:
+        agent_state = "thinking"
+        floor = "agent"
+    elif engine_ready:
+        agent_state = "listening"
+        floor = "user" if user_speaking else "none"
+    else:
+        agent_state = "connecting"
+        floor = "none"
+
+    return {
+        "ok": True,
+        "room": room_id,
+        "family": family,
+        "backend": backend,
+        "model": os.environ.get("MODEL_NAME", ""),
+        "voice_id": getattr(bot, "voice_id", ""),
+        # Floor
+        "floor": floor,
+        "user_speaking": user_speaking,
+        "agent_state": agent_state,
+        "agent_audible": agent_audible,
+        # Metrics from engine snapshot
+        "ready": snap.get("ready", False),
+        "speaking": snap.get("speaking", False),
+        "out_q": snap.get("out_q", 0),
+        # Qwen-specific
+        "frame_n": snap.get("frame_n"),
+        "utt_ms": snap.get("utt_ms"),
+        "delta_age_ms": snap.get("delta_age_ms"),
+        "speaker": snap.get("speaker"),
+        # MiniCPM vLLM-specific
+        "turn_waiting": snap.get("turn_waiting"),
+        "rtf": snap.get("rtf"),
+        "buf_ms": snap.get("buf_ms"),
+        # Native MiniCPM-specific
+        "kv": snap.get("kv"),
+        "cost_all_ms_p50": snap.get("cost_all_ms_p50"),
+        # Common
+        "ring_ms": round(getattr(playout, "ring_ms", 0), 1) if playout else 0,
+        "mic_age_ms": snap.get("mic_age_ms"),
+    }
 
 
 def run() -> None:

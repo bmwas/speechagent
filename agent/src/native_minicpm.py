@@ -217,6 +217,7 @@ class NativeMiniCPMEngine:
         self._listen_speech_streak = 0
         self._speak_streak = 0
         self._speak_user_streak = 0
+        self._last_kv = 0  # kv_cache_length from last native.listen
         self._session_id = ""
         self._reconnect_reason = ""
         self._last_reconnect_reason = ""
@@ -267,6 +268,7 @@ class NativeMiniCPMEngine:
             "speak_user_streak": self._speak_user_streak,
             "cost_all_ms_p50": round(median, 1) if median >= 0 else -1,
             "voice_id": self.voice_id,
+            "kv": self._last_kv,
         }
 
     def _handshake_ref_path(self) -> Path | None:
@@ -440,12 +442,15 @@ class NativeMiniCPMEngine:
                 and not self._reconnect_reason
             ):
                 self._reconnect_reason = "listen_lock"
+            kv = int(metrics.get("kv_cache_length") or 0)
+            if kv > 0:
+                self._last_kv = kv
             trace_stream(
                 "speech",
                 "native.listen",
                 was_speaking=int(was),
                 dropped_q=self._out.qsize(),
-                kv=int(metrics.get("kv_cache_length") or 0),
+                kv=kv,
                 listen_speech_streak=self._listen_speech_streak,
                 append_rms=int(self._last_append_rms),
                 cost_all_ms=round(float(cost), 1) if isinstance(cost, (int, float)) else -1,

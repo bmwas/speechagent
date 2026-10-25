@@ -17,6 +17,7 @@ from tokens import BOT_IDENTITY, token_for_bot
 from trace import RateLimiter, StreamMeter, hires_enabled, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
 from video import FrameSampler
 from voices import DEFAULT_VOICE_ID, asset_path, resolve_voice
+from qwen_speakers import default_qwen_speaker_id, resolve_qwen_speaker
 
 LOG = logging.getLogger("agent")
 
@@ -63,14 +64,12 @@ def system_prompt() -> str:
 
 
 class SpeechSession:
-    def __init__(self, room_id: str, on_stopped=None, *, voice_id: str = DEFAULT_VOICE_ID) -> None:
+    def __init__(self, room_id: str, on_stopped=None, *, voice_id: str = "") -> None:
         self.room_id = room_id
         self.session_id = f"lk-{room_id}"
         self._on_stopped = on_stopped
         self.model_name = os.environ.get("MODEL_NAME", "openbmb/MiniCPM-o-4_5")
         self.minicpm = is_minicpm(self.model_name)
-        spec = resolve_voice(voice_id)
-        self.voice_id = spec.id
         prompt = system_prompt()
         backend = (os.environ.get("MODEL_BACKEND") or "vllm").strip().lower()
         self.native = backend == "native"
@@ -81,14 +80,20 @@ class SpeechSession:
                 "MODEL_NAME=openbmb/MiniCPM-o-4_5."
             )
         self.engine: MiniCPMDuplexEngine | QwenOmniEngine | NativeMiniCPMEngine
-        if self.native:
+        if self.minicpm:
+            # MiniCPM: validate against WAV catalog
+            spec = resolve_voice(voice_id or DEFAULT_VOICE_ID)
+            self.voice_id = spec.id
             ref = None if spec.id == DEFAULT_VOICE_ID else asset_path(spec)
-            self.engine = NativeMiniCPMEngine(prompt, voice_id=spec.id, ref_path=ref)
-        elif self.minicpm:
-            ref = None if spec.id == DEFAULT_VOICE_ID else asset_path(spec)
-            self.engine = MiniCPMDuplexEngine(prompt, voice_id=spec.id, ref_path=ref)
+            if self.native:
+                self.engine = NativeMiniCPMEngine(prompt, voice_id=spec.id, ref_path=ref)
+            else:
+                self.engine = MiniCPMDuplexEngine(prompt, voice_id=spec.id, ref_path=ref)
         else:
-            self.engine = QwenOmniEngine(prompt)
+            # Qwen: use built-in speaker (no WAV)
+            qwen_spec = resolve_qwen_speaker(voice_id or default_qwen_speaker_id())
+            self.voice_id = qwen_spec.id
+            self.engine = QwenOmniEngine(prompt, speaker=qwen_spec.id)
         # MiniCPM (vLLM) commits the user turn on VAD stop. 0.80 s chops
         # mid-thought pauses into extra commits; the model then `listen`s
         # and the user has to repeat. Qwen still uses VAD_STOP_SECS.

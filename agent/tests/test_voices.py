@@ -180,12 +180,20 @@ class TokenVoiceTests(unittest.IsolatedAsyncioTestCase):
         self._humans = {k: set(v) for k, v in ts._humans.items()}
         ts._bots.clear()
         ts._humans.clear()
+        # Force MiniCPM mode for these tests (voice catalog tests)
+        self._old_model = os.environ.get("MODEL_NAME")
+        os.environ["MODEL_NAME"] = "openbmb/MiniCPM-o-4_5"
 
     async def asyncTearDown(self) -> None:
         self.ts._bots.clear()
         self.ts._humans.clear()
         self.ts._bots.update(self._bots)
         self.ts._humans.update(self._humans)
+        # Restore MODEL_NAME
+        if self._old_model is None:
+            os.environ.pop("MODEL_NAME", None)
+        else:
+            os.environ["MODEL_NAME"] = self._old_model
 
     async def test_unknown_voice_does_not_register_human(self) -> None:
         from fastapi import Request
