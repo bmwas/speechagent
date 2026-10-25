@@ -42,6 +42,40 @@ This is the first native MiniCPM-o duplex setup that actually held a conversatio
 
 Bring it up on Ada: `docker compose --profile native up -d --build`. Recreate **agent** only when the client changes; recreate **minicpm-worker** only when the pin or `minicpmo-utils` version changes.
 
+## Qwen3-Omni working (locked 2026-10-25)
+
+First vLLM-Omni Qwen path that actually held a spoken conversation on Ada. Restore point: git tag **`qwen3-omni-working-2026-10-25`**. MiniCPM native duplex is still tag **`best-so-far`**.
+
+**Model we used**
+
+- Hugging Face: **`cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit`**
+- Family: Qwen3-Omni-30B-A3B-Instruct (MoE). Thinker is 4-bit AWQ; talker + code2wav stay BF16.
+- No smaller Qwen3-Omni exists. Qwen2.5-Omni is **not** a realtime-audio option (text only over `/v1/video/chat/stream`).
+
+**Stack (Ada)**
+
+- `MODEL_BACKEND=vllm` + `COMPOSE_PROFILES=vllm` + `MODEL_BASE_URL=http://127.0.0.1:8199`
+- Endpoint: `/v1/video/chat/stream` (live `video.frame` + `audio.chunk`, `video.query` on VAD stop)
+- Deploy: `model-server/deploy/qwen3_omni.yaml` (all 3 stages on cuda:0, `enforce_eager`, `max_num_seqs=1`)
+- Voice: `QWEN_SPEAKER=Chelsie` (built-in; `Ethan` is the male option)
+- VAD: `VAD_BACKEND=silero`, start `0.15` s / stop `0.80` s
+
+**Stage token caps (leave these)**
+
+| Stage | Role | `max_model_len` / `max_num_batched_tokens` |
+|---|---|---|
+| 0 | thinker (4-bit MoE) | `8192` / `8192` |
+| 1 | talker (BF16) | `8192` / `8192` |
+| 2 | code2wav (BF16) | `32768` / `32768` |
+
+**What broke on the way here (do not re-introduce)**
+
+- Stage 2 without `max_model_len` → checkpoint default **65536** vs `max_num_batched_tokens=32768` → orchestrator crash, port 8199 never listens.
+- Qwen2.5-Omni on this endpoint → text then silence (`codec ids empty after stripping boundary tokens`).
+- Talking while stages load → hung turn. Wait for `qwen.ready`.
+
+Bring it up on Ada: `docker compose --profile vllm up -d --build`. Recreate **model-server** after any `qwen3_omni.yaml` change; recreate **agent** after client changes.
+
 ## Architecture
 
 ```
@@ -438,6 +472,7 @@ See [`.env`](.env). Important knobs:
 | Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving. vLLM: Grafana vocoder errors or `0.0 GiB` KV on `:8199`. Native: `minicpm-worker` `/health` must show `model_loaded`; then `native.ws_open` → `native.session_created` → `native.append` → `native.first_audio`. Recreate the profile’s GPU service, then speak. Qwen: `qwen.video_frame` → `qwen.request` → `qwen.first_audio` → `playout.first_frame`. |
 | Qwen `error.qwen` `Query processing failed` / `Stage-1 has no live replica` | v0.30.0 talker dies on the first `video.query` (`prompt_token_ids is None`). The image is patched at start by `/deploy/patch_qwen_talker.py`. Recreate **model-server** (`docker compose --profile vllm up -d --force-recreate model-server`) and confirm Grafana shows `qwen talker patch ...: patched` (not `not found`). A dead stage-1 does not recover in-process. |
 | Qwen text (`Hello`) then silence / `codec ids empty after stripping boundary tokens` | **Qwen2.5-Omni over `/v1/video/chat/stream` cannot produce streaming audio** — the talker returns only boundary tokens and code2wav hangs. This is not a config bug; Qwen2.5-Omni audio in vLLM-Omni is turn-based blob-only. Use **Qwen3-Omni** (`MODEL_NAME=cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit`), which is the model this endpoint is built for. A hung turn still emits `qwen.stall` → `qwen.reconnect` after `QWEN_STALL_S` (12 s). Do not talk while stages load; wait for `qwen.ready`. |
+| `model-server` restart loop / port 8199 never listens / `max_num_batched_tokens (32768) is smaller than max_model_len (65536)` | Stage 2 (code2wav) must set `max_model_len: 32768`. The checkpoint default is 65536. Locked in `deploy/qwen3_omni.yaml` with tag **`qwen3-omni-working-2026-10-25`**. |
 | Native worker never becomes healthy | HF snapshot not mounted. Need `./models/hf/hub/models--openbmb--MiniCPM-o-4_5/snapshots/<hash>/` (symlinks into `blobs/`). First-boot vLLM download creates this. Check `docker compose logs minicpm-worker`. |
 | Native: `Missing Step-Audio2 model files` `config.yaml` / `hift_original.pt` | minicpmo-utils 1.0.7 wants CosyVoice3 vocoder files the HF MiniCPM snapshot does not ship. Rebuild the worker image so it pins **1.0.6** (`docker compose up -d --build minicpm-worker`). |
 | `lstat .../MiniCPM-o-Demo/docker: no such file or directory` | Old compose still built from the submodule path. Recreate with this tree (`native-worker/Dockerfile` clones OpenBMB itself). Optional host checkout: `./scripts/ensure-minicpm-demo.sh`. Do not `--no-cache` unless you want to re-download the 6 GB torch wheel. |
@@ -457,7 +492,8 @@ See [`.env`](.env). Important knobs:
 
 - [vLLM-Omni MiniCPM-o 4.5 recipe](https://github.com/vllm-project/vllm-omni)
 - [vLLM-Omni Realtime Duplex API](https://github.com/vllm-project/vllm-omni/blob/main/docs/serving/realtime_duplex_api.md)
-- [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B)
+- [Qwen3-Omni-30B-A3B-Instruct AWQ 4-bit (working checkpoint)](https://huggingface.co/cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit)
+- [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) (text-realtime only — do not use for spoken Qwen)
 - [vLLM-Omni Streaming Video Input API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/video_stream_api/)
 - [LiveKit Agents](https://docs.livekit.io/agents/)
 - [LiveKit Silero VAD](https://docs.livekit.io/agents/logic/turns/vad/)
