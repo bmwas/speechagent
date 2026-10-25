@@ -42,6 +42,16 @@ TTS_REF_MIN_S = float(os.environ.get("NATIVE_TTS_REF_MIN_S", "5"))
 # Consecutive listen units while the user is still talking → session is stuck.
 LISTEN_LOCK_N = int(os.environ.get("NATIVE_LISTEN_LOCK_N", "5"))
 LISTEN_LOCK_RMS = float(os.environ.get("NATIVE_LISTEN_LOCK_RMS", "400"))
+# OpenBMB default is 1.0. Values <1 make the model eager to speak and, because
+# streaming_generate refuses <|listen|> until current_turn_ended, it will
+# ramble until the client sends force_listen.
+LISTEN_PROB_SCALE = float(os.environ.get("NATIVE_LISTEN_PROB_SCALE", "1.0"))
+# Consecutive 1 s speak units with no listen → force_listen to close the turn.
+SPEAK_YIELD_N = int(os.environ.get("NATIVE_SPEAK_YIELD_N", "10"))
+# Consecutive 1 s mic units at user RMS while the bot is speaking → barge
+# without waiting for Silero (echo hold + bot audio often suppress START).
+SPEAK_BARGE_N = int(os.environ.get("NATIVE_SPEAK_BARGE_N", "2"))
+SPEAK_BARGE_RMS = float(os.environ.get("NATIVE_SPEAK_BARGE_RMS", "400"))
 
 
 def _worker_ws_url() -> str:
@@ -205,6 +215,8 @@ class NativeMiniCPMEngine:
         self._first_audio = False
         self._last_append_rms = 0
         self._listen_speech_streak = 0
+        self._speak_streak = 0
+        self._speak_user_streak = 0
         self._session_id = ""
         self._reconnect_reason = ""
         self._last_reconnect_reason = ""
@@ -251,6 +263,8 @@ class NativeMiniCPMEngine:
             "reconnect_reason": self._last_reconnect_reason[:80],
             "force_listen": int(self._force_listen),
             "listen_speech_streak": self._listen_speech_streak,
+            "speak_streak": self._speak_streak,
+            "speak_user_streak": self._speak_user_streak,
             "cost_all_ms_p50": round(median, 1) if median >= 0 else -1,
             "voice_id": self.voice_id,
         }
@@ -308,8 +322,7 @@ class NativeMiniCPMEngine:
                 "sample_rate": MODEL_RATE,
                 "temperature": 0.7,
                 "force_listen_count": 3,
-                # <1 makes the listen head less sticky after the first turn.
-                "listen_prob_scale": float(os.environ.get("NATIVE_LISTEN_PROB_SCALE", "0.6")),
+                "listen_prob_scale": LISTEN_PROB_SCALE,
             },
             "voice": {
                 "ref_audio_base64": llm_b64,
@@ -415,6 +428,8 @@ class NativeMiniCPMEngine:
         if delta_kind == "listen":
             was = self._speaking
             self._speaking = False
+            self._speak_streak = 0
+            self._speak_user_streak = 0
             if self._last_append_rms >= LISTEN_LOCK_RMS:
                 self._listen_speech_streak += 1
             else:
@@ -463,6 +478,7 @@ class NativeMiniCPMEngine:
                 self._speaking = True
                 self._t_speak = now
             self._listen_speech_streak = 0
+            self._speak_streak += 1
             self._delta_n += 1
             self._delta_bytes += len(pcm)
             self._t_last_delta = now
@@ -523,6 +539,8 @@ class NativeMiniCPMEngine:
         )
         self._ready.clear()
         self._speaking = False
+        self._speak_streak = 0
+        self._speak_user_streak = 0
         await self._teardown_socket(cancel_watchdog=False)
         self._buf.clear()
         self._force_listen = False
@@ -582,9 +600,49 @@ class NativeMiniCPMEngine:
             del self._buf[: self._chunk_bytes]
             await self._append(piece)
 
+    def _drain_out(self) -> int:
+        q = self._out.qsize()
+        while not self._out.empty():
+            try:
+                self._out.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        return q
+
+    def _request_listen(self, reason: str) -> None:
+        was = self._speaking
+        q = self._drain_out()
+        self._speaking = False
+        self._force_listen = True
+        if reason == "interrupt":
+            return
+        trace_stream(
+            "speech",
+            "native.speak_yield",
+            reason=reason[:80],
+            was_speaking=int(was),
+            dropped_q=q,
+            speak_streak=self._speak_streak,
+            speak_user_streak=self._speak_user_streak,
+            append_rms=int(self._last_append_rms),
+        )
+
     async def _append(self, pcm16: bytes) -> None:
         if self._ws is None:
             return
+        rms = pcm_rms(pcm16)
+        if self._speaking and rms >= SPEAK_BARGE_RMS:
+            self._speak_user_streak += 1
+            if SPEAK_BARGE_N > 0 and self._speak_user_streak >= SPEAK_BARGE_N:
+                self._request_listen("speak_barge")
+        else:
+            self._speak_user_streak = 0
+        if (
+            SPEAK_YIELD_N > 0
+            and self._speak_streak >= SPEAK_YIELD_N
+            and not self._force_listen
+        ):
+            self._request_listen("speak_yield")
         audio_b64 = base64.b64encode(_pcm16_to_f32le(pcm16)).decode("ascii")
         body: dict[str, Any] = {
             "audio": audio_b64,
@@ -607,8 +665,8 @@ class NativeMiniCPMEngine:
         now = time.monotonic()
         self._append_n += 1
         self._t_last_append = now
-        self._last_append_rms = pcm_rms(pcm16)
-        self._append_meter.add(chunks=1, bytes=len(pcm16), rms=self._last_append_rms)
+        self._last_append_rms = rms
+        self._append_meter.add(chunks=1, bytes=len(pcm16), rms=rms)
         trace_stream(
             "speech",
             "native.append",
@@ -616,7 +674,7 @@ class NativeMiniCPMEngine:
             bytes=len(pcm16),
             duration_ms=CHUNK_MS,
             force_listen=int(force),
-            rms=pcm_rms(pcm16),
+            rms=int(rms),
         )
 
     async def push_image(self, jpeg: bytes) -> None:
@@ -637,13 +695,9 @@ class NativeMiniCPMEngine:
     async def interrupt(self) -> None:
         was = self._speaking
         q = self._out.qsize()
-        self._speaking = False
-        self._force_listen = True
-        while not self._out.empty():
-            try:
-                self._out.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._speak_streak = 0
+        self._speak_user_streak = 0
+        self._request_listen("interrupt")
         trace_stream(
             "speech",
             "native.interrupt",

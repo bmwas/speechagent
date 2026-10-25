@@ -203,7 +203,8 @@ This is a **native omni** path, not ASR → LLM → TTS. vLLM MiniCPM, native Mi
 - Same LiveKit mic/camera path. The agent buffers PCM into **1 s float32** units (`NATIVE_CHUNK_MS=1000`) and sends `input.append` continuously, including silence. There is **no commit** and **no VAD on the worker** (OpenBMB #17).
 - Camera stills stay at **1 JPEG/s**. Higher FPS makes the model babble (OpenBMB #49).
 - `session.init` sends both `payload.voice.ref_audio_base64` and legacy `ref_audio_base64`. Token2Wav ref is capped at 10 s.
-- Barge-in: Silero `START_OF_SPEECH` while occupying flushes playout **immediately** and sets `force_listen` on the next 1 s unit (model-side listen can lag up to ~1 s). Native has no `response.cancel`.
+- Barge-in: Silero `START_OF_SPEECH` while occupying flushes playout **immediately** and sets `force_listen` on the next 1 s unit (model-side listen can lag up to ~1 s). Native has no `response.cancel`. The worker also **cannot self-yield mid-turn** (listen tokens are rewritten to TTS until `current_turn_ended`); after ~10 s of continuous speak, or 2 s of user-level mic while speaking, the agent sends `force_listen`.
+- `listen_prob_scale` stays at OpenBMB's **1.0**. Values `<1` make the model ramble and never return the floor.
 - Self-imposed **300 s reconnect** (`NATIVE_SESSION_S`) bounds KV growth.
 - First-speech latency is the official 1 Hz unit design (~1.5–3 s TTFS). If Grafana `cost_all_ms` median is above 900 ms, enable `torch.compile` on the worker.
 
@@ -356,6 +357,9 @@ See [`.env`](.env). Important knobs:
 | `NATIVE_CHUNK_MS` | `1000` | Native duplex input unit size (OpenBMB 1 s float32). |
 | `NATIVE_SESSION_S` | `300` | Self-imposed native reconnect cap (KV bound). |
 | `NATIVE_TTS_REF_MAX_S` | `10` | Token2Wav clone clip cap (OpenBMB #11; 15 s hard-fails). |
+| `NATIVE_LISTEN_PROB_SCALE` | `1.0` | OpenBMB listen-head scale. Do not set `<1` (causes endless speak). |
+| `NATIVE_SPEAK_YIELD_N` | `10` | Consecutive 1 s speak units before `force_listen` closes the turn. |
+| `NATIVE_SPEAK_BARGE_N` | `2` | Consecutive 1 s user-RMS units while speaking before `force_listen`. |
 | `HUGGINGFACE_TOKEN` | bashrc | Hub auth for weight download. Read from the GPU-box shell, not `.env` |
 | `AUDIO_SOURCE_QUEUE_MS` | `80` | LiveKit speaker queue depth |
 | `PLAYOUT_HOLD_S` | `0.25` | Brief silence bridge after real audio drains; longer stalls are treated as idle |

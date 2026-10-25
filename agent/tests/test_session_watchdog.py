@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
+import json
 import os
 import sys
 import time
@@ -18,6 +20,8 @@ from duplex_model import MiniCPMDuplexEngine  # noqa: E402
 from barge_in import EnergyVad, LiveKitSileroVad, VAD_START_SECS, VAD_STOP_SECS  # noqa: E402
 from native_minicpm import (  # noqa: E402
     LISTEN_LOCK_N,
+    SPEAK_BARGE_N,
+    SPEAK_YIELD_N,
     NativeMiniCPMEngine,
     _f32le_to_pcm16,
     _pcm16_to_f32le,
@@ -403,6 +407,19 @@ class SileroVadEventTests(unittest.TestCase):
         self.assertFalse(vad._pending_start)
 
 
+class _FakeWs:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(json.loads(payload))
+
+
+def _pcm_chunk(sample: int) -> bytes:
+    n = 16_000  # 1 s at MODEL_RATE
+    return array.array("h", [int(sample)] * n).tobytes()
+
+
 class NativeEngineTests(unittest.IsolatedAsyncioTestCase):
     def test_pcm_float_roundtrip(self) -> None:
         import array
@@ -464,6 +481,32 @@ class NativeEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(eng.generating)
         self.assertEqual(eng._out.qsize(), 0)
         self.assertFalse(hasattr(eng, "end_of_speech"))
+
+    async def test_speak_yield_force_listens_after_ramble(self) -> None:
+        eng = NativeMiniCPMEngine("hello")
+        eng._ws = _FakeWs()
+        eng._speaking = True
+        eng._speak_streak = SPEAK_YIELD_N
+        await eng._out.put((b"\x00\x00", 24000))
+        await eng._append(_pcm_chunk(0))
+        self.assertFalse(eng.generating)
+        self.assertEqual(eng._out.qsize(), 0)
+        payload = eng._ws.sent[-1]
+        self.assertTrue(payload["input"]["force_listen"])
+
+    async def test_speak_barge_force_listens_while_user_talks(self) -> None:
+        eng = NativeMiniCPMEngine("hello")
+        eng._ws = _FakeWs()
+        eng._speaking = True
+        loud = _pcm_chunk(900)
+        await eng._append(loud)
+        self.assertFalse(eng._ws.sent[-1]["input"]["force_listen"])
+        self.assertEqual(eng._speak_user_streak, 1)
+        eng._speaking = True
+        await eng._append(loud)
+        self.assertGreaterEqual(SPEAK_BARGE_N, 2)
+        self.assertTrue(eng._ws.sent[-1]["input"]["force_listen"])
+        self.assertFalse(eng.generating)
 
     def test_qwen_native_refused(self) -> None:
         from agent import SpeechSession
