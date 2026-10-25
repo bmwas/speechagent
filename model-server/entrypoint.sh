@@ -297,18 +297,7 @@ EXTRA=(
 )
 if [ -n "${DEPLOY}" ]; then
   echo "model-server using deploy-config ${DEPLOY}"
-  python - "${DEPLOY}" <<'PY'
-import sys
-from pathlib import Path
-p = Path(sys.argv[1])
-try:
-    import yaml
-    d = yaml.safe_load(p.read_text(encoding="utf-8"))
-    eager = [(s.get("stage_id"), s.get("enforce_eager"), s.get("async_scheduling")) for s in d.get("stages") or []]
-    print("model-server deploy stages (id, enforce_eager, async_scheduling):", eager)
-except Exception as exc:
-    print("model-server deploy parse failed:", exc)
-PY
+  python /deploy/validate_deploy.py "${DEPLOY}"
   EXTRA+=(--deploy-config "${DEPLOY}")
 else
   echo "model-server no deploy-config; --omni auto with gpu_memory_utilization"

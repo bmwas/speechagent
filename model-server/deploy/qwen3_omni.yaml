@@ -73,6 +73,9 @@ stages:
   - stage_id: 2
     devices: "0"
     max_num_seqs: 1
+    # Must cap max_model_len: checkpoint default is 65536 and vLLM 0.30+
+    # rejects max_num_batched_tokens (32768) < max_model_len at orchestrator init.
+    max_model_len: 32768
     max_num_batched_tokens: 32768
     gpu_memory_utilization: 0.10
     trust_remote_code: true

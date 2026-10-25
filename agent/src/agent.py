@@ -120,6 +120,8 @@ class SpeechSession:
         self._mic_packet_seq = 0
         self._last_mic = 0.0
         self._gap_open = False
+        self._engine_down_since = 0.0
+        self._engine_down_rl = RateLimiter(10.0)
         self._pull_n = 0
         self._pull_bytes = 0
         self._pull_last_t = 0.0
@@ -428,6 +430,22 @@ class SpeechSession:
                     }
                 )
                 trace_stream("speech", "stream.health", **fields)
+                if self._humans and self._brain_started and not ready:
+                    if not self._engine_down_since:
+                        self._engine_down_since = now
+                    elif (now - self._engine_down_since) >= 10.0 and self._engine_down_rl.due():
+                        trace_stream(
+                            "speech",
+                            "stream.engine_down",
+                            down_ms=int((now - self._engine_down_since) * 1000),
+                            path=fields.get("path", ""),
+                            model=self.model_name,
+                            ws_attempts=snap.get("ws_attempts", -1),
+                            model_tcp_ok=snap.get("model_tcp_ok"),
+                            model_probe_detail=snap.get("model_probe_detail", ""),
+                        )
+                else:
+                    self._engine_down_since = 0.0
                 if self._humans and self._mic_first and mic_age_ms >= 1500:
                     if not self._gap_open:
                         self._gap_open = True

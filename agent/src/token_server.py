@@ -7,6 +7,7 @@ import logging
 import os
 import uuid
 from typing import Any
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -70,6 +71,30 @@ async def livekit_tcp_ok() -> tuple[bool, str]:
         return False, f"{host}:{port} {exc}"
 
 
+def _model_host_port() -> tuple[str, int]:
+    raw = (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8199").rstrip("/")
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urlparse(raw)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8199
+    return host, port
+
+
+async def model_server_tcp_ok() -> tuple[bool, str]:
+    host, port = _model_host_port()
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 2.0)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True, f"{host}:{port}"
+    except Exception as exc:
+        return False, f"{host}:{port} {exc}"
+
+
 def public_ws_url(request: Request | None = None) -> str:
     if LIVEKIT_PUBLIC_URL:
         return LIVEKIT_PUBLIC_URL
@@ -88,23 +113,48 @@ def public_ws_url(request: Request | None = None) -> str:
 async def health():
     brains = sum(1 for b in _bots.values() if b._brain_started and b._running)
     lk_ok, lk_detail = await livekit_tcp_ok()
+    backend = (os.environ.get("MODEL_BACKEND") or "vllm").strip().lower()
+    model_tcp_ok = True
+    model_tcp_detail = "(native worker — not vLLM :8199)"
+    if backend == "vllm":
+        model_tcp_ok, model_tcp_detail = await model_server_tcp_ok()
+    engine_ready = any(
+        getattr(bot, "_brain_started", False)
+        and getattr(bot, "_running", False)
+        and bool(getattr(getattr(bot, "engine", None), "ready", False))
+        for bot in _bots.values()
+    )
+    ok = lk_ok and (model_tcp_ok or backend != "vllm")
+    if backend == "vllm" and not model_tcp_ok:
+        trace_stream(
+            "speech",
+            "error.model_down",
+            detail=model_tcp_detail,
+            model=os.environ.get("MODEL_NAME", ""),
+            model_base_url=os.environ.get("MODEL_BASE_URL", ""),
+        )
     voices = {
         rid: getattr(bot, "voice_id", DEFAULT_VOICE_ID)
         for rid, bot in _bots.items()
         if getattr(bot, "_running", False)
     }
     return {
-        "ok": True,
+        "ok": ok,
         "model": os.environ.get("MODEL_NAME", ""),
+        "model_backend": backend,
+        "model_base_url": os.environ.get("MODEL_BASE_URL", ""),
         "transport": "livekit",
         "bots": sum(1 for b in _bots.values() if b._running),
         "brains": brains,
+        "engine_ready": engine_ready,
         "rooms": list(_bots.keys()),
         "voices": voices,
         "livekit_url": os.environ.get("LIVEKIT_URL", ""),
         "livekit_public_url": LIVEKIT_PUBLIC_URL or "(same-origin wss /rtc)",
         "livekit_tcp": lk_ok,
         "livekit_tcp_detail": lk_detail,
+        "model_tcp": model_tcp_ok,
+        "model_tcp_detail": model_tcp_detail,
     }
 
 

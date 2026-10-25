@@ -15,8 +15,11 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 import wave
 from typing import Any
+from urllib.parse import urlparse
 
 import websockets
 
@@ -84,13 +87,87 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _model_ws_url() -> str:
+def _model_http_url() -> str:
     base = (os.environ.get("MODEL_BASE_URL") or "http://127.0.0.1:8199").rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        base = "http://" + base
+    return base
+
+
+def _model_ws_url() -> str:
+    base = _model_http_url()
     if base.startswith("http://"):
         base = "ws://" + base[len("http://") :]
     elif base.startswith("https://"):
         base = "wss://" + base[len("https://") :]
     return f"{base}/v1/video/chat/stream"
+
+
+def _model_host_port() -> tuple[str, int]:
+    parsed = urlparse(_model_http_url())
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 8199)
+    return host, port
+
+
+async def probe_model_server() -> dict[str, Any]:
+    """TCP + HTTP probe for vLLM-Omni (used while the WS endpoint is down)."""
+    host, port = _model_host_port()
+    out: dict[str, Any] = {
+        "model_base_url": _model_http_url(),
+        "host": host,
+        "port": port,
+        "tcp_ok": False,
+        "http_ok": False,
+        "models_ok": False,
+        "detail": "",
+    }
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 2.0)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        out["tcp_ok"] = True
+    except Exception as exc:
+        out["detail"] = f"tcp refused: {exc}"[:200]
+        return out
+
+    def _http_probe() -> tuple[bool, bool, str]:
+        health_url = f"http://{host}:{port}/health"
+        models_url = f"http://{host}:{port}/v1/models"
+        detail_parts: list[str] = []
+        http_ok = False
+        models_ok = False
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as resp:
+                body = resp.read(240).decode("utf-8", "replace")
+                http_ok = 200 <= int(getattr(resp, "status", 200)) < 300
+                detail_parts.append(f"health={body[:120]}")
+        except urllib.error.HTTPError as exc:
+            detail_parts.append(f"health HTTP {exc.code}")
+        except Exception as exc:
+            detail_parts.append(f"health {exc}")
+        try:
+            with urllib.request.urlopen(models_url, timeout=2) as resp:
+                body = resp.read(240).decode("utf-8", "replace")
+                models_ok = 200 <= int(getattr(resp, "status", 200)) < 300
+                detail_parts.append(f"models={body[:120]}")
+        except urllib.error.HTTPError as exc:
+            detail_parts.append(f"models HTTP {exc.code}")
+        except Exception as exc:
+            detail_parts.append(f"models {exc}")
+        return http_ok, models_ok, "; ".join(detail_parts)[:240]
+
+    try:
+        http_ok, models_ok, detail = await asyncio.to_thread(_http_probe)
+        out["http_ok"] = http_ok
+        out["models_ok"] = models_ok
+        out["detail"] = detail
+    except Exception as exc:
+        out["detail"] = f"http probe failed: {exc}"[:200]
+    return out
 
 
 def _age_ms(started: float, now: float) -> int:
@@ -162,6 +239,10 @@ class QwenOmniEngine:
         self._drop_meter = StreamMeter("speech", "stream.drop_not_ready", kind="in")
         self._text_rl = RateLimiter(1.0)
         self._unknown_rl = RateLimiter(2.0)
+        self._not_ready_since = 0.0
+        self._not_ready_rl = RateLimiter(5.0)
+        self._last_probe: dict[str, Any] = {}
+        self._ws_attempts = 0
 
     @property
     def generating(self) -> bool:
@@ -173,7 +254,8 @@ class QwenOmniEngine:
 
     def stream_snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
-        return {
+        not_ready_ms = _age_ms(self._not_ready_since, now) if self._not_ready_since else 0
+        snap = {
             "ready": self.ready,
             "speaking": self._busy,
             "out_q": self._out.qsize(),
@@ -184,7 +266,20 @@ class QwenOmniEngine:
             "frame_age_ms": _age_ms(self._t_last_frame, now),
             "delta_age_ms": _age_ms(self._t_last_delta, now),
             "rx_age_ms": _age_ms(self._t_last_rx, now),
+            "ws_attempts": self._ws_attempts,
+            "not_ready_ms": not_ready_ms,
         }
+        probe = self._last_probe
+        if probe:
+            snap.update(
+                {
+                    "model_tcp_ok": bool(probe.get("tcp_ok")),
+                    "model_http_ok": bool(probe.get("http_ok")),
+                    "model_models_ok": bool(probe.get("models_ok")),
+                    "model_probe_detail": str(probe.get("detail") or "")[:120],
+                }
+            )
+        return snap
 
     async def _send(self, body: dict[str, Any]) -> None:
         if self._ws is None:
@@ -194,15 +289,70 @@ class QwenOmniEngine:
     async def _connect_ws(self, url: str, attempts: int = 181) -> int:
         delay = 2.0
         last_err = "unknown"
+        self._ws_attempts = 0
         for attempt in range(1, attempts + 1):
+            self._ws_attempts = attempt
             try:
                 self._ws = await websockets.connect(url, max_size=16_000_000, ping_interval=20)
+                if attempt > 1:
+                    trace_stream(
+                        "speech",
+                        "qwen.ws_connected",
+                        attempt=attempt,
+                        url=url,
+                        model=self.model,
+                    )
                 return attempt
             except Exception as exc:
                 last_err = str(exc)[:200]
-                trace_stream("speech", "qwen.ws_retry", attempt=attempt, error=last_err, url=url)
+                probe: dict[str, Any] = {}
+                if attempt == 1 or attempt in (3, 5, 10, 20) or attempt % 15 == 0:
+                    probe = await probe_model_server()
+                    self._last_probe = probe
+                    trace_stream(
+                        "speech",
+                        "qwen.model_probe",
+                        attempt=attempt,
+                        url=url,
+                        error=last_err,
+                        **probe,
+                    )
+                    if not probe.get("tcp_ok"):
+                        LOG.warning(
+                            "model-server not listening on %s:%s (attempt %s): %s",
+                            probe.get("host"),
+                            probe.get("port"),
+                            attempt,
+                            probe.get("detail") or last_err,
+                        )
+                trace_stream(
+                    "speech",
+                    "qwen.ws_retry",
+                    attempt=attempt,
+                    error=last_err,
+                    url=url,
+                    model_base_url=_model_http_url(),
+                    model_tcp_ok=bool(probe.get("tcp_ok")) if probe else None,
+                )
                 await asyncio.sleep(min(delay, 15.0))
                 delay = min(delay * 1.25, 15.0)
+        probe = await probe_model_server()
+        self._last_probe = probe
+        trace_stream(
+            "speech",
+            "error.qwen_ws_connect_failed",
+            attempts=attempts,
+            error=last_err,
+            url=url,
+            **probe,
+        )
+        LOG.error(
+            "model-server video stream never accepted %s after %s attempts: %s; probe=%s",
+            url,
+            attempts,
+            last_err,
+            probe.get("detail") or probe,
+        )
         raise RuntimeError(f"model-server video stream never accepted {url}: {last_err}")
 
     async def _send_session_config(self) -> None:
@@ -230,6 +380,7 @@ class QwenOmniEngine:
         connected_at = await self._connect_ws(url)
         await self._send_session_config()
         self._t_ready = time.monotonic()
+        self._not_ready_since = 0.0
         self._ready.set()
         self._reader = asyncio.create_task(self._read())
         self._hb = asyncio.create_task(self._heartbeat())
@@ -483,8 +634,23 @@ class QwenOmniEngine:
                 return
         self._t_last_mic = time.monotonic()
         if not self.ready:
+            now = time.monotonic()
+            if not self._not_ready_since:
+                self._not_ready_since = now
             self._drop_meter.add(bytes=len(pcm16), frames=1)
+            if self._not_ready_rl.due():
+                not_ready_ms = _age_ms(self._not_ready_since, now)
+                probe = await probe_model_server()
+                self._last_probe = probe
+                trace_stream(
+                    "speech",
+                    "qwen.engine_not_ready",
+                    not_ready_ms=not_ready_ms,
+                    ws_attempts=self._ws_attempts,
+                    **probe,
+                )
             return
+        self._not_ready_since = 0.0
         if is_speech:
             self._utt_bytes += len(pcm16)
         self._audio_n += 1
@@ -504,8 +670,22 @@ class QwenOmniEngine:
         if not jpeg:
             return
         if not self.ready:
+            now = time.monotonic()
+            if not self._not_ready_since:
+                self._not_ready_since = now
             self._drop_meter.add(dropped=1, reason="not_ready")
+            if self._not_ready_rl.due():
+                not_ready_ms = _age_ms(self._not_ready_since, now)
+                trace_stream(
+                    "speech",
+                    "qwen.engine_not_ready",
+                    not_ready_ms=not_ready_ms,
+                    ws_attempts=self._ws_attempts,
+                    dropped="video",
+                    **self._last_probe,
+                )
             return
+        self._not_ready_since = 0.0
         self._frame_n += 1
         self._t_last_frame = time.monotonic()
         pts_ms = int(self._t_last_frame * 1000)
