@@ -17,6 +17,7 @@ from session_watchdog import TurnWatchdog  # noqa: E402
 from duplex_model import MiniCPMDuplexEngine  # noqa: E402
 from barge_in import EnergyVad, LiveKitSileroVad, VAD_START_SECS, VAD_STOP_SECS  # noqa: E402
 from native_minicpm import (  # noqa: E402
+    LISTEN_LOCK_N,
     NativeMiniCPMEngine,
     _f32le_to_pcm16,
     _pcm16_to_f32le,
@@ -438,13 +439,21 @@ class NativeEngineTests(unittest.IsolatedAsyncioTestCase):
             else:
                 os.environ["NATIVE_WORKER_URL"] = old_native
 
-    async def test_listen_drops_queued_audio(self) -> None:
+    async def test_listen_keeps_queued_audio(self) -> None:
         eng = NativeMiniCPMEngine("hello")
         eng._speaking = True
         await eng._out.put((b"\x00\x00", 24000))
         await eng._on_event({"type": "response.output.delta", "kind": "listen"})
         self.assertFalse(eng.generating)
-        self.assertEqual(eng._out.qsize(), 0)
+        self.assertEqual(eng._out.qsize(), 1)
+
+    async def test_listen_lock_reconnects_while_user_talks(self) -> None:
+        eng = NativeMiniCPMEngine("hello")
+        eng._last_append_rms = 900
+        for _ in range(LISTEN_LOCK_N):
+            await eng._on_event({"type": "response.output.delta", "kind": "listen"})
+        self.assertEqual(eng._reconnect_reason, "listen_lock")
+        self.assertEqual(eng._listen_speech_streak, LISTEN_LOCK_N)
 
     async def test_interrupt_sets_force_listen_and_drops_queue(self) -> None:
         eng = NativeMiniCPMEngine("hello")

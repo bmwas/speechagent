@@ -39,6 +39,9 @@ CHUNK_MS = int(os.environ.get("NATIVE_CHUNK_MS", "1000"))
 SESSION_CAP_S = float(os.environ.get("NATIVE_SESSION_S", "300"))
 TTS_REF_MAX_S = float(os.environ.get("NATIVE_TTS_REF_MAX_S", "10"))
 TTS_REF_MIN_S = float(os.environ.get("NATIVE_TTS_REF_MIN_S", "5"))
+# Consecutive listen units while the user is still talking → session is stuck.
+LISTEN_LOCK_N = int(os.environ.get("NATIVE_LISTEN_LOCK_N", "5"))
+LISTEN_LOCK_RMS = float(os.environ.get("NATIVE_LISTEN_LOCK_RMS", "400"))
 
 
 def _worker_ws_url() -> str:
@@ -200,6 +203,8 @@ class NativeMiniCPMEngine:
         self._t_last_rx = 0.0
         self._t_speak = 0.0
         self._first_audio = False
+        self._last_append_rms = 0
+        self._listen_speech_streak = 0
         self._session_id = ""
         self._reconnect_reason = ""
         self._last_reconnect_reason = ""
@@ -245,6 +250,7 @@ class NativeMiniCPMEngine:
             "session_generation": self._session_generation,
             "reconnect_reason": self._last_reconnect_reason[:80],
             "force_listen": int(self._force_listen),
+            "listen_speech_streak": self._listen_speech_streak,
             "cost_all_ms_p50": round(median, 1) if median >= 0 else -1,
             "voice_id": self.voice_id,
         }
@@ -302,6 +308,8 @@ class NativeMiniCPMEngine:
                 "sample_rate": MODEL_RATE,
                 "temperature": 0.7,
                 "force_listen_count": 3,
+                # <1 makes the listen head less sticky after the first turn.
+                "listen_prob_scale": float(os.environ.get("NATIVE_LISTEN_PROB_SCALE", "0.6")),
             },
             "voice": {
                 "ref_audio_base64": llm_b64,
@@ -335,6 +343,7 @@ class NativeMiniCPMEngine:
         if not self._ready.is_set():
             raise RuntimeError("native worker never sent session.created")
         self._session_generation += 1
+        self._listen_speech_streak = 0
         self._t_session = time.monotonic()
         self._t_ready = self._t_session
         self._first_audio = False
@@ -405,27 +414,32 @@ class NativeMiniCPMEngine:
                 del self._unit_cost_ms[:128]
         if delta_kind == "listen":
             was = self._speaking
-            dropped = 0
-            if was:
-                dropped = self._out.qsize()
-                while not self._out.empty():
-                    try:
-                        self._out.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
             self._speaking = False
+            if self._last_append_rms >= LISTEN_LOCK_RMS:
+                self._listen_speech_streak += 1
+            else:
+                self._listen_speech_streak = 0
+            if (
+                LISTEN_LOCK_N > 0
+                and self._listen_speech_streak >= LISTEN_LOCK_N
+                and not self._reconnect_reason
+            ):
+                self._reconnect_reason = "listen_lock"
             trace_stream(
                 "speech",
                 "native.listen",
                 was_speaking=int(was),
-                dropped_q=dropped,
+                dropped_q=self._out.qsize(),
                 kv=int(metrics.get("kv_cache_length") or 0),
+                listen_speech_streak=self._listen_speech_streak,
+                append_rms=int(self._last_append_rms),
                 cost_all_ms=round(float(cost), 1) if isinstance(cost, (int, float)) else -1,
             )
             return
         if delta_kind == "text":
             text = str(ev.get("text") or "")
             if text:
+                self._listen_speech_streak = 0
                 if not self._speaking:
                     self._speaking = True
                     self._t_speak = time.monotonic()
@@ -448,6 +462,7 @@ class NativeMiniCPMEngine:
             if not self._speaking:
                 self._speaking = True
                 self._t_speak = now
+            self._listen_speech_streak = 0
             self._delta_n += 1
             self._delta_bytes += len(pcm)
             self._t_last_delta = now
@@ -592,7 +607,8 @@ class NativeMiniCPMEngine:
         now = time.monotonic()
         self._append_n += 1
         self._t_last_append = now
-        self._append_meter.add(chunks=1, bytes=len(pcm16), rms=pcm_rms(pcm16))
+        self._last_append_rms = pcm_rms(pcm16)
+        self._append_meter.add(chunks=1, bytes=len(pcm16), rms=self._last_append_rms)
         trace_stream(
             "speech",
             "native.append",
