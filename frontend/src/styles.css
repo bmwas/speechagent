@@ -10,7 +10,23 @@
 }
 * { box-sizing: border-box; }
 html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
-.shell { max-width: 960px; margin: 0 auto; padding: 24px; }
+.shell { max-width: 1400px; margin: 0 auto; padding: 24px; }
+.patient-layout.has-lab {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 20px;
+  align-items: start;
+}
+.patient-lab {
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+@media (max-width: 960px) {
+  .patient-layout.has-lab { grid-template-columns: 1fr; }
+  .patient-lab { position: static; max-height: none; }
+}
 .eyebrow {
   font-family: ui-monospace, monospace;
   font-size: 12px;
@@ -231,7 +247,7 @@ code { font-family: ui-monospace, monospace; font-size: 12px; }
 
 /* Session Lab */
 .session-lab {
-  margin: 20px 0;
+  margin: 0;
   padding: 16px;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -245,6 +261,7 @@ code { font-family: ui-monospace, monospace; font-size: 12px; }
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+.session-lab.session-lab-idle,
 .session-lab.session-lab-loading,
 .session-lab.session-lab-error {
   opacity: 0.55;

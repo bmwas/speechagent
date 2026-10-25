@@ -434,50 +434,56 @@ export default function App() {
 
   return (
     <div className="shell">
-      <div className="eyebrow">speechagent · livekit · /patient</div>
-      <h1>Talk to the agent</h1>
-      <p className="muted">
-        Headphones on. Open this page over HTTPS, pick a voice, click Connect, allow camera and mic,
-        then speak. The agent sees you and answers in speech.
-        {model ? ` Model: ${model}.` : ""} Voice: {voiceName}.
-      </p>
-      {insecure || httpPage ? (
-        <div className="warn">
-          Stay on <code>https://{host}{PATH}</code> — Advanced → Proceed — then reload. HTTP is not
-          a secure context, so camera/mic stay blocked.
+      <div className="patient-layout has-lab">
+        <div className="patient-main">
+          <div className="eyebrow">speechagent · livekit · /patient</div>
+          <h1>Talk to the agent</h1>
+          <p className="muted">
+            Headphones on. Open this page over HTTPS, pick a voice, click Connect, allow camera and mic,
+            then speak. The agent sees you and answers in speech.
+            {model ? ` Model: ${model}.` : ""} Voice: {voiceName}.
+          </p>
+          {insecure || httpPage ? (
+            <div className="warn">
+              Stay on <code>https://{host}{PATH}</code> — Advanced → Proceed — then reload. HTTP is not
+              a secure context, so camera/mic stay blocked.
+            </div>
+          ) : null}
+          <VoicePicker
+            voices={voices}
+            selectedId={voiceId}
+            disabled={voiceLocked}
+            family={family}
+            onSelect={(id) => {
+              setVoiceId(id);
+              storeVoiceId(id, family);
+            }}
+          />
+          <div className="row">
+            <button type="button" onClick={() => void connect()} disabled={state === "connecting"}>
+              {connected ? "Reconnect" : "Connect"}
+            </button>
+            <button type="button" className="secondary" onClick={() => void disconnect()} disabled={!lkOn && state === "idle"}>
+              Disconnect
+            </button>
+            <span className="status">transport: {state}</span>
+          </div>
+          <FloorMetrics connected={lkOn} room={ROOM} />
+          {error ? <p className="muted">error: {error}</p> : null}
+          <div className="previews">
+            <div className="tile">
+              <h2>self-preview (local)</h2>
+              <video ref={localRef} autoPlay muted playsInline />
+            </div>
+            <div className="tile">
+              <h2>agent audio</h2>
+              <video autoPlay playsInline />
+            </div>
+          </div>
         </div>
-      ) : null}
-      <VoicePicker
-        voices={voices}
-        selectedId={voiceId}
-        disabled={voiceLocked}
-        family={family}
-        onSelect={(id) => {
-          setVoiceId(id);
-          storeVoiceId(id, family);
-        }}
-      />
-      <div className="row">
-        <button type="button" onClick={() => void connect()} disabled={state === "connecting"}>
-          {connected ? "Reconnect" : "Connect"}
-        </button>
-        <button type="button" className="secondary" onClick={() => void disconnect()} disabled={!lkOn && state === "idle"}>
-          Disconnect
-        </button>
-        <span className="status">transport: {state}</span>
-      </div>
-      <FloorMetrics connected={lkOn} room={ROOM} />
-      <SessionLab connected={lkOn} room={ROOM} peerConnection={peerConnection} />
-      {error ? <p className="muted">error: {error}</p> : null}
-      <div className="previews">
-        <div className="tile">
-          <h2>self-preview (local)</h2>
-          <video ref={localRef} autoPlay muted playsInline />
-        </div>
-        <div className="tile">
-          <h2>agent audio</h2>
-          <video autoPlay playsInline />
-        </div>
+        <aside className="patient-lab">
+          <SessionLab connected={lkOn} room={ROOM} peerConnection={peerConnection} />
+        </aside>
       </div>
       <audio ref={remoteAudioRef} autoPlay playsInline />
     </div>

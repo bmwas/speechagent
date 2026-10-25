@@ -203,7 +203,16 @@ export default function SessionLab({ connected, room, peerConnection }: Props) {
     };
   }, [connected, peerConnection]);
 
-  if (!connected) return null;
+  if (!connected) {
+    return (
+      <div className="session-lab session-lab-idle">
+        <h3>Session Lab</h3>
+        <div className="lab-row">
+          <span className="lab-label">Connect to start scoring</span>
+        </div>
+      </div>
+    );
+  }
   if (error) {
     return (
       <div className="session-lab session-lab-error">
