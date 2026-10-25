@@ -1,0 +1,92 @@
+# Qwen3-Omni-30B-A3B-Instruct (MoE), single RTX 6000 Ada 48 GB.
+#
+# Upstream vllm_omni/deploy/qwen3_omni_moe.yaml is verified on 2x H100
+# (stage 0 cuda:0, stages 1+2 cuda:1). This box has one Ada as cuda:0, so
+# all three stages colocate there with a hand-split memory budget and
+# max_num_seqs=1 (single live caller, not the production 64).
+#
+# Model weights come from a thinker-only 4-bit checkpoint
+# (cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit, compressed-tensors
+# pack-quantized int4). The audio_tower, talker, and code2wav stay in their
+# checkpoint precision, so stages 1/2 must NOT inherit the top-level
+# quantization_config — cleared via hf_overrides, mirroring the upstream
+# `musa` profile note "the supported Qwen3-Omni checkpoint quantizes the
+# thinker only; clear the checkpoint-level metadata for the BF16 audio
+# stages."
+#
+# enforce_eager is forced on every stage: it removes CUDA-graph capture
+# memory (critical when 3 stages share 48 GB) and sidesteps the vLLM 0.27
+# compiled-MRoPE fusion that corrupts Qwen3-Omni audio (#6090), so the
+# cuda `custom_ops: ["+rotary_embedding"]` workaround is unnecessary here.
+
+# Stream codec chunks so audio arrives as incremental response.audio.delta.
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  # Stage 0 — thinker (MoE, 4-bit). Largest resident footprint.
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.55
+    moe_backend: triton
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enforce_eager: true
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  # Stage 1 — talker (MoE, BF16). Only stochastic stage; keep the seed so
+  # Qwen3-Omni speech is reproducible (#6090). Not quantized.
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.20
+    moe_backend: triton
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enforce_eager: true
+    hf_overrides:
+      quantization_config: null
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      seed: 42
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      repetition_penalty: 1.05
+
+  # Stage 2 — code2wav (ConvNet, BF16). No KV cache. Not quantized.
+  - stage_id: 2
+    devices: "0"
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    gpu_memory_utilization: 0.10
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    enforce_eager: true
+    hf_overrides:
+      quantization_config: null
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 32768
+      repetition_penalty: 1.1

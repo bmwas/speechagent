@@ -56,7 +56,14 @@ print(
     f"model-server torch cuda:0 {name} "
     f"free={free/1024**3:.2f}GiB total={total/1024**3:.2f}GiB"
 )
-need = 12 * 1024**3 if "minicpm" in os.environ.get("MODEL_NAME", "").lower() else 6 * 1024**3
+_model_lc = os.environ.get("MODEL_NAME", "").lower()
+if "minicpm" in _model_lc:
+    need = 12 * 1024**3
+elif "qwen3-omni" in _model_lc or "qwen3_omni" in _model_lc:
+    # 4-bit thinker (~18 GiB) + BF16 talker/code2wav + KV share this card.
+    need = 20 * 1024**3
+else:
+    need = 6 * 1024**3
 if free < need:
     print(
         f"model-server FATAL: only {free/1024**3:.2f} GiB free on {name}. "
@@ -268,6 +275,13 @@ case "${MODEL}" in
     DEPLOY="$(find_yaml minicpmo_4_5.yaml || true)"
     install_minicpm_vocoder
     tune_minicpm_omni
+    ;;
+  *Qwen3-Omni*|*qwen3-omni*|*Qwen3_Omni*|*qwen3_omni*)
+    # Qwen3-Omni MoE. Realtime /v1/video/chat/stream is the Qwen3-Omni path
+    # (Qwen2.5-Omni has no streaming audio). No talker pad-remap patch — that
+    # TypeError is Qwen2.5-only. Thinker-only 4-bit checkpoint; stages 1/2
+    # keep checkpoint precision (see deploy/qwen3_omni.yaml hf_overrides).
+    DEPLOY="$(find_yaml qwen3_omni.yaml || true)"
     ;;
   *Qwen2.5-Omni*|*qwen2.5-omni*|*Qwen2_5*)
     DEPLOY="$(find_yaml qwen2_5_omni.yaml || true)"
