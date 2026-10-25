@@ -4,6 +4,44 @@ Talk to **MiniCPM-o 4.5** or **Qwen2.5-Omni-3B** in the browser. The agent hears
 
 Everything starts and stops with Docker Compose. Grafana shows every agent action. `docker compose down` **deletes all logs**.
 
+## Best so far (locked 2026-10-24)
+
+This is the first native MiniCPM-o duplex setup that actually held a conversation on Ada. Restore point: git tag **`best-so-far`**. Do not “tune” the listen head or the worker pin without a new tag.
+
+**Stack (Ada)**
+
+- `MODEL_BACKEND=native` + `COMPOSE_PROFILES=native` + `MODEL_BASE_URL=http://127.0.0.1:22400`
+- LiveKit is still the only browser/media path. Do not add the OpenBMB gateway.
+- Worker: OpenBMB MiniCPM-o-Demo `47709a9210dfd71afa76c058e017fc8c4db5c8d2`, **`minicpmo-utils[all]==1.0.6`** (1.0.7 crashes: missing `config.yaml` / `hift_original.pt`)
+- Weights: HF snapshot `openbmb/MiniCPM-o-4_5` mounted whole (blobs + snapshot symlinks) at `/weights`
+- VAD: `VAD_BACKEND=silero` (LiveKit bundled Silero, standalone — not AgentSession)
+
+**Native duplex knobs (leave these)**
+
+| Knob | Value | Why |
+|---|---|---|
+| `NATIVE_CHUNK_MS` | `1000` | OpenBMB 1 s float32 unit. Not optional. |
+| `NATIVE_SESSION_S` | `300` | Reconnect cap so KV cannot grow forever. |
+| `NATIVE_TTS_REF_MAX_S` | `10` | Token2Wav clone clip. 15 s hard-fails (OpenBMB #11). |
+| `NATIVE_LISTEN_PROB_SCALE` | `1.0` | OpenBMB default. **`<1` makes the model ramble and never return the floor.** |
+| `NATIVE_SPEAK_YIELD_N` | `10` | After ~10 s of continuous speak, `force_listen` closes the turn. The worker will not emit `<\|listen\|>` until `current_turn_ended`. |
+| `NATIVE_SPEAK_BARGE_N` | `2` | Two 1 s user-RMS chunks while speaking → `force_listen` (Silero often stays echo-held). |
+| `NATIVE_LISTEN_LOCK_N` | `5` | Five listen units while the user is still talking → reconnect (`listen_lock`). |
+| `force_listen_count` | `3` | Startup protection only (first 3 units). Not a barge-in control. |
+| `VIDEO_FPS` / `VIDEO_MAX_SIDE` | `1` / `448` | Higher FPS makes MiniCPM babble (OpenBMB #49). |
+| `VAD_START_SECS` / `VAD_STOP_SECS` | `0.15` / `0.80` | Silero edges. Native has **no commit** on stop. |
+| `PLAYOUT_HOLD_S` | `0.40` | Tail after generation stops. Gaps while generating are silence, not rebuffer. |
+| `AUDIO_SOURCE_QUEUE_MS` | `80` | Shallow LiveKit speaker queue so barge-in is tens of ms. |
+
+**What broke on the way here (do not re-introduce)**
+
+- `listen_prob_scale=0.6` → endless monologue, user speech ignored (`turn.barge_in=0`).
+- Draining `_out` on every `<\|listen\|>` → chopped the first reply’s tail.
+- `minicpmo-utils` 1.0.7 → Token2Wav `FileNotFoundError`.
+- Compose build context inside an empty `third_party/MiniCPM-o-Demo` submodule → `lstat .../docker` bake failure. Image clones the pin from `native-worker/`.
+
+Bring it up on Ada: `docker compose --profile native up -d --build`. Recreate **agent** only when the client changes; recreate **minicpm-worker** only when the pin or `minicpmo-utils` version changes.
+
 ## Architecture
 
 ```
@@ -285,6 +323,7 @@ Promtail parses the prefix, labels `agent` + `event` + `lane`, and stores `sessi
 | `native.ws_open` / `native.session_created` / `native.ws_close` | OpenBMB worker duplex |
 | `native.append` / `native.video_attach` / `native.first_audio` | 1 s float32 units in, PCM out |
 | `native.listen` / `native.speak` / `native.interrupt` / `native.reconnect` | Listen/speak, barge-in, 300 s cap |
+| `native.speak_yield` | Client `force_listen` after ramble (`speak_yield`) or loud mic while speaking (`speak_barge`) |
 | `qwen.ws_open` / `qwen.ready` / `qwen.ws_close` | Qwen `/v1/video/chat/stream` session |
 | `qwen.video_frame` | Live `video.frame` sent into the server buffer |
 | `qwen.frames_consumed` | Server sampled this query's frames |
