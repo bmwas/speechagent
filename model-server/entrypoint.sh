@@ -254,6 +254,41 @@ find_yaml() {
   return 1
 }
 
+# v0.30.0 talker crashes on the first /v1/video/chat/stream query:
+# sampling_metadata is set but prompt_token_ids is None, then
+#   prompt_token_ids[prompt_token_ids == 152064] = 8448
+# raises TypeError and the orchestrator evicts stage-1 forever
+# ("Stage-1 has no live replica"). Guard the None case in-place.
+patch_qwen25_talker_pad_remap() {
+  python - <<'PY'
+from pathlib import Path
+p = Path("/usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni.py")
+if not p.is_file():
+    print("model-server qwen talker patch skipped: file missing")
+    raise SystemExit(0)
+src = p.read_text(encoding="utf-8")
+old = (
+    "        if sampling_metadata is not None:\n"
+    "            # the padding token id is set to text model's pad token id,\n"
+    "            # which do not match with the talker model's word embedding size\n"
+    "            sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448\n"
+)
+new = (
+    "        if sampling_metadata is not None and getattr(sampling_metadata, \"prompt_token_ids\", None) is not None:\n"
+    "            # the padding token id is set to text model's pad token id,\n"
+    "            # which do not match with the talker model's word embedding size\n"
+    "            sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448\n"
+)
+if new in src:
+    print("model-server qwen talker pad-remap already patched")
+elif old in src:
+    p.write_text(src.replace(old, new, 1), encoding="utf-8")
+    print("model-server patched qwen talker pad-remap (skip None prompt_token_ids)")
+else:
+    print("model-server qwen talker pad-remap not found; leaving package as-is")
+PY
+}
+
 DEPLOY=""
 case "${MODEL}" in
   *MiniCPM*|*minicpm*)
@@ -263,6 +298,7 @@ case "${MODEL}" in
     ;;
   *Qwen2.5-Omni*|*qwen2.5-omni*|*Qwen2_5*)
     DEPLOY="$(find_yaml qwen2_5_omni.yaml || true)"
+    patch_qwen25_talker_pad_remap
     ;;
 esac
 
