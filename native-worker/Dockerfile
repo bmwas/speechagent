@@ -40,8 +40,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --index-url https://download.pytorch.org/whl/cu128 \
         torch==2.8.0 torchaudio==2.8.0
 
+# 1.0.7 Token2wav requires config.yaml + hift_original.pt (CosyVoice3 causal
+# vocoder). The MiniCPM-o-4_5 HF snapshot only ships flow.yaml + hift.pt.
+# 1.0.6 matches that layout and still has stream() / set_stream_cache().
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "minicpmo-utils[all]>=1.0.5" \
+    pip install "minicpmo-utils[all]==1.0.6" \
     && grep -vE '^[[:space:]]*minicpmo-utils(\[all\])?>=' requirements.txt > /tmp/requirements-worker.txt \
     && pip install -r /tmp/requirements-worker.txt \
     && rm /tmp/requirements-worker.txt

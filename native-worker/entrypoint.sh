@@ -26,6 +26,15 @@ if [ -z "${MODEL_PATH:-}" ] || [ ! -d "${MODEL_PATH}" ]; then
   exit 1
 fi
 
+T2W="${MODEL_PATH}/assets/token2wav"
+for f in flow.yaml flow.pt hift.pt campplus.onnx speech_tokenizer_v2_25hz.onnx; do
+  if [ ! -f "${T2W}/${f}" ]; then
+    echo "[native-worker] missing Token2Wav file: ${T2W}/${f}" >&2
+    echo "[native-worker] HF snapshot must include assets/token2wav (downloaded with MiniCPM-o-4_5)." >&2
+    exit 1
+  fi
+done
+
 echo "[native-worker] MODEL_PATH=${MODEL_PATH}"
 cd /app
 exec /bin/bash docker/entrypoint-worker-backend.sh
