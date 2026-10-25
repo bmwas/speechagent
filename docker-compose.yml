@@ -189,8 +189,12 @@ services:
   minicpm-worker:
     profiles: ["native"]
     build:
-      context: ./third_party/MiniCPM-o-Demo
-      dockerfile: docker/Dockerfile.worker-backend
+      # Context is always in this repo. The Dockerfile clones OpenBMB at the
+      # SHA in native-worker/source.pin, so a missing submodule does not fail
+      # bake with `lstat .../MiniCPM-o-Demo/docker`. Host tree is optional;
+      # scripts/ensure-minicpm-demo.sh fills it when you want the sources.
+      context: ./native-worker
+      dockerfile: Dockerfile
     image: speechagent-minicpm-worker:local
     env_file: .env
     environment:

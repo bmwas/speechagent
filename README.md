@@ -66,7 +66,7 @@ VRAM: MiniCPM-o 4.5 ~12–20 GB on vLLM, ~21.5 GB on the native PyTorch worker; 
 Copy from a laptop:
 
 ```bash
-git submodule update --init --recursive   # third_party/MiniCPM-o-Demo
+./scripts/ensure-minicpm-demo.sh   # MiniCPM-o-Demo submodule, or clone the pinned SHA
 rsync -az --delete --exclude node_modules --exclude dist --exclude logs \
   ./speechagent/ gpu-box:/opt/speechagent/
 ```
@@ -320,7 +320,9 @@ speechagent/
   model-server/entrypoint.sh  MODEL_NAME → vllm serve --omni
   model-server/deploy/        MiniCPM-o Ada KV/VRAM split YAML
   native-worker/entrypoint.sh Resolves HF snapshot path for the PyTorch worker
-  third_party/MiniCPM-o-Demo  OpenBMB submodule (worker + backend only)
+  native-worker/Dockerfile    Clones OpenBMB at source.pin SHA (no host submodule required)
+  third_party/MiniCPM-o-Demo  OpenBMB submodule (optional on the host)
+  scripts/ensure-minicpm-demo.sh  Fill the submodule, or clone the pinned SHA
   scripts/native_probe.py     Worker protocol smoke test (no LiveKit)
   obs/                        Loki, Promtail, Grafana, janitor
 ```
@@ -389,6 +391,7 @@ See [`.env`](.env). Important knobs:
 | `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
 | Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving. vLLM: Grafana vocoder errors or `0.0 GiB` KV on `:8199`. Native: `minicpm-worker` `/health` must show `model_loaded`; then `native.ws_open` → `native.session_created` → `native.append` → `native.first_audio`. Recreate the profile’s GPU service, then speak. Qwen: `qwen.video_frame` → `qwen.request` → `qwen.first_audio` → `playout.first_frame`. |
 | Native worker never becomes healthy | HF snapshot not mounted. Need `./models/hf/hub/models--openbmb--MiniCPM-o-4_5/snapshots/<hash>/` (symlinks into `blobs/`). First-boot vLLM download creates this. Check `docker compose logs minicpm-worker`. |
+| `lstat .../MiniCPM-o-Demo/docker: no such file or directory` | Old compose still built from the submodule path. Recreate with this tree (`native-worker/Dockerfile` clones OpenBMB itself). Optional host checkout: `./scripts/ensure-minicpm-demo.sh`. Do not `--no-cache` unless you want to re-download the 6 GB torch wheel. |
 | `MiniCPM-o duplex audio output requires ref_audio` / `error.brain` `never sent session.created` | v0.30.0 will not open a duplex session without a clone WAV. Recreate **agent** after this fix so it sends `assets/HT_ref_audio.wav` from `/models/hf`. Override with `REF_AUDIO_PATH`. Model-server does not need a reload. |
 | First turns good, then buffering / quiet, then Chinese | Stage-0 `context_length_exceeded` (prompt ~4167 vs old cap 4096). Server logs `dropping error for unknown req`; agent sees `stream.stall` and `ring_ms=0` while `speaking=true`. Recreate **model-server** (8192 cap) **and agent** (sliding window + English clone prompt + reconnect). Grafana: `duplex.session_update` should show `sliding_window=basic`; a hung speak should emit `duplex.stall_cancel` then `duplex.reconnect` within ~4 s. |
 | `audio_past_key_values length 1500 exceeds 1500, reset` | Expected MiniCPM audio-encoder window (`max_source_positions=1500`), about every 30 s. Not a crash. Harmless unless it coincides with thinker overflow. |
