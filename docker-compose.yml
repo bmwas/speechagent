@@ -141,6 +141,7 @@ services:
 
   model-server:
     image: vllm/vllm-omni:v0.30.0
+    profiles: ["vllm"]
     env_file: .env
     environment:
       HF_HOME: /models/hf
@@ -183,6 +184,56 @@ services:
               device_ids: ["${ADA_GPU_INDEX:-1}"]
               capabilities: [gpu]
 
+  # OpenBMB MiniCPM-o-Demo PyTorch worker. Direct /v1/worker/duplex — no gateway.
+  # COMPOSE_PROFILES=native. Do not combine with vllm: both grab Ada and OOM.
+  minicpm-worker:
+    profiles: ["native"]
+    build:
+      context: ./third_party/MiniCPM-o-Demo
+      dockerfile: docker/Dockerfile.worker-backend
+    image: speechagent-minicpm-worker:local
+    env_file: .env
+    environment:
+      GPU_ID: "0"
+      BACKEND_PORT: "22500"
+      WORKER_PORT: "22400"
+      WEIGHTS_ROOT: /weights
+      MODEL_PATH: /weights
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HUGGINGFACE_TOKEN: ${HUGGINGFACE_TOKEN:-}
+      HF_TOKEN: ${HUGGINGFACE_TOKEN:-}
+    volumes:
+      - ./models/hf/hub/models--openbmb--MiniCPM-o-4_5:/weights:ro
+      - ./native-worker/entrypoint.sh:/entrypoint.sh:ro
+    ports: ["22400:22400"]
+    shm_size: "8gb"
+    ipc: host
+    runtime: nvidia
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:22400/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+    logging: *default-logging
+    restart: unless-stopped
+    depends_on:
+      gpu-free:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ADA_GPU_INDEX:-1}"]
+              capabilities: [gpu]
+
   agent:
     build:
       context: ./agent
@@ -196,7 +247,12 @@ services:
       LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:-}
       MSE_LAN_IP: ${MSE_LAN_IP:-}
       MODEL_NAME: ${MODEL_NAME:-openbmb/MiniCPM-o-4_5}
+      MODEL_BACKEND: ${MODEL_BACKEND:-vllm}
       MODEL_BASE_URL: ${MODEL_BASE_URL:-http://127.0.0.1:8199}
+      VAD_BACKEND: ${VAD_BACKEND:-silero}
+      NATIVE_CHUNK_MS: ${NATIVE_CHUNK_MS:-1000}
+      NATIVE_SESSION_S: ${NATIVE_SESSION_S:-300}
+      NATIVE_TTS_REF_MAX_S: ${NATIVE_TTS_REF_MAX_S:-10}
       AGENT_SYSTEM_PROMPT: ${AGENT_SYSTEM_PROMPT:-}
       REF_AUDIO_PATH: ${REF_AUDIO_PATH:-}
       QWEN_SPEAKER: ${QWEN_SPEAKER:-Chelsie}
@@ -221,7 +277,15 @@ services:
       PORT: "${AGENT_PORT:-8860}"
     volumes:
       - ./models:/models:ro
-    depends_on: [livekit, model-server]
+    depends_on:
+      livekit:
+        condition: service_started
+      model-server:
+        condition: service_started
+        required: false
+      minicpm-worker:
+        condition: service_healthy
+        required: false
     healthcheck:
       test:
         [

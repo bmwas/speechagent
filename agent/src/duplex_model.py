@@ -234,6 +234,7 @@ class MiniCPMDuplexEngine:
         self._listen_flush_task: asyncio.Task | None = None
         self._drop_output = False
         self._drop_response_id = ""
+        self._barge_until_commit = False
         self._audio_drop_rl = RateLimiter(1.0)
         self._delta_n = 0
         self._delta_bytes = 0
@@ -542,6 +543,7 @@ class MiniCPMDuplexEngine:
         self._utt_speech_ms = 0
         self._drop_output = False
         self._drop_response_id = ""
+        self._barge_until_commit = False
         self._turn_deltas = 0
         self._turn_bytes = 0
         self._response_id = ""
@@ -727,7 +729,11 @@ class MiniCPMDuplexEngine:
             return
         if typ in ("response.created", "response.speak"):
             new_id = str(ev.get("response_id") or (ev.get("response") or {}).get("id") or "")
-            if self._drop_output and new_id and new_id != self._drop_response_id:
+            if self._barge_until_commit:
+                if new_id:
+                    self._drop_response_id = new_id
+                self._drop_output = True
+            elif self._drop_output and new_id and new_id != self._drop_response_id:
                 self._drop_output = False
                 self._drop_response_id = ""
             self._response_id = new_id
@@ -905,7 +911,9 @@ class MiniCPMDuplexEngine:
         if pcm[:4] == b"RIFF":
             pcm = pcm[44:]
         rid = str(ev.get("response_id") or self._response_id or "")
-        if self._drop_output and (not self._drop_response_id or not rid or rid == self._drop_response_id):
+        if self._barge_until_commit or (
+            self._drop_output and (not self._drop_response_id or not rid or rid == self._drop_response_id)
+        ):
             if hires_enabled() or self._audio_drop_rl.due():
                 trace_stream(
                     "speech",
@@ -915,7 +923,12 @@ class MiniCPMDuplexEngine:
                     drop_response_id=self._drop_response_id[:16],
                 )
             return
-        if self._drop_output and rid and rid != self._drop_response_id:
+        if (
+            not self._barge_until_commit
+            and self._drop_output
+            and rid
+            and rid != self._drop_response_id
+        ):
             self._drop_output = False
             self._drop_response_id = ""
         now = time.monotonic()
@@ -1052,6 +1065,7 @@ class MiniCPMDuplexEngine:
             )
             return
         self._commit_pending = False
+        self._barge_until_commit = False
         await self._send({"type": "input_audio_buffer.commit"})
         now = time.monotonic()
         self._turn.arm(now)
@@ -1196,6 +1210,7 @@ class MiniCPMDuplexEngine:
         self._speaking = False
         self._drop_output = True
         self._drop_response_id = self._response_id
+        self._barge_until_commit = True
         self._note_decision("cancel")
         while not self._out.empty():
             try:

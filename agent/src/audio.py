@@ -6,10 +6,9 @@ Jitter buffer design matches the Runtype Persona AudioWorklet
 200-400 ms gaps between them; HiFT eager-fallback on vLLM-Omni 0.30.0
 can pause 5-30 s between deltas (#5069 / #5657 warmup still pending).
 
-The prebuffer absorbs normal inter-chunk jitter. PLAYOUT_HOLD_S must outlast
-the first MiniCPM codec chunk (120-360 ms) plus one vocoder gap; otherwise
-the ring drains and playout goes idle mid-sentence. Longer model stalls
-still become true idle so VAD does not treat dead air as barge-in.
+While the model is generating, empty-ring gaps are silence (no rebuffer).
+PLAYOUT_HOLD_S only covers the tail after generation stops. Longer dead
+air then goes idle so VAD can treat it as the user's turn.
 """
 
 from __future__ import annotations
@@ -45,7 +44,7 @@ PLAYOUT_REBUFFER_MS = float(os.environ.get("PLAYOUT_REBUFFER_MS", "150"))
 PLAYOUT_MAX_WAIT_MS = float(os.environ.get("PLAYOUT_MAX_WAIT_MS", "300"))
 # Briefly keep the LiveKit clock warm after real audio drains. Longer model
 # stalls are not bridgeable with silence and must not count as bot playback.
-HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "1.2"))
+HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "0.40"))
 BOT_AUDIBLE_GRACE_MS = float(os.environ.get("BOT_AUDIBLE_GRACE_MS", "120"))
 
 CAPTURE_TIMEOUT_S = float(os.environ.get("PLAYOUT_CAPTURE_TIMEOUT_S", "0.08"))
@@ -151,9 +150,9 @@ class ClockedPlayout:
     hold) or None (idle — no audio pending).
 
     The prebuffer gate holds real audio and feeds silence until the ring
-    reaches the waterline, then releases.  On underrun it re-enters buffering
-    at the rebuffer waterline.  This matches the Runtype Persona AudioWorklet
-    pattern (waterline → play → underrun → re-buffer → play).
+    reaches the waterline, then releases.  Gaps while the model is still
+    generating are silence, not a rebuffer.  Rebuffer-on-underrun only
+    applies after generation has stopped.
     """
 
     def __init__(self) -> None:
@@ -438,6 +437,22 @@ class ClockedPlayout:
             )
             return frame[:need]
 
+        # MiniCPM body chunks are ~960 ms with ~0.5-1 s vocoder gaps while
+        # generating. Rebuffer-on-underrun was a hitch on every chunk
+        # (Loki 00:04: 17 underruns / 5 replies). Keep the clock warm and
+        # play the next delta immediately.
+        if self._active and self.source_active:
+            self.silence_frames += 1
+            self._turn_silence += 1
+            self._trace_frame(
+                "gap_silence",
+                self._silence,
+                ring_before_ms=ring_before_ms,
+                real_bytes=0,
+                now=now,
+            )
+            return self._silence
+
         if self._active and self._last_push and (now - self._last_push) <= HOLD_SILENCE_S:
             self.silence_frames += 1
             self._turn_silence += 1
@@ -447,8 +462,6 @@ class ClockedPlayout:
                 self.underruns_total += 1
                 self._underrun_t0 = now
                 self._underrun_frames = 0
-                # Enter re-buffer mode so the next batch of audio accumulates
-                # before we start draining again.
                 if not self._buffering:
                     self._buffering = True
                     self._buf_target_ms = PLAYOUT_REBUFFER_MS

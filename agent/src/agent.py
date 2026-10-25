@@ -8,9 +8,10 @@ import os
 import time
 
 from audio import ClockedPlayout, LinearResampler, MODEL_RATE
-from barge_in import EnergyVad
+from barge_in import make_vad
 from duplex_model import MiniCPMDuplexEngine
 from livekit_room import LiveKitBotRoom, cancel_task_robust
+from native_minicpm import NativeMiniCPMEngine
 from qwen_omni import QwenOmniEngine
 from tokens import BOT_IDENTITY, token_for_bot
 from trace import RateLimiter, StreamMeter, hires_enabled, set_session_id, set_trace_id, trace, trace_dbg, trace_exc, trace_stream
@@ -71,21 +72,33 @@ class SpeechSession:
         spec = resolve_voice(voice_id)
         self.voice_id = spec.id
         prompt = system_prompt()
-        self.engine: MiniCPMDuplexEngine | QwenOmniEngine
-        if self.minicpm:
+        backend = (os.environ.get("MODEL_BACKEND") or "vllm").strip().lower()
+        self.native = backend == "native"
+        if self.native and not self.minicpm:
+            raise RuntimeError(
+                "MODEL_BACKEND=native requires MODEL_NAME containing 'minicpm'. "
+                "Qwen is vLLM-only. Set MODEL_BACKEND=vllm or "
+                "MODEL_NAME=openbmb/MiniCPM-o-4_5."
+            )
+        self.engine: MiniCPMDuplexEngine | QwenOmniEngine | NativeMiniCPMEngine
+        if self.native:
+            ref = None if spec.id == DEFAULT_VOICE_ID else asset_path(spec)
+            self.engine = NativeMiniCPMEngine(prompt, voice_id=spec.id, ref_path=ref)
+        elif self.minicpm:
             ref = None if spec.id == DEFAULT_VOICE_ID else asset_path(spec)
             self.engine = MiniCPMDuplexEngine(prompt, voice_id=spec.id, ref_path=ref)
         else:
             self.engine = QwenOmniEngine(prompt)
-        # MiniCPM commits the user turn on VAD stop. 0.80 s chops mid-thought
-        # pauses into extra commits; the model then `listen`s and the user
-        # has to repeat. Qwen still uses VAD_STOP_SECS (turn generate).
+        # MiniCPM (vLLM) commits the user turn on VAD stop. 0.80 s chops
+        # mid-thought pauses into extra commits; the model then `listen`s
+        # and the user has to repeat. Qwen still uses VAD_STOP_SECS.
+        # Native duplex does not commit on stop (OpenBMB #17).
         vad_stop = (
             _env_float("MINICPM_VAD_STOP_SECS", 1.2)
             if self.minicpm
             else _env_float("VAD_STOP_SECS", 0.80)
         )
-        self.vad = EnergyVad(stop_secs=vad_stop)
+        self.vad = make_vad(stop_secs=vad_stop)
         self.playout = ClockedPlayout()
         if self.minicpm:
             self.frames = FrameSampler()
@@ -128,8 +141,9 @@ class SpeechSession:
             "session.open",
             room=self.room_id,
             model=self.model_name,
-            path="minicpm" if self.minicpm else "qwen",
+            path="native" if self.native else ("minicpm" if self.minicpm else "qwen"),
             voice_id=self.voice_id,
+            vad_backend=getattr(self.vad, "backend", "energy"),
             vad_stop_secs=self.vad.stop_secs,
         )
         token = token_for_bot(self.room_id)
@@ -141,6 +155,9 @@ class SpeechSession:
             on_disconnect=self.stop,
         )
         await self.bot.connect()
+        start_vad = getattr(self.vad, "start", None)
+        if callable(start_vad):
+            await start_vad()
         self._play_task = asyncio.create_task(self._playback_loop())
         self._clock_task = asyncio.create_task(self._clock_loop())
         self._health_task = asyncio.create_task(self._health_loop())
@@ -155,7 +172,7 @@ class SpeechSession:
                 "speech",
                 "session.brain_ready",
                 model=self.model_name,
-                path="minicpm" if self.minicpm else "qwen",
+                path="native" if self.native else ("minicpm" if self.minicpm else "qwen"),
                 voice_id=self.voice_id,
             )
         except Exception as exc:
@@ -241,20 +258,21 @@ class SpeechSession:
                 trace_stream(
                     "speech",
                     "turn.barge_in",
-                    source="energy",
+                    source=getattr(self.vad, "backend", "energy"),
                     identity=identity,
                     bot_playing=self.vad.bot_playing,
                     generating=generating,
                     ring_ms=round(self.playout.ring_ms, 1),
                     during_stall=int(generating and not self.vad.bot_playing),
                 )
+        generating = bool(getattr(self.engine, "generating", False))
         if edge == "stop":
             trace_stream(
                 "speech",
                 "stream.user_utt_end",
                 rms=self.vad.last_rms,
                 identity=identity,
-                generating=bool(getattr(self.engine, "generating", False)),
+                generating=generating,
                 ring_ms=round(self.playout.ring_ms, 1),
             )
         is_speech = bool(self.vad.speaking or edge in ("start", "stop"))
@@ -269,14 +287,18 @@ class SpeechSession:
             identity=identity,
         )
         await self.engine.push_audio(pcm16, MODEL_RATE, is_speech=is_speech)
-        if edge == "stop" and not self.minicpm:
-            gen = getattr(self.engine, "generate", None)
-            if callable(gen):
-                await gen()
-        if edge == "stop" and self.minicpm:
-            end = getattr(self.engine, "end_of_speech", None)
-            if callable(end):
-                await end()
+        # Silero can fire END_OF_SPEECH more often than energy VAD. Do not
+        # re-commit / re-query while the model is still producing a reply.
+        # Native duplex never commits on stop (OpenBMB #17).
+        if edge == "stop" and not generating:
+            if not self.minicpm:
+                gen = getattr(self.engine, "generate", None)
+                if callable(gen):
+                    await gen()
+            elif not self.native:
+                end = getattr(self.engine, "end_of_speech", None)
+                if callable(end):
+                    await end()
         if edge:
             trace_dbg("speech", "audio.chunk", rms=self.vad.last_rms, edge=edge, bytes=len(pcm16), is_speech=is_speech)
 
@@ -386,7 +408,8 @@ class SpeechSession:
                 fields = dict(snap)
                 fields.update(
                     {
-                        "path": "minicpm" if self.minicpm else "qwen",
+                        "path": "native" if self.native else ("minicpm" if self.minicpm else "qwen"),
+                        "vad_backend": getattr(self.vad, "backend", "energy"),
                         "humans": len(self._humans),
                         "brain_started": self._brain_started,
                         "ready": ready,
@@ -457,6 +480,12 @@ class SpeechSession:
             await self.engine.close()
         except Exception:
             LOG.exception("engine close")
+        close_vad = getattr(self.vad, "close", None)
+        if callable(close_vad):
+            try:
+                await close_vad()
+            except Exception:
+                LOG.exception("vad close")
         if self.bot is not None:
             try:
                 await self.bot.close()

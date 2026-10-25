@@ -1,0 +1,3 @@
+[submodule "third_party/MiniCPM-o-Demo"]
+	path = third_party/MiniCPM-o-Demo
+	url = https://github.com/OpenBMB/MiniCPM-o-Demo.git

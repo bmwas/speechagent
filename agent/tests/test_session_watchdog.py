@@ -15,7 +15,13 @@ if str(ROOT) not in sys.path:
 
 from session_watchdog import TurnWatchdog  # noqa: E402
 from duplex_model import MiniCPMDuplexEngine  # noqa: E402
-from barge_in import EnergyVad, VAD_START_SECS, VAD_STOP_SECS  # noqa: E402
+from barge_in import EnergyVad, LiveKitSileroVad, VAD_START_SECS, VAD_STOP_SECS  # noqa: E402
+from native_minicpm import (  # noqa: E402
+    NativeMiniCPMEngine,
+    _f32le_to_pcm16,
+    _pcm16_to_f32le,
+    _worker_ws_url,
+)
 
 
 class TurnWatchdogTests(unittest.TestCase):
@@ -246,6 +252,7 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(s.get("type") == "response.cancel" for s in sent))
         self.assertFalse(eng._speaking)
         self.assertTrue(eng._drop_output)
+        self.assertTrue(eng._barge_until_commit)
         self.assertEqual(eng._out.qsize(), 0)
         pcm = b"\x00\x01" * 80
         b64 = base64.b64encode(pcm).decode("ascii")
@@ -253,6 +260,16 @@ class DuplexWatchdogTests(unittest.IsolatedAsyncioTestCase):
             {"type": "response.audio.delta", "delta": b64, "response_id": "resp-old"}
         )
         self.assertEqual(eng._out.qsize(), 0)
+        # auto_response must not play a new reply over the interrupt.
+        await eng._handle({"type": "response.speak", "response_id": "resp-sneak"})
+        self.assertTrue(eng._drop_output)
+        await eng._on_audio_delta(
+            {"type": "response.audio.delta", "delta": b64, "response_id": "resp-sneak"}
+        )
+        self.assertEqual(eng._out.qsize(), 0)
+        eng._commit_pending = True
+        await eng._commit_input()
+        self.assertFalse(eng._barge_until_commit)
         await eng._handle({"type": "response.speak", "response_id": "resp-new"})
         self.assertFalse(eng._drop_output)
         await eng._on_audio_delta(
@@ -353,6 +370,139 @@ class EnergyVadTests(unittest.TestCase):
         self.assertIn("occupying", src)
         self.assertIn("during_stall", src)
         self.assertNotIn("turn.speech_during_model_stall", src)
+        self.assertIn("not self.native", src)
+        self.assertIn("not generating", src)
+
+
+class SileroVadEventTests(unittest.TestCase):
+    def test_start_without_bot_playing(self) -> None:
+        vad = LiveKitSileroVad(start_secs=0.15, stop_secs=1.2)
+        self.assertEqual(vad.apply_event("start_of_speech"), "start")
+        self.assertTrue(vad.speaking)
+        self.assertEqual(vad.apply_event("end_of_speech"), "stop")
+        self.assertFalse(vad.speaking)
+
+    def test_echo_hold_then_release(self) -> None:
+        vad = LiveKitSileroVad()
+        vad.bot_playing = True
+        clock = 10.0
+        self.assertIsNone(vad.apply_event("start_of_speech", now=clock))
+        self.assertFalse(vad.speaking)
+        self.assertTrue(vad._pending_start)
+        self.assertIsNone(vad.apply_event("inference_done", now=clock + 0.2))
+        self.assertEqual(vad.apply_event("inference_done", now=clock + 0.51), "start")
+        self.assertTrue(vad.speaking)
+
+    def test_echo_blip_cancelled_by_end(self) -> None:
+        vad = LiveKitSileroVad()
+        vad.bot_playing = True
+        self.assertIsNone(vad.apply_event("start_of_speech", now=1.0))
+        self.assertIsNone(vad.apply_event("end_of_speech", now=1.1))
+        self.assertFalse(vad.speaking)
+        self.assertFalse(vad._pending_start)
+
+
+class NativeEngineTests(unittest.IsolatedAsyncioTestCase):
+    def test_pcm_float_roundtrip(self) -> None:
+        import array
+
+        pcm = array.array("h", [0, 16384, -16384, 32767, -32768]).tobytes()
+        raw = _pcm16_to_f32le(pcm)
+        back = _f32le_to_pcm16(raw)
+        src = array.array("h")
+        src.frombytes(pcm)
+        dst = array.array("h")
+        dst.frombytes(back)
+        self.assertEqual(len(src), len(dst))
+        for a, b in zip(src, dst):
+            self.assertLessEqual(abs(a - b), 1)
+
+    def test_worker_url_remaps_vllm_port(self) -> None:
+        old_base = os.environ.get("MODEL_BASE_URL")
+        old_native = os.environ.get("NATIVE_WORKER_URL")
+        os.environ["MODEL_BASE_URL"] = "http://127.0.0.1:8199"
+        os.environ.pop("NATIVE_WORKER_URL", None)
+        try:
+            self.assertEqual(_worker_ws_url(), "ws://127.0.0.1:22400/v1/worker/duplex")
+            os.environ["MODEL_BASE_URL"] = "http://127.0.0.1:22400"
+            self.assertEqual(_worker_ws_url(), "ws://127.0.0.1:22400/v1/worker/duplex")
+            os.environ["NATIVE_WORKER_URL"] = "http://10.0.0.9:22400"
+            self.assertEqual(_worker_ws_url(), "ws://10.0.0.9:22400/v1/worker/duplex")
+        finally:
+            if old_base is None:
+                os.environ.pop("MODEL_BASE_URL", None)
+            else:
+                os.environ["MODEL_BASE_URL"] = old_base
+            if old_native is None:
+                os.environ.pop("NATIVE_WORKER_URL", None)
+            else:
+                os.environ["NATIVE_WORKER_URL"] = old_native
+
+    async def test_listen_drops_queued_audio(self) -> None:
+        eng = NativeMiniCPMEngine("hello")
+        eng._speaking = True
+        await eng._out.put((b"\x00\x00", 24000))
+        await eng._on_event({"type": "response.output.delta", "kind": "listen"})
+        self.assertFalse(eng.generating)
+        self.assertEqual(eng._out.qsize(), 0)
+
+    async def test_interrupt_sets_force_listen_and_drops_queue(self) -> None:
+        eng = NativeMiniCPMEngine("hello")
+        eng._speaking = True
+        await eng._out.put((b"\x00\x00", 24000))
+        await eng.interrupt()
+        self.assertTrue(eng._force_listen)
+        self.assertFalse(eng.generating)
+        self.assertEqual(eng._out.qsize(), 0)
+        self.assertFalse(hasattr(eng, "end_of_speech"))
+
+    def test_qwen_native_refused(self) -> None:
+        from agent import SpeechSession
+
+        old_backend = os.environ.get("MODEL_BACKEND")
+        old_model = os.environ.get("MODEL_NAME")
+        os.environ["MODEL_BACKEND"] = "native"
+        os.environ["MODEL_NAME"] = "Qwen/Qwen2.5-Omni-3B"
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                SpeechSession("default")
+            self.assertIn("minicpm", str(ctx.exception).lower())
+        finally:
+            if old_backend is None:
+                os.environ.pop("MODEL_BACKEND", None)
+            else:
+                os.environ["MODEL_BACKEND"] = old_backend
+            if old_model is None:
+                os.environ.pop("MODEL_NAME", None)
+            else:
+                os.environ["MODEL_NAME"] = old_model
+
+
+class PlayoutGapTests(unittest.TestCase):
+    def test_generating_gap_does_not_rebuffer(self) -> None:
+        import array
+
+        from audio import WEBRTC_RATE, ClockedPlayout
+
+        p = ClockedPlayout()
+        p.source_active = True
+        p._buffering = False
+        pcm = array.array("h", [8000] * (WEBRTC_RATE // 5)).tobytes()  # 200 ms
+        t = 1000.0
+        p.push(pcm, WEBRTC_RATE)
+        p._last_push = t
+        for i in range(12):
+            frame = p.take_frame(t + i * 0.02)
+            self.assertIsNotNone(frame)
+        gap = p.take_frame(t + 0.50)
+        self.assertIsNotNone(gap)
+        self.assertFalse(p._buffering)
+        self.assertEqual(p.underruns_total, 0)
+        p.push(pcm, WEBRTC_RATE)
+        nxt = p.take_frame(t + 0.52)
+        self.assertIsNotNone(nxt)
+        self.assertFalse(p._buffering)
+        self.assertEqual(p.underruns_total, 0)
 
 
 if __name__ == "__main__":

@@ -13,9 +13,9 @@ Browser  https://<GPU-LAN>:6173/patient
                               |
                          Python agent (:8860)
                               |
-                   vLLM-Omni model-server (:8199)
+                   vLLM-Omni (:8199)  OR  MiniCPM-o-Demo worker (:22400)
                               |
-                    RTX 6000 Ada 48 GB (device 1)
+                    RTX 6000 Ada 48 GB (device 1)  — one backend at a time
 
 stdout SA_TRACE  -->  Promtail  -->  Loki (:3310)  -->  Grafana (:3300)
 ```
@@ -25,7 +25,8 @@ msestream keeps `:5173` / `:7860` / `:7880` / `:3000` / `:3100`. This stack uses
 | Service | Role |
 |---|---|
 | `livekit` | Self-hosted SFU. Host network so ICE/TURN advertise the GPU LAN IP. |
-| `model-server` | `vllm/vllm-omni:v0.30.0` (prebuilt, includes flash-attn). Pinned to Ada GPU. |
+| `model-server` | `vllm/vllm-omni:v0.30.0` (prebuilt, includes flash-attn). Pinned to Ada GPU. Profile **`vllm`**. |
+| `minicpm-worker` | OpenBMB MiniCPM-o-Demo PyTorch worker (`/v1/worker/duplex`). Profile **`native`**. Not started with vLLM. |
 | `agent` | Joins the room as a bot, streams A/V into the model, publishes speech back. |
 | `frontend` | Same capture-ui mux as msestream, on **:6173** host network, SPA at `/patient`, proxies `/api` and `/rtc` to loopback. |
 | `loki` / `promtail` / `grafana` | Log pipeline. Anonymous Grafana Admin. |
@@ -58,13 +59,14 @@ Do **not** run Compose on a laptop or any host without the Ada GPU.
 - `HUGGINGFACE_TOKEN` already in the GPU-box `~/.bashrc` — Compose passes it through (do not paste the token into `.env`)
 - From a laptop you only open the HTTPS UI
 
-VRAM: MiniCPM-o 4.5 ~12–20 GB; Qwen2.5-Omni-3B ~7 GB. The 48 GB Ada holds either, not both at once.
+VRAM: MiniCPM-o 4.5 ~12–20 GB on vLLM, ~21.5 GB on the native PyTorch worker; Qwen2.5-Omni-3B ~7 GB. The 48 GB Ada holds one of these, not two.
 
 ## Run on the GPU server
 
 Copy from a laptop:
 
 ```bash
+git submodule update --init --recursive   # third_party/MiniCPM-o-Demo
 rsync -az --delete --exclude node_modules --exclude dist --exclude logs \
   ./speechagent/ gpu-box:/opt/speechagent/
 ```
@@ -118,38 +120,62 @@ docker compose down
 
 | Command | What it does |
 |---|---|
-| `docker compose up -d --build` | Build + start the full stack (`gpu-free` clears Ada first) |
-| `docker compose run --rm gpu-free` | Stop other Ada users without starting vLLM |
+| `docker compose up -d --build` | Build + start the stack for `COMPOSE_PROFILES` (`gpu-free` clears Ada first) |
+| `docker compose run --rm gpu-free` | Stop other Ada users without starting a model |
 | `FREE_ADA_GPU=0 docker compose up -d model-server` | Load vLLM without touching msestream |
 | `docker compose ps` | Service status |
 | `docker compose logs -f agent` | Agent stdout including `SA_TRACE` |
 | `docker compose logs -f gpu-stats` | Ada VRAM/util samples + rolling avg/p95/peak/headroom verdicts |
 | `docker compose logs -f model-server` | vLLM-Omni / weight download |
+| `docker compose logs -f minicpm-worker` | Native PyTorch worker (profile `native`) |
 | `docker compose logs -f livekit` | SFU / ICE |
 | `docker compose restart agent` | Bounce the bot without unloading weights |
 | `docker compose up -d --build model-server agent` | Reload after changing `MODEL_NAME` |
 | `docker compose down` | Stop **and delete `./logs`** |
 
-## Switch models
+## Switch models / backends
 
-In `.env`:
+`COMPOSE_PROFILES` and `MODEL_BACKEND` must match. **Never set both `vllm` and `native`** — Ada cannot hold both.
+
+vLLM-Omni MiniCPM duplex (default):
 
 ```env
-# Full-duplex, most natural conversation
 MODEL_NAME=openbmb/MiniCPM-o-4_5
-
-# Turn-based live video stream, lighter VRAM, Chelsie/Ethan voices
-MODEL_NAME=Qwen/Qwen2.5-Omni-3B
-QWEN_SPEAKER=Chelsie
+MODEL_BACKEND=vllm
+COMPOSE_PROFILES=vllm
+MODEL_BASE_URL=http://127.0.0.1:8199
 ```
-
-Then:
 
 ```bash
 docker compose up -d --build model-server agent
 ```
 
-Only one omni model is loaded. Do not run both.
+vLLM-Omni Qwen (turn-based, lighter VRAM):
+
+```env
+MODEL_NAME=Qwen/Qwen2.5-Omni-3B
+MODEL_BACKEND=vllm
+COMPOSE_PROFILES=vllm
+QWEN_SPEAKER=Chelsie
+```
+
+OpenBMB native PyTorch duplex (MiniCPM only — no Qwen):
+
+```env
+MODEL_NAME=openbmb/MiniCPM-o-4_5
+MODEL_BACKEND=native
+COMPOSE_PROFILES=native
+MODEL_BASE_URL=http://127.0.0.1:22400
+```
+
+```bash
+docker compose up -d --build minicpm-worker agent
+# After worker /health shows model_loaded, smoke the protocol (no LiveKit):
+# needs `websockets` on the GPU box (`python3 -m pip install websockets`)
+python3 scripts/native_probe.py --wav /path/to/16k_mono.wav --url http://127.0.0.1:22400
+```
+
+`VAD_BACKEND=silero` (default) uses LiveKit’s bundled Silero VAD for barge-in / turn edges on every backend. `VAD_BACKEND=energy` is the old RMS hangover detector.
 
 ## Voices
 
@@ -159,9 +185,9 @@ Only one omni model is loaded. Do not run both.
 
 ## How conversation stays real-time
 
-This is a **native omni** path on vLLM-Omni, not ASR → LLM → TTS. The two models use different sockets. They cannot share one.
+This is a **native omni** path, not ASR → LLM → TTS. vLLM MiniCPM, native MiniCPM, and Qwen use different sockets. They cannot share one.
 
-**MiniCPM-o 4.5** — native duplex (`/v1/realtime?duplex=1`):
+**MiniCPM-o 4.5 via vLLM-Omni** — duplex (`/v1/realtime?duplex=1`):
 
 - Browser camera + mic publish over LiveKit. The agent streams both into MiniCPM-o **while you talk**.
 - Mic PCM is appended every **100 ms**. Camera stills (~**1 JPEG/s**, long side 448) ride on those appends as `video_frames` — the OpenBMB duplex contract is one still per ~1 s audio unit.
@@ -170,7 +196,25 @@ This is a **native omni** path on vLLM-Omni, not ASR → LLM → TTS. The two mo
 - Language is locked by the **official English clone prompt** (`AGENT_SYSTEM_PROMPT`), not by `HT_ref_audio.wav`. That WAV is bilingual; without the English prefix MiniCPM falls back to Chinese after a thinker overflow.
 - While the model is speaking, silence and camera stills are **not** appended (they were filling the thinker KV and stalling the vocoder). User speech still is, so barge-in works. Stills resume on the next listen unit.
 - If a speak stalls (≥4 s with no audio delta), the agent sends `response.cancel` and **reopens the duplex socket** (`duplex.reconnect`). vllm-omni drops `context_length_exceeded` as `dropping error for unknown req` and otherwise leaves a zombie session.
-- MiniCPM-o 4.5 **does not self-yield** when you talk over it. The agent runs energy VAD, sends `response.cancel`, and clears the LiveKit queue (client-side barge-in).
+- MiniCPM-o 4.5 **does not self-yield** when you talk over it. The agent runs Silero (or energy) VAD, sends `response.cancel`, and clears the LiveKit queue (client-side barge-in).
+
+**MiniCPM-o 4.5 via OpenBMB native worker** — `/v1/worker/duplex` (no gateway):
+
+- Same LiveKit mic/camera path. The agent buffers PCM into **1 s float32** units (`NATIVE_CHUNK_MS=1000`) and sends `input.append` continuously, including silence. There is **no commit** and **no VAD on the worker** (OpenBMB #17).
+- Camera stills stay at **1 JPEG/s**. Higher FPS makes the model babble (OpenBMB #49).
+- `session.init` sends both `payload.voice.ref_audio_base64` and legacy `ref_audio_base64`. Token2Wav ref is capped at 10 s.
+- Barge-in: Silero `START_OF_SPEECH` while occupying flushes playout **immediately** and sets `force_listen` on the next 1 s unit (model-side listen can lag up to ~1 s). Native has no `response.cancel`.
+- Self-imposed **300 s reconnect** (`NATIVE_SESSION_S`) bounds KV growth.
+- First-speech latency is the official 1 Hz unit design (~1.5–3 s TTFS). If Grafana `cost_all_ms` median is above 900 ms, enable `torch.compile` on the worker.
+
+Ada checklist (GPU box only — this laptop cannot load the 21 GB worker):
+
+1. `COMPOSE_PROFILES=native docker compose up -d --build` → `curl -sS http://127.0.0.1:22400/health` shows `model_loaded`.
+2. `python3 scripts/native_probe.py --wav <16k_mono.wav>` against `:22400` **before** LiveKit. Expect `session.created` then `first_audio_ms`. The probe sends both `payload.voice.ref_audio_base64` and top-level `ref_audio_base64`.
+3. Patient UI Connect: Grafana `native.ws_open` → `native.session_created` (no queue events) → `native.append` 1 Hz → `native.first_audio` → `playout.first_frame`.
+4. Barge-in: speak over the bot → `vad.start` → playout clears immediately; next `native.listen` may lag up to ~1 s. Speaker echo must not barge in (`vad.echo_hold`).
+5. Switch back: `MODEL_BACKEND=vllm` + `COMPOSE_PROFILES=vllm` + `MODEL_BASE_URL=http://127.0.0.1:8199`. vLLM MiniCPM still commits on `END_OF_SPEECH`; Qwen still fires `video.query`. `VAD_BACKEND=energy` still works.
+6. Measure `cost_all_ms` in `native.audio_delta`. If median >900 ms, enable `torch.compile` on the worker.
 
 **Qwen2.5-Omni-3B** — live video stream (`/v1/video/chat/stream`), not duplex, not one JPEG, not an MP4 at VAD stop:
 
@@ -221,7 +265,8 @@ Promtail parses the prefix, labels `agent` + `event` + `lane`, and stores `sessi
 | `session.brain_ready` | Omni engine started |
 | `livekit.connect` / `livekit.disconnect` | Bot or user joined/left |
 | `track.audio_sub` / `track.video_sub` / `track.audio_pub` | Media tracks |
-| `vad.start` / `vad.stop` | Energy VAD edges |
+| `vad.start` / `vad.stop` | Silero or energy VAD edges |
+| `vad.silero_start` / `vad.echo_hold` | Silero stream started / barge-in gated while bot audible |
 | `turn.barge_in` | User interrupted the agent |
 | `duplex.ws_open` / `duplex.session_created` / `duplex.ws_close` | MiniCPM WS |
 | `duplex.append` | 1 Hz audio+video heartbeat into the model |
@@ -236,6 +281,9 @@ Promtail parses the prefix, labels `agent` + `event` + `lane`, and stores `sessi
 | `stream.health` | 1 Hz pipeline snapshot (ready, ring, mic age) |
 | `stream.mic_in` / `stream.mic_first` / `stream.mic_gap` | LiveKit mic hop |
 | `stream.stall` / `stream.drop_not_ready` | Duplex not producing / WS not ready |
+| `native.ws_open` / `native.session_created` / `native.ws_close` | OpenBMB worker duplex |
+| `native.append` / `native.video_attach` / `native.first_audio` | 1 s float32 units in, PCM out |
+| `native.listen` / `native.speak` / `native.interrupt` / `native.reconnect` | Listen/speak, barge-in, 300 s cap |
 | `qwen.ws_open` / `qwen.ready` / `qwen.ws_close` | Qwen `/v1/video/chat/stream` session |
 | `qwen.video_frame` | Live `video.frame` sent into the server buffer |
 | `qwen.frames_consumed` | Server sampled this query's frames |
@@ -263,13 +311,17 @@ speechagent/
     livekit_room.py           rtc.Room subscribe / publish
     audio.py                  resample, silence trim, 20 ms clock
     video.py                  RGB → JPEG sampler
-    barge_in.py               energy VAD + echo-aware interrupt
+    barge_in.py               Silero (LiveKit) or energy VAD + echo-aware interrupt
+    native_minicpm.py         OpenBMB `/v1/worker/duplex` client
     trace.py                  SA_TRACE JSON
     logging_setup.py          LOG_LEVEL, quiet WebRTC loggers
   frontend/                   Vite + React + serve.mjs HTTPS mux (`/patient`)
   livekit/                    SFU config + entrypoint
   model-server/entrypoint.sh  MODEL_NAME → vllm serve --omni
   model-server/deploy/        MiniCPM-o Ada KV/VRAM split YAML
+  native-worker/entrypoint.sh Resolves HF snapshot path for the PyTorch worker
+  third_party/MiniCPM-o-Demo  OpenBMB submodule (worker + backend only)
+  scripts/native_probe.py     Worker protocol smoke test (no LiveKit)
   obs/                        Loki, Promtail, Grafana, janitor
 ```
 
@@ -283,7 +335,8 @@ speechagent/
 | 8860 TCP | Agent token/health (host network) |
 | 8880–8882 | LiveKit signaling / TCP media / TURN |
 | 51000–51100 UDP | LiveKit WebRTC |
-| 8199 TCP | vLLM-Omni |
+| 8199 TCP | vLLM-Omni (profile `vllm`) |
+| 22400 TCP | MiniCPM-o-Demo worker (profile `native`) |
 
 ## Configuration
 
@@ -295,6 +348,12 @@ See [`.env`](.env). Important knobs:
 | `ADA_GPU_INDEX` | `1` | Host `nvidia-smi` index of the Ada 48 GB |
 | `FREE_ADA_GPU` | `1` | Stop other Ada GPU users before vLLM loads |
 | `MODEL_NAME` | `openbmb/MiniCPM-o-4_5` | Which omni weights to load |
+| `MODEL_BACKEND` | `vllm` | `vllm` = vLLM-Omni. `native` = OpenBMB PyTorch worker (MiniCPM only). |
+| `COMPOSE_PROFILES` | `vllm` | Must match `MODEL_BACKEND`. Never `vllm,native`. |
+| `VAD_BACKEND` | `silero` | `silero` = LiveKit bundled Silero. `energy` = RMS hangover. |
+| `NATIVE_CHUNK_MS` | `1000` | Native duplex input unit size (OpenBMB 1 s float32). |
+| `NATIVE_SESSION_S` | `300` | Self-imposed native reconnect cap (KV bound). |
+| `NATIVE_TTS_REF_MAX_S` | `10` | Token2Wav clone clip cap (OpenBMB #11; 15 s hard-fails). |
 | `HUGGINGFACE_TOKEN` | bashrc | Hub auth for weight download. Read from the GPU-box shell, not `.env` |
 | `AUDIO_SOURCE_QUEUE_MS` | `80` | LiveKit speaker queue depth |
 | `PLAYOUT_HOLD_S` | `0.25` | Brief silence bridge after real audio drains; longer stalls are treated as idle |
@@ -328,7 +387,8 @@ See [`.env`](.env). Important knobs:
 | Mic: `Could not start audio source` | Chrome Linux `"default"` device. Pick a real input in chrome://settings/content/microphone. |
 | Connect hangs / ICE failed | `MSE_LAN_IP` must be the GPU box address the laptop can ping. UDP 51000–51100 + 8882 open on the LAN. |
 | `room connection has timed out (signal)` | Browser never reached `wss://<GPU-LAN>:6173/rtc`. Open **https://10.4.7.193:6173/patient** (not the laptop IP). Recreate `livekit` + `frontend` (frontend is host-network so `/rtc` hits `127.0.0.1:8880`). Check Grafana frontend logs for `livekit ws`. |
-| Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving on `:8199`. Grafana: vocoder import errors or `0.0 GiB` KV. Recreate `model-server` (`vllm/vllm-omni:v0.30.0`). Wait for `Application startup complete`, then speak. MiniCPM: `duplex.video_attach` → `duplex.first_audio` → `playout.first_frame`. Qwen: `qwen.video_frame` (while talking) → `qwen.request` → `qwen.first_audio` → `playout.first_frame`. |
+| Silent agent / `duplex.ws_retry` / `stream.drop_not_ready` | Model never serving. vLLM: Grafana vocoder errors or `0.0 GiB` KV on `:8199`. Native: `minicpm-worker` `/health` must show `model_loaded`; then `native.ws_open` → `native.session_created` → `native.append` → `native.first_audio`. Recreate the profile’s GPU service, then speak. Qwen: `qwen.video_frame` → `qwen.request` → `qwen.first_audio` → `playout.first_frame`. |
+| Native worker never becomes healthy | HF snapshot not mounted. Need `./models/hf/hub/models--openbmb--MiniCPM-o-4_5/snapshots/<hash>/` (symlinks into `blobs/`). First-boot vLLM download creates this. Check `docker compose logs minicpm-worker`. |
 | `MiniCPM-o duplex audio output requires ref_audio` / `error.brain` `never sent session.created` | v0.30.0 will not open a duplex session without a clone WAV. Recreate **agent** after this fix so it sends `assets/HT_ref_audio.wav` from `/models/hf`. Override with `REF_AUDIO_PATH`. Model-server does not need a reload. |
 | First turns good, then buffering / quiet, then Chinese | Stage-0 `context_length_exceeded` (prompt ~4167 vs old cap 4096). Server logs `dropping error for unknown req`; agent sees `stream.stall` and `ring_ms=0` while `speaking=true`. Recreate **model-server** (8192 cap) **and agent** (sliding window + English clone prompt + reconnect). Grafana: `duplex.session_update` should show `sliding_window=basic`; a hung speak should emit `duplex.stall_cancel` then `duplex.reconnect` within ~4 s. |
 | `audio_past_key_values length 1500 exceeds 1500, reset` | Expected MiniCPM audio-encoder window (`max_source_positions=1500`), about every 30 s. Not a crash. Harmless unless it coincides with thinker overflow. |
@@ -348,4 +408,7 @@ See [`.env`](.env). Important knobs:
 - [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B)
 - [vLLM-Omni Streaming Video Input API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/video_stream_api/)
 - [LiveKit Agents](https://docs.livekit.io/agents/)
+- [LiveKit Silero VAD](https://docs.livekit.io/agents/logic/turns/vad/)
+- [OpenBMB MiniCPM-o-Demo](https://github.com/OpenBMB/MiniCPM-o-Demo)
+- [MiniCPM-o Realtime API](https://minicpmo45.modelbest.cn/docs/en/realtime-api/overview/)
 - Logging / GPU pin / `/patient` UI patterns from the local `msestream` stack
