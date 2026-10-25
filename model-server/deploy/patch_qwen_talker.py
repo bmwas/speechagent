@@ -7,6 +7,13 @@ The stock line:
 
 raises TypeError on /v1/video/chat/stream (prompt_token_ids is None). The
 orchestrator then evicts stage-1 for the rest of the process.
+
+Skipping the remap (the first guard) lets the talker finish but it then
+emits only START/PAD/END codec tokens. code2wav strips those, ships an
+empty payload, and the consumer wait gate hangs — text arrives, no PCM.
+
+Fill prompt_token_ids from talker additional_information (thinker ids) or
+input_ids, convert to a tensor, then remap 152064 → 8448.
 """
 
 from __future__ import annotations
@@ -18,22 +25,53 @@ MARKER = "speechagent_qwen_talker_pad_guard"
 NEEDLE = "sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448"
 
 
+def _guard_block(indent: str, nl: str) -> str:
+    # additional_information / input_ids / torch are in scope in talker forward().
+    return (
+        f"{indent}# {MARKER}{nl}"
+        f"{indent}_ptids = getattr(sampling_metadata, 'prompt_token_ids', None){nl}"
+        f"{indent}if _ptids is None:{nl}"
+        f"{indent}    _src = None{nl}"
+        f"{indent}    if additional_information is not None:{nl}"
+        f"{indent}        _src = additional_information.get('prompt_token_ids'){nl}"
+        f"{indent}    if _src is None:{nl}"
+        f"{indent}        _src = input_ids{nl}"
+        f"{indent}    _ptids = _src{nl}"
+        f"{indent}if _ptids is not None:{nl}"
+        f"{indent}    if not isinstance(_ptids, torch.Tensor):{nl}"
+        f"{indent}        _ptids = torch.as_tensor(_ptids){nl}"
+        f"{indent}    sampling_metadata.prompt_token_ids = _ptids{nl}"
+        f"{indent}    sampling_metadata.prompt_token_ids["
+        f"sampling_metadata.prompt_token_ids == 152064] = 8448{nl}"
+    )
+
+
 def patch_source(src: str) -> tuple[str, str]:
-    if MARKER in src:
+    if MARKER in src and "additional_information.get('prompt_token_ids')" in src:
         return src, "already"
-    if NEEDLE not in src:
+    if NEEDLE not in src and MARKER not in src:
         return src, "missing"
     out: list[str] = []
+    skip_old_guard = False
     for line in src.splitlines(keepends=True):
-        if NEEDLE in line:
+        stripped = line.lstrip(" \t")
+        # Replace a previous skip-only guard (MARKER + if-not-None wrap).
+        if MARKER in line and "additional_information.get" not in line:
+            skip_old_guard = True
+            continue
+        if skip_old_guard:
+            if NEEDLE in line or stripped.startswith("if getattr(sampling_metadata"):
+                if NEEDLE in line:
+                    indent = line[: len(line) - len(line.lstrip(" \t"))]
+                    nl = "\n" if line.endswith("\n") else ""
+                    out.append(_guard_block(indent, nl))
+                    skip_old_guard = False
+                continue
+            skip_old_guard = False
+        if NEEDLE in line and MARKER not in "".join(out[-3:]):
             indent = line[: len(line) - len(line.lstrip(" \t"))]
             nl = "\n" if line.endswith("\n") else ""
-            stripped = line.lstrip(" \t")
-            out.append(f"{indent}# {MARKER}{nl}")
-            out.append(
-                f"{indent}if getattr(sampling_metadata, 'prompt_token_ids', None) is not None:{nl}"
-            )
-            out.append(f"{indent}    {stripped}")
+            out.append(_guard_block(indent, nl))
         else:
             out.append(line)
     return "".join(out), "patched"
@@ -96,13 +134,26 @@ def _selftest() -> None:
     patched, status = patch_source(sample)
     assert status == "patched", status
     assert MARKER in patched
-    assert "getattr(sampling_metadata, 'prompt_token_ids', None) is not None" in patched
+    assert "additional_information.get('prompt_token_ids')" in patched
+    assert "torch.as_tensor" in patched
+    assert NEEDLE.split("[")[0] in patched
     again, status2 = patch_source(patched)
     assert status2 == "already", status2
     assert again == patched
     missing, status3 = patch_source("return None\n")
     assert status3 == "missing", status3
     assert missing == "return None\n"
+    old_guard = (
+        "        if sampling_metadata is not None:\n"
+        f"            # {MARKER}\n"
+        "            if getattr(sampling_metadata, 'prompt_token_ids', None) is not None:\n"
+        f"                {NEEDLE}\n"
+        "        return OmniOutput()\n"
+    )
+    upgraded, status4 = patch_source(old_guard)
+    assert status4 == "patched", status4
+    assert "additional_information.get('prompt_token_ids')" in upgraded
+    assert "getattr(sampling_metadata, 'prompt_token_ids', None) is not None" not in upgraded
 
 
 if __name__ == "__main__":

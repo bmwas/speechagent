@@ -28,6 +28,29 @@ LOG = logging.getLogger("qwen")
 _QUERY_TEXT = "Reply in spoken English. Keep it concise."
 _MIN_UTT_S = 0.2
 _OUT_RATE = 24000
+_QWEN_SYSTEM_PROMPT = (
+    "You can see the user through their camera and hear them through their "
+    "microphone. Always reply in spoken English. Keep responses concise."
+)
+
+
+def _system_prompt(raw: str) -> str:
+    """Drop the MiniCPM clone prompt; Qwen has no reference WAV."""
+    text = (raw or "").strip()
+    if not text or "MiniCPM" in text or "Clone the voice" in text:
+        return _QWEN_SYSTEM_PROMPT
+    return text
+
+
+def _stall_s() -> float:
+    raw = (os.environ.get("QWEN_STALL_S") or "").strip()
+    if not raw:
+        return 12.0
+    try:
+        return max(4.0, float(raw))
+    except ValueError:
+        return 12.0
+
 
 _AUDIO_DELTA_TYPES = frozenset(
     {
@@ -99,8 +122,10 @@ class QwenOmniEngine:
     input_rate = MODEL_RATE
 
     def __init__(self, system_prompt: str = "") -> None:
-        self.system_prompt = system_prompt.strip()
+        self.system_prompt = _system_prompt(system_prompt)
         self.speaker = os.environ.get("QWEN_SPEAKER", "Chelsie").strip() or "Chelsie"
+        self._stall_s = _stall_s()
+        self._resetting = False
         self.model = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-Omni-3B")
         self._max_frames = max(1, min(_env_int("QWEN_VIDEO_MAX_FRAMES", 50), 256))
         self._num_frames = max(1, min(_env_int("QWEN_VIDEO_NUM_FRAMES", 40), 128))
@@ -166,6 +191,32 @@ class QwenOmniEngine:
             return
         await self._ws.send(json.dumps(body))
 
+    async def _connect_ws(self, url: str, attempts: int = 181) -> int:
+        delay = 2.0
+        last_err = "unknown"
+        for attempt in range(1, attempts + 1):
+            try:
+                self._ws = await websockets.connect(url, max_size=16_000_000, ping_interval=20)
+                return attempt
+            except Exception as exc:
+                last_err = str(exc)[:200]
+                trace_stream("speech", "qwen.ws_retry", attempt=attempt, error=last_err, url=url)
+                await asyncio.sleep(min(delay, 15.0))
+                delay = min(delay * 1.25, 15.0)
+        raise RuntimeError(f"model-server video stream never accepted {url}: {last_err}")
+
+    async def _send_session_config(self) -> None:
+        config: dict[str, Any] = {
+            "type": "session.config",
+            "modalities": ["text", "audio"],
+            "num_frames": self._num_frames,
+            "max_frames": self._max_frames,
+            "use_audio_in_video": False,
+            "enable_frame_filter": True,
+            "system_prompt": self.system_prompt,
+        }
+        await self._send(config)
+
     async def start(self) -> None:
         url = _model_ws_url()
         trace_stream(
@@ -176,33 +227,8 @@ class QwenOmniEngine:
             num_frames=self._num_frames,
             max_frames=self._max_frames,
         )
-        delay = 2.0
-        last_err = "unknown"
-        connected_at = 0
-        for attempt in range(1, 181):
-            try:
-                self._ws = await websockets.connect(url, max_size=16_000_000, ping_interval=20)
-                connected_at = attempt
-                break
-            except Exception as exc:
-                last_err = str(exc)[:200]
-                trace_stream("speech", "qwen.ws_retry", attempt=attempt, error=last_err, url=url)
-                await asyncio.sleep(min(delay, 15.0))
-                delay = min(delay * 1.25, 15.0)
-        else:
-            raise RuntimeError(f"model-server video stream never accepted {url}: {last_err}")
-
-        config: dict[str, Any] = {
-            "type": "session.config",
-            "modalities": ["text", "audio"],
-            "num_frames": self._num_frames,
-            "max_frames": self._max_frames,
-            "use_audio_in_video": False,
-            "enable_frame_filter": True,
-        }
-        if self.system_prompt:
-            config["system_prompt"] = self.system_prompt
-        await self._send(config)
+        connected_at = await self._connect_ws(url)
+        await self._send_session_config()
         self._t_ready = time.monotonic()
         self._ready.set()
         self._reader = asyncio.create_task(self._read())
@@ -219,21 +245,90 @@ class QwenOmniEngine:
         )
         trace_stream("speech", "voice.ref_loaded", source=f"qwen_speaker:{self.speaker}")
 
-    async def _heartbeat(self) -> None:
+    async def _reset_socket(self, reason: str) -> None:
+        """Drop a hung /v1/video/chat/stream session (empty codec wait-gate)."""
+        if self._resetting:
+            return
+        self._resetting = True
+        self._ready.clear()
+        self._busy = False
+        self._t_query = 0.0
+        reader = self._reader
+        self._reader = None
+        if reader is not None:
+            reader.cancel()
+            try:
+                await reader
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        url = _model_ws_url()
+        trace_stream("speech", "qwen.reconnect", reason=reason, url=url)
         try:
-            while self._ws is not None:
-                await asyncio.sleep(20.0)
+            await self._connect_ws(url, attempts=12)
+            await self._send_session_config()
+            self._frame_n = 0
+            self._audio_n = 0
+            self._utt_bytes = 0
+            self._t_ready = time.monotonic()
+            self._ready.set()
+            self._reader = asyncio.create_task(self._read())
+            trace_stream(
+                "speech",
+                "qwen.ready",
+                url=url,
+                reconnect=True,
+                reason=reason,
+                speaker=self.speaker,
+                model=self.model,
+            )
+        except Exception as exc:
+            trace_exc("speech", "error.qwen_reconnect", exc, reason=reason)
+        finally:
+            self._resetting = False
+
+    async def _heartbeat(self) -> None:
+        ticks = 0
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                ticks += 1
+                if self._ws is None or self._resetting:
+                    continue
                 try:
-                    await self._send({"type": "ping"})
                     now = time.monotonic()
-                    trace_stream(
-                        "speech",
-                        "qwen.heartbeat",
-                        rx_age_ms=_age_ms(self._t_last_rx, now),
-                        delta_age_ms=_age_ms(self._t_last_delta, now),
-                        busy=self._busy,
-                        frame_n=self._frame_n,
-                    )
+                    if (
+                        self._busy
+                        and self._t_query
+                        and not self._first_audio
+                        and (now - self._t_query) >= self._stall_s
+                    ):
+                        age_ms = _age_ms(self._t_query, now)
+                        trace_stream(
+                            "speech",
+                            "qwen.stall",
+                            latency_ms=age_ms,
+                            text_chars=self._text_chars,
+                            frames=self._frame_n,
+                        )
+                        self._finish_turn("stall_no_audio")
+                        await self._reset_socket(f"stall_{age_ms}ms")
+                        continue
+                    if ticks % 10 == 0:
+                        await self._send({"type": "ping"})
+                        trace_stream(
+                            "speech",
+                            "qwen.heartbeat",
+                            rx_age_ms=_age_ms(self._t_last_rx, now),
+                            delta_age_ms=_age_ms(self._t_last_delta, now),
+                            busy=self._busy,
+                            frame_n=self._frame_n,
+                        )
                 except Exception:
                     return
         except asyncio.CancelledError:
