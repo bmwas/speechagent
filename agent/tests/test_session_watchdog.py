@@ -437,6 +437,29 @@ class SileroVadEventTests(unittest.TestCase):
         finally:
             mod.time.monotonic = orig
 
+    def test_energy_assist_does_not_barge_while_bot_occupies(self) -> None:
+        import barge_in as mod
+
+        vad = LiveKitSileroVad(start_secs=0.15, stop_secs=0.20)
+        vad.bot_playing = True
+        loud = array.array("h", [8000] * 320).tobytes()
+        clock = [0.0]
+        orig = mod.time.monotonic
+        mod.time.monotonic = lambda: clock[0]
+        try:
+            saw = None
+            for i in range(40):
+                clock[0] = i * 0.02
+                got = vad.feed(loud)
+                if got:
+                    saw = got
+                    break
+            self.assertIsNone(saw)
+            self.assertFalse(vad.speaking)
+            self.assertFalse(vad._assist_active)
+        finally:
+            mod.time.monotonic = orig
+
 
 class _FakeWs:
     def __init__(self) -> None:

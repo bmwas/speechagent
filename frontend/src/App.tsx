@@ -186,6 +186,7 @@ export default function App() {
   const [signalDetail, setSignalDetail] = useState("checking browser socket");
   const connectingRef = useRef(false);
   const autoTriedRef = useRef(false);
+  const connectGenRef = useRef(0);
   const insecure = typeof window !== "undefined" && !navigator.mediaDevices?.getUserMedia;
   const httpPage = typeof window !== "undefined" && window.location.protocol === "http:";
   const host = typeof window !== "undefined" ? window.location.host : "host";
@@ -278,7 +279,7 @@ export default function App() {
   }, [httpPage]);
 
   useEffect(() => {
-    if (httpPage || insecure || lkOn) return;
+    if (httpPage || insecure || lkOn || state === "connecting") return;
     let cancelled = false;
     const tick = async () => {
       const result = await probeCaptureWs();
@@ -292,7 +293,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [httpPage, insecure, lkOn]);
+  }, [httpPage, insecure, lkOn, state]);
 
   const attachRemote = (track: RemoteTrack) => {
     if (track.kind === Track.Kind.Audio && remoteAudioRef.current) {
@@ -311,6 +312,8 @@ export default function App() {
   const connect = useCallback(async () => {
     if (connectingRef.current) return;
     connectingRef.current = true;
+    const gen = ++connectGenRef.current;
+    const mine = () => connectGenRef.current === gen;
     try {
       if (!audioCtxRef.current) {
         const Ctor =
@@ -323,19 +326,19 @@ export default function App() {
       /* ignore */
     }
     if (upgradeLanHttp()) {
-      connectingRef.current = false;
+      if (mine()) connectingRef.current = false;
       return;
     }
     if (insecure) {
       setError(
         `Camera/mic APIs are off on ${window.location.origin}. Open https://${window.location.host}${PATH} — Advanced → Proceed — then reload. Do not switch to 127.0.0.1 — that is the GPU box, not this laptop.`,
       );
-      connectingRef.current = false;
+      if (mine()) connectingRef.current = false;
       return;
     }
     if (ready && !ready.admit) {
       setError(ready.message || "Engine is not ready. Stay in the greenroom.");
-      connectingRef.current = false;
+      if (mine()) connectingRef.current = false;
       return;
     }
     const stale = lkRoomRef.current;
@@ -359,6 +362,7 @@ export default function App() {
     setError(null);
     setState("connecting");
     let localTracks: LocalTrack[] = [];
+    let room: Room | null = null;
     try {
       localTracks = await acquireLocalTracks();
       const micTrack = localTracks.find((t) => t.kind === Track.Kind.Audio);
@@ -415,7 +419,7 @@ export default function App() {
       const url = livekitConnectUrl(window.location, body.url || "");
       setState(`signaling ${url}${diag ? ` via ${diag}` : ""}`);
       const videoEncoding = { maxBitrate: 1_500_000, maxFramerate: 30 };
-      const room = new Room({
+      const nextRoom = new Room({
         adaptiveStream: false,
         dynacast: false,
         audioCaptureDefaults: {
@@ -434,40 +438,52 @@ export default function App() {
           stopMicTrackOnMute: false,
         },
       });
-      lkRoomRef.current = room;
+      room = nextRoom;
+      lkRoomRef.current = nextRoom;
       lkIdentityRef.current = body.identity || null;
-      room.on(RoomEvent.ConnectionStateChanged, (s: ConnectionState) => setState(s));
-      room.on(RoomEvent.Disconnected, () => {
+      nextRoom.on(RoomEvent.ConnectionStateChanged, (s: ConnectionState) => {
+        if (lkRoomRef.current === nextRoom) setState(s);
+      });
+      nextRoom.on(RoomEvent.Disconnected, () => {
+        if (lkRoomRef.current !== nextRoom) return;
         setLkOn(false);
         setState("disconnected");
         setLeftOnPurpose(true);
         autoTriedRef.current = true;
       });
-      room.on(RoomEvent.TrackSubscribed, (track) => attachRemote(track));
-      room.on(RoomEvent.TrackUnsubscribed, (track) => track.detach());
-      room.on(RoomEvent.LocalTrackPublished, (pub) => {
+      nextRoom.on(RoomEvent.TrackSubscribed, (track) => attachRemote(track));
+      nextRoom.on(RoomEvent.TrackUnsubscribed, (track) => track.detach());
+      nextRoom.on(RoomEvent.LocalTrackPublished, (pub) => {
         if (pub.track?.kind === Track.Kind.Video && localRef.current) {
           pub.track.attach(localRef.current);
           localRef.current.play().catch(() => undefined);
         }
       });
-      await room.connect(url, body.token, { websocketTimeout: 20000, peerConnectionTimeout: 20000 });
+      await nextRoom.connect(url, body.token, { websocketTimeout: 20000, peerConnectionTimeout: 20000 });
+      if (!mine()) {
+        try {
+          await nextRoom.disconnect();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
       try {
-        const engine = (room as unknown as { engine?: { pcManager?: { publisher?: { pc?: RTCPeerConnection } } } }).engine;
+        const engine = (nextRoom as unknown as { engine?: { pcManager?: { publisher?: { pc?: RTCPeerConnection } } } }).engine;
         setPeerConnection(engine?.pcManager?.publisher?.pc || null);
       } catch {
         setPeerConnection(null);
       }
-      room.remoteParticipants.forEach((p) => {
+      nextRoom.remoteParticipants.forEach((p) => {
         p.trackPublications.forEach((pub) => {
           if (pub.track) attachRemote(pub.track);
         });
       });
       for (const track of localTracks) {
         if (track.kind === Track.Kind.Audio) {
-          await room.localParticipant.publishTrack(track, { source: Track.Source.Microphone });
+          await nextRoom.localParticipant.publishTrack(track, { source: Track.Source.Microphone });
         } else {
-          await room.localParticipant.publishTrack(track, {
+          await nextRoom.localParticipant.publishTrack(track, {
             source: Track.Source.Camera,
             simulcast: false,
             degradationPreference: "maintain-resolution",
@@ -479,11 +495,12 @@ export default function App() {
           }
         }
       }
-      if (room.localParticipant.audioTrackPublications.size === 0) {
+      if (nextRoom.localParticipant.audioTrackPublications.size === 0) {
         throw new Error("Microphone track did not publish");
       }
       setLkOn(true);
       setNeedGesture(false);
+      setError(null);
     } catch (err) {
       for (const t of localTracks) {
         try {
@@ -492,6 +509,7 @@ export default function App() {
           /* ignore */
         }
       }
+      if (!mine()) return;
       const raw = err instanceof Error ? err.message : String(err);
       const name = err instanceof DOMException ? err.name : "";
       const signalFail = /signal connection|timed out \(signal\)|websocket/i.test(raw);
@@ -516,18 +534,20 @@ export default function App() {
       setPeerConnection(null);
       const lk = lkRoomRef.current;
       const identity = lkIdentityRef.current;
-      lkRoomRef.current = null;
-      lkIdentityRef.current = null;
-      if (identity) {
-        fetch("/api/livekit/leave", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ room: ROOM, identity }),
-        }).catch(() => undefined);
+      if (lk === room || lkRoomRef.current == null) {
+        lkRoomRef.current = null;
+        lkIdentityRef.current = null;
+        if (identity) {
+          fetch("/api/livekit/leave", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ room: ROOM, identity }),
+          }).catch(() => undefined);
+        }
+        if (lk) lk.disconnect().catch(() => undefined);
       }
-      if (lk) lk.disconnect().catch(() => undefined);
     } finally {
-      connectingRef.current = false;
+      if (mine()) connectingRef.current = false;
     }
   }, [insecure, voiceId, family, ready]);
 
@@ -618,7 +638,7 @@ export default function App() {
             <span className="status">transport: {state}</span>
           </div>
           <FloorMetrics connected={lkOn} room={ROOM} />
-          {error ? <p className="muted">error: {error}</p> : null}
+          {error && !lkOn ? <p className="muted">error: {error}</p> : null}
           <div className="previews">
             <div className="tile">
               <h2>self-preview (local)</h2>

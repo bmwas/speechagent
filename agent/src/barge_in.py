@@ -264,6 +264,11 @@ class LiveKitSileroVad:
             self._assist_active = False
             return silero_edge
         if energy_edge == "start" and not self.speaking:
+            # Energy assist exists so Silero cannot drop a quiet "hello".
+            # While the bot still occupies the floor (including Qwen vocoder
+            # holes) RMS echo looks like speech — do not barge on energy.
+            if self.bot_playing:
+                return None
             self._assist_active = True
             trace_stream(
                 "speech",

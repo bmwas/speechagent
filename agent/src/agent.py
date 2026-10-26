@@ -224,10 +224,18 @@ class SpeechSession:
                 identity=identity,
                 brain_ready=self._brain_started and bool(getattr(self.engine, "ready", True)),
             )
-        # Echo guard uses audible speakers only. Barge-in itself also fires
-        # when the model is still generating or has PCM queued — vocoder holes
-        # set audible=False while the rest of the reply is still coming.
-        self.vad.bot_playing = self.playout.audible
+        # Qwen emits two coarse vocoder blobs ~1.2 s apart. During that hole
+        # audible=False and ring_ms=0 while generating is still true. Echo
+        # hold and energy-assist must see occupying, or they barge the rest
+        # of the sentence.
+        generating = bool(getattr(self.engine, "generating", False))
+        occupying = bool(
+            self.playout.audible
+            or generating
+            or self.playout.ring_ms > 0
+            or getattr(self.playout, "source_active", False)
+        )
+        self.vad.bot_playing = occupying
         edge = self.vad.feed(pcm16)
         self._mic_packet_seq += 1
         if hires_enabled():
@@ -247,7 +255,7 @@ class SpeechSession:
         if edge == "start":
             generating = bool(getattr(self.engine, "generating", False))
             occupying = bool(
-                self.vad.bot_playing
+                self.playout.audible
                 or generating
                 or self.playout.ring_ms > 0
                 or getattr(self.playout, "source_active", False)
