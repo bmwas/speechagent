@@ -36,9 +36,11 @@ class EnergyVad:
         *,
         start_secs: float | None = None,
         stop_secs: float | None = None,
+        silent: bool = False,
     ) -> None:
         self.start_secs = float(VAD_START_SECS if start_secs is None else start_secs)
         self.stop_secs = float(VAD_STOP_SECS if stop_secs is None else stop_secs)
+        self.silent = silent
         self.speaking = False
         self.bot_playing = False
         self._noise_ema = 400.0
@@ -58,7 +60,7 @@ class EnergyVad:
         now = time.monotonic()
         open_t = self._open_thresh()
         self.frame_seq += 1
-        if hires_enabled():
+        if hires_enabled() and not self.silent:
             trace_stream(
                 "speech",
                 "vad.frame",
@@ -71,13 +73,14 @@ class EnergyVad:
                 bot_playing=self.bot_playing,
                 noise_ema=int(self._noise_ema),
             )
-        self._stats.add(
-            frames=1,
-            rms=rms,
-            open_thresh=int(open_t),
-            speaking=int(self.speaking),
-            bot_playing=int(self.bot_playing),
-        )
+        if not self.silent:
+            self._stats.add(
+                frames=1,
+                rms=rms,
+                open_thresh=int(open_t),
+                speaking=int(self.speaking),
+                bot_playing=int(self.bot_playing),
+            )
         close_t = open_t * 0.6
         if not self.speaking and rms < open_t:
             self._noise_ema = 0.98 * self._noise_ema + 0.02 * float(rms)
@@ -93,14 +96,15 @@ class EnergyVad:
                         return None
                 self.speaking = True
                 self._speech_start = now
-                trace_stream(
-                    "speech",
-                    "vad.start",
-                    rms=int(rms),
-                    open_thresh=int(open_t),
-                    bot_playing=self.bot_playing,
-                    noise_ema=int(self._noise_ema),
-                )
+                if not self.silent:
+                    trace_stream(
+                        "speech",
+                        "vad.start",
+                        rms=int(rms),
+                        open_thresh=int(open_t),
+                        bot_playing=self.bot_playing,
+                        noise_ema=int(self._noise_ema),
+                    )
                 return "start"
             return None
 
@@ -117,13 +121,14 @@ class EnergyVad:
             self.speaking = False
             self._speech_start = None
             self._quiet_since = None
-            trace_stream(
-                "speech",
-                "vad.stop",
-                rms=int(rms),
-                utterance_s=round(dur, 2),
-                bot_playing=self.bot_playing,
-            )
+            if not self.silent:
+                trace_stream(
+                    "speech",
+                    "vad.stop",
+                    rms=int(rms),
+                    utterance_s=round(dur, 2),
+                    bot_playing=self.bot_playing,
+                )
             return "stop"
         return None
 
@@ -160,6 +165,10 @@ class LiveKitSileroVad:
         self._task: asyncio.Task | None = None
         self._rtc: Any = None
         self._stats = StreamMeter("speech", "vad.stats", period_s=STREAM_PERIOD_S)
+        # If Silero misses a turn (stream stall, conservative threshold), RMS
+        # hangover still commits so "hello" is not dropped.
+        self._energy = EnergyVad(start_secs=start_secs, stop_secs=stop_secs, silent=True)
+        self._assist_active = False
 
     def apply_event(self, ev_type: str, *, probability: float = 0.0, now: float | None = None) -> str | None:
         """Process a Silero-style event. Used by the stream task and by unit tests."""
@@ -246,8 +255,35 @@ class LiveKitSileroVad:
         )
         self._push_frame(pcm16)
         if self._edges:
-            return self._edges.popleft()
-        return self._maybe_release_hold(now)
+            silero_edge = self._edges.popleft()
+        else:
+            silero_edge = self._maybe_release_hold(now)
+        self._energy.bot_playing = self.bot_playing
+        energy_edge = self._energy.feed(pcm16)
+        if silero_edge:
+            self._assist_active = False
+            return silero_edge
+        if energy_edge == "start" and not self.speaking:
+            self._assist_active = True
+            trace_stream(
+                "speech",
+                "vad.energy_assist",
+                edge="start",
+                rms=int(self.last_rms),
+                backend=self.backend,
+            )
+            return self._emit_start(now)
+        if energy_edge == "stop" and self._assist_active and self.speaking:
+            self._assist_active = False
+            trace_stream(
+                "speech",
+                "vad.energy_assist",
+                edge="stop",
+                rms=int(self.last_rms),
+                backend=self.backend,
+            )
+            return self.apply_event("end_of_speech", now=now)
+        return None
 
     def _push_frame(self, pcm16: bytes) -> None:
         stream = self._stream

@@ -178,8 +178,10 @@ class TokenVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.ts = ts
         self._bots = dict(ts._bots)
         self._humans = {k: set(v) for k, v in ts._humans.items()}
+        self._ready_cache = ts._ready_cache
         ts._bots.clear()
         ts._humans.clear()
+        ts._ready_cache = None
         # Force MiniCPM mode for these tests (voice catalog tests)
         self._old_model = os.environ.get("MODEL_NAME")
         os.environ["MODEL_NAME"] = "openbmb/MiniCPM-o-4_5"
@@ -189,6 +191,7 @@ class TokenVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.ts._humans.clear()
         self.ts._bots.update(self._bots)
         self.ts._humans.update(self._humans)
+        self.ts._ready_cache = self._ready_cache
         # Restore MODEL_NAME
         if self._old_model is None:
             os.environ.pop("MODEL_NAME", None)
@@ -239,9 +242,15 @@ class TokenVoiceTests(unittest.IsolatedAsyncioTestCase):
             "server": ("test", 80),
         }
         request = Request(scope)
+        ready = {
+            "admit": True,
+            "phase": "ready",
+            "message": "Engine is ready.",
+        }
         with patch.object(self.ts, "livekit_tcp_ok", new=AsyncMock(return_value=(True, "ok"))):
-            with patch.object(self.ts, "token_for_user", return_value="tok"):
-                resp = await self.ts.livekit_token(request)
+            with patch.object(self.ts, "admission_status", new=AsyncMock(return_value=ready)):
+                with patch.object(self.ts, "token_for_user", return_value="tok"):
+                    resp = await self.ts.livekit_token(request)
         self.assertEqual(resp.status_code, 409)
         self.assertFalse(self.ts._humans.get("default"))
         self.assertIs(self.ts._bots["default"], self.ts._bots.get("default"))

@@ -295,6 +295,22 @@ class ClockedPlayout:
             since_push_ms=int((now - self._last_push) * 1000) if self._last_push else -1,
         )
 
+    def _emit_turn_summary(self, reason: str) -> None:
+        if self._turn_frames <= 0:
+            return
+        trace_stream(
+            "speech",
+            "playout.turn_summary",
+            reason=reason,
+            frames=self._turn_frames,
+            silence_frames=self._turn_silence,
+            underrun_episodes=self._underrun_episodes,
+            underrun_total_ms=int(self._underrun_total_ms),
+            longest_underrun_ms=int(self._longest_underrun_ms),
+            ring_ms_min=round(self._ring_ms_min, 1) if self._ring_ms_min >= 0 else -1,
+            prebuffer_ms=round(self._turn_prebuffer_ms, 1) if self._turn_prebuffer_ms >= 0 else -1,
+        )
+
     def _close_turn(self, reason: str) -> None:
         if self._turn_open:
             self._emit_turn_summary(reason)

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import time
 import uuid
+import urllib.error
+import urllib.request
 from typing import Any
 from urllib.parse import urlparse
 
@@ -15,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from agent import SpeechSession, is_minicpm
+from qwen_omni import probe_model_server, probe_video_stream
 from tokens import livekit_url, token_for_user
 from trace import trace, trace_exc, trace_stream
 from voices import (
@@ -49,6 +54,8 @@ app.add_middleware(
 _bots: dict[str, SpeechSession] = {}
 _bots_lock: asyncio.Lock | None = None
 _humans: dict[str, set[str]] = {}
+_ready_cache: tuple[float, dict[str, Any]] | None = None
+_READY_TTL_S = 0.8
 
 
 def _livekit_host_port() -> tuple[str, int]:
@@ -101,6 +108,72 @@ async def model_server_tcp_ok() -> tuple[bool, str]:
         return False, f"{host}:{port} {exc}"
 
 
+def _native_worker_http_url() -> str:
+    """MiniCPM worker is :22400. MODEL_BASE_URL often still points at vLLM."""
+    base = (os.environ.get("NATIVE_WORKER_URL") or os.environ.get("MODEL_BASE_URL") or "").strip().rstrip("/")
+    if not base or ":8199" in base:
+        base = "http://127.0.0.1:22400"
+    if base.startswith("ws://"):
+        base = "http://" + base[len("ws://") :]
+    elif base.startswith("wss://"):
+        base = "https://" + base[len("wss://") :]
+    if base.endswith("/v1/worker/duplex"):
+        base = base[: -len("/v1/worker/duplex")]
+    return base.rstrip("/")
+
+
+async def probe_native_worker() -> dict[str, Any]:
+    """HTTP /health on the native MiniCPM worker. TCP alone is not model_loaded."""
+    base = _native_worker_http_url()
+    parsed = urlparse(base if "://" in base else f"http://{base}")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 22400
+    out: dict[str, Any] = {
+        "tcp_ok": False,
+        "http_ok": False,
+        "model_loaded": False,
+        "detail": "",
+        "url": f"{base}/health",
+    }
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 2.0)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        out["tcp_ok"] = True
+    except Exception as exc:
+        out["detail"] = f"tcp refused: {exc}"[:200]
+        return out
+
+    def _http() -> tuple[bool, bool, str]:
+        try:
+            with urllib.request.urlopen(out["url"], timeout=2) as resp:
+                raw = resp.read(800).decode("utf-8", "replace")
+                http_ok = 200 <= int(getattr(resp, "status", 200)) < 300
+                loaded = False
+                try:
+                    body = json.loads(raw)
+                    loaded = bool(body.get("model_loaded") or body.get("ready") or body.get("ok"))
+                except Exception:
+                    loaded = http_ok
+                return http_ok, loaded, raw[:160]
+        except urllib.error.HTTPError as exc:
+            return False, False, f"health HTTP {exc.code}"
+        except Exception as exc:
+            return False, False, str(exc)[:160]
+
+    try:
+        http_ok, loaded, detail = await asyncio.to_thread(_http)
+        out["http_ok"] = http_ok
+        out["model_loaded"] = loaded
+        out["detail"] = detail
+    except Exception as exc:
+        out["detail"] = f"http probe failed: {exc}"[:200]
+    return out
+
+
 def public_ws_url(request: Request | None = None) -> str:
     if LIVEKIT_PUBLIC_URL:
         return LIVEKIT_PUBLIC_URL
@@ -144,6 +217,9 @@ async def health():
         for rid, bot in _bots.items()
         if getattr(bot, "_running", False)
     }
+    # Cache-only — never probe the video socket from /health. Docker's
+    # healthcheck timeout is 3s; a load-time WS wait would restart the agent.
+    cached = _ready_cache[1] if _ready_cache else {}
     return {
         "ok": ok,
         "model": os.environ.get("MODEL_NAME", ""),
@@ -153,6 +229,9 @@ async def health():
         "bots": sum(1 for b in _bots.values() if b._running),
         "brains": brains,
         "engine_ready": engine_ready,
+        "admit": bool(cached.get("admit")) if cached else False,
+        "phase": cached.get("phase") or ("up" if ok else "down"),
+        "stream_ok": bool(cached.get("stream_ok")) if cached else False,
         "rooms": list(_bots.keys()),
         "voices": voices,
         "livekit_url": os.environ.get("LIVEKIT_URL", ""),
@@ -167,6 +246,106 @@ async def health():
 def _model_family() -> str:
     """Return 'minicpm' or 'qwen' based on MODEL_NAME."""
     return "minicpm" if is_minicpm() else "qwen"
+
+
+async def admission_status(room_id: str = "default") -> dict[str, Any]:
+    """Whether a patient may enter. Model HTTP up is not enough — the live
+    speech socket must accept, or an already-running engine must be ready."""
+    global _ready_cache
+    now = time.monotonic()
+    cached = _ready_cache
+    if cached and (now - cached[0]) < _READY_TTL_S:
+        snap = dict(cached[1])
+        snap["room"] = room_id
+        return snap
+
+    backend = (os.environ.get("MODEL_BACKEND") or "vllm").strip().lower()
+    family = _model_family()
+    lk_ok, lk_detail = await livekit_tcp_ok()
+    bot = _bots.get(room_id)
+    engine_ready = bool(
+        bot is not None
+        and getattr(bot, "_running", False)
+        and bool(getattr(getattr(bot, "engine", None), "ready", False))
+    )
+
+    model_tcp = False
+    model_http = False
+    models_ok = False
+    stream_ok = False
+    model_detail = ""
+    stream_detail = ""
+
+    if backend == "native":
+        native = await probe_native_worker()
+        model_tcp = bool(native.get("tcp_ok"))
+        model_http = bool(native.get("http_ok"))
+        models_ok = bool(native.get("model_loaded"))
+        model_detail = str(native.get("detail") or "")
+        stream_ok = models_ok or engine_ready
+        stream_detail = "worker model_loaded" if models_ok else model_detail
+    else:
+        probe = await probe_model_server()
+        model_tcp = bool(probe.get("tcp_ok"))
+        model_http = bool(probe.get("http_ok"))
+        models_ok = bool(probe.get("models_ok"))
+        model_detail = str(probe.get("detail") or "")
+        if model_http and models_ok:
+            stream = await probe_video_stream()
+            stream_ok = bool(stream.get("stream_ok"))
+            stream_detail = str(stream.get("stream_detail") or "")
+        elif engine_ready:
+            stream_ok = True
+            stream_detail = "engine session already live"
+        else:
+            stream_detail = "model HTTP not serving yet"
+
+    model_serving = model_http and models_ok
+    admit = bool(lk_ok and model_serving and (stream_ok or engine_ready))
+    if not lk_ok:
+        phase = "waiting_sfu"
+        message = f"LiveKit is not listening ({lk_detail})."
+    elif not model_tcp:
+        phase = "waiting_model"
+        message = "Model server is not listening yet. Weights are still coming up."
+    elif not model_serving:
+        phase = "waiting_model"
+        message = "Model HTTP is up but stages are still loading. Stay in the greenroom."
+    elif not (stream_ok or engine_ready):
+        phase = "waiting_engine"
+        message = "Live speech socket is not accepting yet. Almost there."
+    else:
+        phase = "ready"
+        message = "Engine is ready."
+
+    snap = {
+        "ok": True,
+        "admit": admit,
+        "phase": phase,
+        "message": message,
+        "livekit_ok": lk_ok,
+        "livekit_detail": lk_detail,
+        "model_tcp": model_tcp,
+        "model_http": model_http,
+        "models_ok": models_ok,
+        "model_detail": model_detail[:200],
+        "stream_ok": stream_ok,
+        "stream_detail": stream_detail[:200],
+        "engine_ready": engine_ready,
+        "model_serving": model_serving,
+        "model": os.environ.get("MODEL_NAME", ""),
+        "model_backend": backend,
+        "family": family,
+        "room": room_id,
+    }
+    _ready_cache = (now, snap)
+    return dict(snap)
+
+
+@app.get("/api/ready")
+async def api_ready(request: Request):
+    room_id = (request.query_params.get("room") or "default").strip() or "default"
+    return await admission_status(room_id)
 
 
 @app.get("/api/voices")
@@ -232,6 +411,27 @@ async def livekit_token(request: Request):
             {
                 "ok": False,
                 "error": f"LiveKit SFU is not listening ({lk_detail}). Recreate the livekit service.",
+            },
+            status_code=503,
+        )
+    admission = await admission_status(room_id)
+    if not admission.get("admit"):
+        trace_stream(
+            "speech",
+            "greenroom.hold",
+            room=room_id,
+            phase=admission.get("phase"),
+            message=str(admission.get("message") or "")[:200],
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": (
+                    f"{admission.get('message') or 'Engine is not ready.'} "
+                    "Wait in the greenroom — do not talk yet."
+                ),
+                "phase": admission.get("phase"),
+                "ready": admission,
             },
             status_code=503,
         )

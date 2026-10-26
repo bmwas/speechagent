@@ -13,6 +13,7 @@ import { isFailedToFetch, livekitConnectUrl, upgradeLanHttp } from "./upgradeHtt
 import VoicePicker from "./VoicePicker";
 import FloorMetrics from "./FloorMetrics";
 import SessionLab from "./SessionLab";
+import Greenroom, { type Admission } from "./Greenroom";
 import {
   DEFAULT_VOICE_ID,
   DEFAULT_QWEN_SPEAKER,
@@ -133,6 +134,11 @@ export default function App() {
   const lkIdentityRef = useRef<string | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const [peerConnection, setPeerConnection] = useState<RTCPeerConnection | null>(null);
+  const [ready, setReady] = useState<Admission | null>(null);
+  const [needGesture, setNeedGesture] = useState(false);
+  const [leftOnPurpose, setLeftOnPurpose] = useState(false);
+  const connectingRef = useRef(false);
+  const autoTriedRef = useRef(false);
   const insecure = typeof window !== "undefined" && !navigator.mediaDevices?.getUserMedia;
   const httpPage = typeof window !== "undefined" && window.location.protocol === "http:";
   const host = typeof window !== "undefined" ? window.location.host : "host";
@@ -201,6 +207,29 @@ export default function App() {
     };
   }, [httpPage, host]);
 
+  useEffect(() => {
+    if (httpPage) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch(`/api/ready?room=${ROOM}`, { signal: AbortSignal.timeout(8000) });
+        const j = (await r.json()) as Admission & { family?: VoiceFamily; model?: string };
+        if (cancelled) return;
+        setReady(j);
+        if (j.model) setModel(j.model);
+        if (j.family === "qwen" || j.family === "minicpm") setFamily(j.family);
+      } catch {
+        /* keep last snapshot */
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [httpPage]);
+
   const attachRemote = (track: RemoteTrack) => {
     if (track.kind === Track.Kind.Audio && remoteAudioRef.current) {
       try {
@@ -216,6 +245,8 @@ export default function App() {
   };
 
   const connect = useCallback(async () => {
+    if (connectingRef.current) return;
+    connectingRef.current = true;
     try {
       if (!audioCtxRef.current) {
         const Ctor =
@@ -227,11 +258,20 @@ export default function App() {
     } catch {
       /* ignore */
     }
-    if (upgradeLanHttp()) return;
+    if (upgradeLanHttp()) {
+      connectingRef.current = false;
+      return;
+    }
     if (insecure) {
       setError(
         `Camera/mic APIs are off on ${window.location.origin}. Open https://${window.location.host}${PATH} — Advanced → Proceed — then reload. Do not switch to 127.0.0.1 — that is the GPU box, not this laptop.`,
       );
+      connectingRef.current = false;
+      return;
+    }
+    if (ready && !ready.admit) {
+      setError(ready.message || "Engine is not ready. Stay in the greenroom.");
+      connectingRef.current = false;
       return;
     }
     const stale = lkRoomRef.current;
@@ -254,11 +294,12 @@ export default function App() {
     }
     setError(null);
     setState("connecting");
-    const localTracks = await acquireLocalTracks();
-    const micTrack = localTracks.find((t) => t.kind === Track.Kind.Audio);
-    const micDeviceId = micTrack?.mediaStreamTrack.getSettings().deviceId;
-    const tokenUrl = `/api/livekit/token?role=patient&room=${ROOM}&consent=1&voice=${encodeURIComponent(voiceId)}`;
+    let localTracks: LocalTrack[] = [];
     try {
+      localTracks = await acquireLocalTracks();
+      const micTrack = localTracks.find((t) => t.kind === Track.Kind.Audio);
+      const micDeviceId = micTrack?.mediaStreamTrack.getSettings().deviceId;
+      const tokenUrl = `/api/livekit/token?role=patient&room=${ROOM}&consent=1&voice=${encodeURIComponent(voiceId)}`;
       const r = await fetch(tokenUrl, {
         method: "POST",
         signal: AbortSignal.timeout(20000),
@@ -281,7 +322,13 @@ export default function App() {
             : `token HTTP ${r.status} (not JSON — is the agent up behind this origin?)`,
         );
       }
-      if (!r.ok || !body.token) throw new Error(body.error || `token HTTP ${r.status}`);
+      if (!r.ok || !body.token) {
+        if (r.status === 503) {
+          autoTriedRef.current = false;
+          setLeftOnPurpose(false);
+        }
+        throw new Error(body.error || `token HTTP ${r.status}`);
+      }
       if (body.model) setModel(body.model);
       if (body.voice_id) {
         setVoiceId(body.voice_id);
@@ -329,6 +376,8 @@ export default function App() {
       room.on(RoomEvent.Disconnected, () => {
         setLkOn(false);
         setState("disconnected");
+        setLeftOnPurpose(true);
+        autoTriedRef.current = true;
       });
       room.on(RoomEvent.TrackSubscribed, (track) => attachRemote(track));
       room.on(RoomEvent.TrackUnsubscribed, (track) => track.detach());
@@ -370,6 +419,7 @@ export default function App() {
         throw new Error("Microphone track did not publish");
       }
       setLkOn(true);
+      setNeedGesture(false);
     } catch (err) {
       for (const t of localTracks) {
         try {
@@ -379,7 +429,13 @@ export default function App() {
         }
       }
       const raw = err instanceof Error ? err.message : String(err);
+      const name = err instanceof DOMException ? err.name : "";
       const signalFail = /signal connection|timed out \(signal\)|websocket/i.test(raw);
+      const gesture = name === "NotAllowedError" || /Permission denied|user gesture|The request is not allowed/i.test(raw);
+      if (gesture) setNeedGesture(true);
+      if (/greenroom|not ready|not accepting|still loading|stages are still/i.test(raw)) {
+        autoTriedRef.current = false;
+      }
       const msg = isFailedToFetch(raw)
         ? `Connect failed (Failed to fetch). LiveKit signaling is same-origin wss://${window.location.host}/rtc — accept the self-signed cert, stay on this host (not 127.0.0.1 from a laptop), then Connect again. (${raw})`
         : signalFail
@@ -401,8 +457,10 @@ export default function App() {
         }).catch(() => undefined);
       }
       if (lk) lk.disconnect().catch(() => undefined);
+    } finally {
+      connectingRef.current = false;
     }
-  }, [insecure, voiceId, family]);
+  }, [insecure, voiceId, family, ready]);
 
   const disconnect = useCallback(async () => {
     const lk = lkRoomRef.current;
@@ -411,6 +469,8 @@ export default function App() {
     lkIdentityRef.current = null;
     setLkOn(false);
     setPeerConnection(null);
+    setLeftOnPurpose(true);
+    autoTriedRef.current = true;
     if (identity) {
       fetch("/api/livekit/leave", {
         method: "POST",
@@ -431,6 +491,28 @@ export default function App() {
   const connected = state !== "idle" && state !== "disconnected";
   const voiceLocked = connected; // Includes "connecting" since it's neither "idle" nor "disconnected"
   const voiceName = voices.find((v) => v.id === voiceId)?.name || "Original";
+  const admitted = Boolean(ready?.admit);
+  const showGreenroom = !leftOnPurpose && !lkOn;
+
+  useEffect(() => {
+    if (!showGreenroom || !admitted || needGesture || insecure || httpPage) return;
+    if (autoTriedRef.current || connectingRef.current || state === "connecting") return;
+    autoTriedRef.current = true;
+    void connect();
+  }, [showGreenroom, admitted, needGesture, insecure, httpPage, state, connect]);
+
+  const picker = (
+    <VoicePicker
+      voices={voices}
+      selectedId={voiceId}
+      disabled={voiceLocked}
+      family={family}
+      onSelect={(id) => {
+        setVoiceId(id);
+        storeVoiceId(id, family);
+      }}
+    />
+  );
 
   return (
     <div className="shell">
@@ -439,8 +521,8 @@ export default function App() {
           <div className="eyebrow">speechagent · livekit · /patient</div>
           <h1>Talk to the agent</h1>
           <p className="muted">
-            Headphones on. Open this page over HTTPS, pick a voice, click Connect, allow camera and mic,
-            then speak. The agent sees you and answers in speech.
+            Headphones on. The greenroom holds Connect until the model and speech socket are up, then
+            walks you in. Pick a voice while you wait.
             {model ? ` Model: ${model}.` : ""} Voice: {voiceName}.
           </p>
           {insecure || httpPage ? (
@@ -449,18 +531,13 @@ export default function App() {
               a secure context, so camera/mic stay blocked.
             </div>
           ) : null}
-          <VoicePicker
-            voices={voices}
-            selectedId={voiceId}
-            disabled={voiceLocked}
-            family={family}
-            onSelect={(id) => {
-              setVoiceId(id);
-              storeVoiceId(id, family);
-            }}
-          />
+          {showGreenroom ? null : picker}
           <div className="row">
-            <button type="button" onClick={() => void connect()} disabled={state === "connecting"}>
+            <button
+              type="button"
+              onClick={() => void connect()}
+              disabled={state === "connecting" || (!admitted && !lkOn && !leftOnPurpose)}
+            >
               {connected ? "Reconnect" : "Connect"}
             </button>
             <button type="button" className="secondary" onClick={() => void disconnect()} disabled={!lkOn && state === "idle"}>
@@ -486,6 +563,18 @@ export default function App() {
         </aside>
       </div>
       <audio ref={remoteAudioRef} autoPlay playsInline />
+      {showGreenroom ? (
+        <Greenroom
+          ready={ready}
+          error={error}
+          connecting={state === "connecting" || connectingRef.current}
+          needGesture={needGesture}
+          voicePicker={picker}
+          insecure={insecure || httpPage}
+          host={host}
+          onEnter={() => void connect()}
+        />
+      ) : null}
     </div>
   );
 }

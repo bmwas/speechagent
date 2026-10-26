@@ -31,6 +31,8 @@ LOG = logging.getLogger("qwen")
 
 _QUERY_TEXT = "Reply in spoken English. Keep it concise."
 _MIN_UTT_S = 0.2
+_PENDING_AUDIO_MAX_S = 8.0
+_PENDING_AUDIO_MAX_BYTES = int(MODEL_RATE * 2 * _PENDING_AUDIO_MAX_S)
 _OUT_RATE = 24000
 _QWEN_SYSTEM_PROMPT = (
     "You can see the user through their camera and hear them through their "
@@ -171,6 +173,30 @@ async def probe_model_server() -> dict[str, Any]:
     return out
 
 
+async def probe_video_stream(*, timeout_s: float = 3.0) -> dict[str, Any]:
+    """Open and close ``/v1/video/chat/stream``. HTTP /health is not enough —
+    the video socket stays closed until all Omni stages finish loading."""
+    url = _model_ws_url()
+    out: dict[str, Any] = {"stream_ok": False, "stream_url": url, "stream_detail": ""}
+    ws = None
+    try:
+        ws = await asyncio.wait_for(
+            websockets.connect(url, max_size=1_000_000, ping_interval=None, open_timeout=timeout_s),
+            timeout_s + 0.5,
+        )
+        out["stream_ok"] = True
+        out["stream_detail"] = "accepted"
+    except Exception as exc:
+        out["stream_detail"] = str(exc)[:200]
+    finally:
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+    return out
+
+
 def _age_ms(started: float, now: float) -> int:
     if not started:
         return -1
@@ -258,6 +284,13 @@ class QwenOmniEngine:
         self._not_ready_rl = RateLimiter(5.0)
         self._last_probe: dict[str, Any] = {}
         self._ws_attempts = 0
+        # Speech that arrives before /v1/video/chat/stream is ready. VAD stop
+        # used to call generate() which no-op'd, so "hello" during load vanished.
+        self._pending_pcm = bytearray()
+        self._pending_jpeg = b""
+        self._pending_generate = False
+        self._speech_open = False
+        self._flushing_pending = False
 
     @property
     def generating(self) -> bool:
@@ -276,11 +309,15 @@ class QwenOmniEngine:
             wall_ms = _age_ms(self._t_first_audio, now)
             if wall_ms > 0:
                 live_rtf = round(self._turn_audio_ms / wall_ms, 2)
+        pending_audio_ms = int(1000.0 * (len(self._pending_pcm) / 2.0) / MODEL_RATE) if self._pending_pcm else 0
+        live_utt_ms = int(1000.0 * (self._utt_bytes / 2.0) / MODEL_RATE) if self._utt_bytes else 0
         snap = {
             "ready": self.ready,
             "speaking": self._busy,
             "out_q": self._out.qsize(),
-            "utt_ms": int(1000.0 * (self._utt_bytes / 2.0) / MODEL_RATE) if self._utt_bytes else 0,
+            "utt_ms": live_utt_ms if self.ready else pending_audio_ms,
+            "pending_generate": self._pending_generate,
+            "pending_audio_ms": pending_audio_ms,
             "frame_n": self._frame_n,
             "audio_n": self._audio_n,
             "mic_age_ms": _age_ms(self._t_last_mic, now),
@@ -436,6 +473,7 @@ class QwenOmniEngine:
             max_frames=self._max_frames,
         )
         trace_stream("speech", "voice.ref_loaded", source=f"qwen_speaker:{self.speaker}")
+        await self._flush_pending_after_ready()
 
     async def _reset_socket(self, reason: str) -> None:
         """Drop a hung /v1/video/chat/stream session (empty codec wait-gate)."""
@@ -479,6 +517,7 @@ class QwenOmniEngine:
                 speaker=self.speaker,
                 model=self.model,
             )
+            await self._flush_pending_after_ready()
         except Exception as exc:
             trace_exc("speech", "error.qwen_reconnect", exc, reason=reason)
         finally:
@@ -704,34 +743,38 @@ class QwenOmniEngine:
         self._turn_ttft_ms = -1.0
         self._turn_rtf = -1.0
 
-    async def push_audio(self, pcm16: bytes, sample_rate: int, is_speech: bool = True) -> None:
-        if not pcm16:
+    def _stash_pcm(self, pcm16: bytes, is_speech: bool) -> None:
+        if is_speech and pcm16:
+            self._pending_pcm.extend(pcm16)
+            overflow = len(self._pending_pcm) - _PENDING_AUDIO_MAX_BYTES
+            if overflow > 0:
+                del self._pending_pcm[:overflow]
+
+    async def _note_not_ready(self, *, dropped: str | None = None) -> None:
+        now = time.monotonic()
+        if not self._not_ready_since:
+            self._not_ready_since = now
+        if not self._not_ready_rl.due():
             return
-        if sample_rate != MODEL_RATE:
-            if self._in_rs is None:
-                self._in_rs = LinearResampler(MODEL_RATE)
-            pcm16 = self._in_rs.feed(pcm16, sample_rate)
-            if not pcm16:
-                return
-        self._t_last_mic = time.monotonic()
-        if not self.ready:
-            now = time.monotonic()
-            if not self._not_ready_since:
-                self._not_ready_since = now
-            self._drop_meter.add(bytes=len(pcm16), frames=1)
-            if self._not_ready_rl.due():
-                not_ready_ms = _age_ms(self._not_ready_since, now)
-                probe = await probe_model_server()
-                self._last_probe = probe
-                trace_stream(
-                    "speech",
-                    "qwen.engine_not_ready",
-                    not_ready_ms=not_ready_ms,
-                    ws_attempts=self._ws_attempts,
-                    **probe,
-                )
-            return
-        self._not_ready_since = 0.0
+        not_ready_ms = _age_ms(self._not_ready_since, now)
+        probe = await probe_model_server()
+        self._last_probe = probe
+        extra: dict[str, Any] = dict(probe)
+        if dropped:
+            extra["dropped"] = dropped
+        extra["pending_audio_ms"] = (
+            int(1000.0 * (len(self._pending_pcm) / 2.0) / MODEL_RATE) if self._pending_pcm else 0
+        )
+        extra["pending_generate"] = self._pending_generate
+        trace_stream(
+            "speech",
+            "qwen.engine_not_ready",
+            not_ready_ms=not_ready_ms,
+            ws_attempts=self._ws_attempts,
+            **extra,
+        )
+
+    async def _send_audio_chunk(self, pcm16: bytes, is_speech: bool) -> None:
         if is_speech:
             self._utt_bytes += len(pcm16)
         self._audio_n += 1
@@ -747,26 +790,7 @@ class QwenOmniEngine:
             }
         )
 
-    async def push_image(self, jpeg: bytes) -> None:
-        if not jpeg:
-            return
-        if not self.ready:
-            now = time.monotonic()
-            if not self._not_ready_since:
-                self._not_ready_since = now
-            self._drop_meter.add(dropped=1, reason="not_ready")
-            if self._not_ready_rl.due():
-                not_ready_ms = _age_ms(self._not_ready_since, now)
-                trace_stream(
-                    "speech",
-                    "qwen.engine_not_ready",
-                    not_ready_ms=not_ready_ms,
-                    ws_attempts=self._ws_attempts,
-                    dropped="video",
-                    **self._last_probe,
-                )
-            return
-        self._not_ready_since = 0.0
+    async def _send_image(self, jpeg: bytes) -> None:
         self._frame_n += 1
         self._t_last_frame = time.monotonic()
         pts_ms = int(self._t_last_frame * 1000)
@@ -788,9 +812,86 @@ class QwenOmniEngine:
                 pts_ms=pts_ms,
             )
 
-    async def generate(self) -> None:
-        if self._busy or not self.ready:
+    async def _promote_pending_media(self) -> None:
+        pcm = bytes(self._pending_pcm)
+        jpeg = self._pending_jpeg
+        self._pending_pcm.clear()
+        self._pending_jpeg = b""
+        if jpeg:
+            await self._send_image(jpeg)
+        if pcm:
+            await self._send_audio_chunk(pcm, is_speech=True)
+
+    async def _flush_pending_after_ready(self) -> None:
+        if self._flushing_pending or not self.ready:
             return
+        self._flushing_pending = True
+        try:
+            want = self._pending_generate
+            await self._promote_pending_media()
+            self._not_ready_since = 0.0
+            if want and not self._speech_open and not self._busy:
+                trace_stream(
+                    "speech",
+                    "qwen.pending_flush",
+                    utt_ms=int(1000.0 * (self._utt_bytes / 2.0) / MODEL_RATE) if self._utt_bytes else 0,
+                    frames=self._frame_n,
+                )
+                await self.generate()
+        finally:
+            self._flushing_pending = False
+
+    async def push_audio(self, pcm16: bytes, sample_rate: int, is_speech: bool = True) -> None:
+        if not pcm16:
+            return
+        if sample_rate != MODEL_RATE:
+            if self._in_rs is None:
+                self._in_rs = LinearResampler(MODEL_RATE)
+            pcm16 = self._in_rs.feed(pcm16, sample_rate)
+            if not pcm16:
+                return
+        self._t_last_mic = time.monotonic()
+        self._speech_open = bool(is_speech)
+        if not self.ready:
+            self._stash_pcm(pcm16, is_speech)
+            self._drop_meter.add(bytes=len(pcm16), frames=1)
+            await self._note_not_ready()
+            return
+        self._not_ready_since = 0.0
+        await self._send_audio_chunk(pcm16, is_speech)
+
+    async def push_image(self, jpeg: bytes) -> None:
+        if not jpeg:
+            return
+        if not self.ready:
+            self._pending_jpeg = jpeg
+            self._drop_meter.add(dropped=1, reason="not_ready")
+            await self._note_not_ready(dropped="video")
+            return
+        self._not_ready_since = 0.0
+        await self._send_image(jpeg)
+
+    async def generate(self) -> None:
+        if self._busy:
+            return
+        # VAD stop is the only caller. The last mic packet is tagged is_speech
+        # for the stop edge, so clear the open-utterance flag here.
+        self._speech_open = False
+        if not self.ready:
+            self._pending_generate = True
+            pending_ms = int(1000.0 * (len(self._pending_pcm) / 2.0) / MODEL_RATE) if self._pending_pcm else 0
+            trace_stream(
+                "speech",
+                "qwen.request",
+                skipped="not_ready",
+                pending=True,
+                bytes=len(self._pending_pcm),
+                utt_ms=pending_ms,
+                has_jpeg=bool(self._pending_jpeg),
+            )
+            return
+        if not self._flushing_pending:
+            await self._promote_pending_media()
         utt_ms = int(1000.0 * (self._utt_bytes / 2.0) / MODEL_RATE)
         if self._utt_bytes < int(MODEL_RATE * 2 * _MIN_UTT_S):
             trace_stream("speech", "qwen.request", skipped="too_short", bytes=self._utt_bytes, utt_ms=utt_ms)
@@ -799,6 +900,7 @@ class QwenOmniEngine:
             trace_stream("speech", "qwen.request", skipped="no_frames", utt_ms=utt_ms)
             return
         self._utt_bytes = 0
+        self._pending_generate = False
         self._drop_output = False
         self._busy = True
         self._first_audio = False
@@ -820,6 +922,7 @@ class QwenOmniEngine:
         except Exception as exc:
             self._busy = False
             self._t_query = 0.0
+            self._pending_generate = True
             trace_exc("speech", "error.qwen_query", exc)
 
     async def pull_audio(self) -> list[tuple[bytes, int]]:
@@ -836,6 +939,9 @@ class QwenOmniEngine:
         self._drop_output = True
         self._busy = False
         self._t_query = 0.0
+        self._pending_generate = False
+        self._pending_pcm.clear()
+        self._utt_bytes = 0
         while not self._out.empty():
             try:
                 self._out.get_nowait()

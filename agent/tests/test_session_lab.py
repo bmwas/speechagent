@@ -45,7 +45,7 @@ class SnapshotContractTests(unittest.TestCase):
 
     def test_qwen_keeps_floor_keys(self) -> None:
         snap = QwenOmniEngine("test", speaker="ethan").stream_snapshot()
-        for key in ("ready", "speaking", "out_q", "frame_n", "utt_ms", "delta_age_ms", "speaker", "rtf"):
+        for key in ("ready", "speaking", "out_q", "frame_n", "utt_ms", "delta_age_ms", "speaker", "rtf", "pending_generate"):
             self.assertIn(key, snap, key)
         self.assertEqual(snap["ttfa_anchor"], "query")
 
@@ -75,6 +75,17 @@ class PlayoutPrebufferTests(unittest.TestCase):
         stats = p.turn_stats()
         self.assertGreaterEqual(stats["prebuffer_ms"], 0.0)
         self.assertFalse(p._buffering)
+
+    def test_close_turn_does_not_raise(self) -> None:
+        """Metrics refactor deleted _emit_turn_summary; idle/clear must still work."""
+        p = ClockedPlayout()
+        p.source_active = False
+        need = int(WEBRTC_RATE * PLAYOUT_START_MS / 1000) + 480
+        pcm = array.array("h", [8000] * need).tobytes()
+        p.push(pcm, WEBRTC_RATE)
+        self.assertIsNotNone(p.take_frame())
+        p._close_turn("idle")
+        p.clear()
 
 
 class ApiLiveContractTests(unittest.IsolatedAsyncioTestCase):

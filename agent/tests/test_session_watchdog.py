@@ -406,6 +406,37 @@ class SileroVadEventTests(unittest.TestCase):
         self.assertFalse(vad.speaking)
         self.assertFalse(vad._pending_start)
 
+    def test_energy_assist_commits_when_silero_is_silent(self) -> None:
+        import barge_in as mod
+
+        vad = LiveKitSileroVad(start_secs=0.15, stop_secs=0.20)
+        loud = array.array("h", [8000] * 320).tobytes()
+        quiet = array.array("h", [20] * 320).tobytes()
+        clock = [0.0]
+        orig = mod.time.monotonic
+        mod.time.monotonic = lambda: clock[0]
+        try:
+            edge = None
+            for i in range(20):
+                clock[0] = i * 0.02
+                got = vad.feed(loud)
+                if got:
+                    edge = got
+                    break
+            self.assertEqual(edge, "start")
+            self.assertTrue(vad._assist_active)
+            stop = None
+            for i in range(20, 50):
+                clock[0] = i * 0.02
+                got = vad.feed(quiet)
+                if got:
+                    stop = got
+                    break
+            self.assertEqual(stop, "stop")
+            self.assertFalse(vad.speaking)
+        finally:
+            mod.time.monotonic = orig
+
 
 class _FakeWs:
     def __init__(self) -> None:
