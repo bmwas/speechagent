@@ -66,6 +66,51 @@ function wrapStream(stream: MediaStream): LocalTrack[] {
   return out;
 }
 
+function probeCaptureWs(timeoutMs = 4000): Promise<{ ok: boolean; detail: string }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean, detail: string) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok, detail });
+    };
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(`${proto}://${window.location.host}/lk-ws-probe`);
+    } catch (err) {
+      finish(false, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      finish(false, "wss probe timed out");
+    }, timeoutMs);
+    ws.addEventListener("open", () => {
+      window.clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      finish(true, "101");
+    });
+    ws.addEventListener("error", () => {
+      window.clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      finish(false, "wss probe error");
+    });
+  });
+}
+
 function gumMessage(err: unknown): string {
   if (err instanceof DOMException) return `${err.name}: ${err.message}`;
   if (err instanceof Error) return err.message;
@@ -137,6 +182,8 @@ export default function App() {
   const [ready, setReady] = useState<Admission | null>(null);
   const [needGesture, setNeedGesture] = useState(false);
   const [leftOnPurpose, setLeftOnPurpose] = useState(false);
+  const [signalOk, setSignalOk] = useState(false);
+  const [signalDetail, setSignalDetail] = useState("checking browser socket");
   const connectingRef = useRef(false);
   const autoTriedRef = useRef(false);
   const insecure = typeof window !== "undefined" && !navigator.mediaDevices?.getUserMedia;
@@ -229,6 +276,23 @@ export default function App() {
       window.clearInterval(id);
     };
   }, [httpPage]);
+
+  useEffect(() => {
+    if (httpPage || insecure || lkOn) return;
+    let cancelled = false;
+    const tick = async () => {
+      const result = await probeCaptureWs();
+      if (cancelled) return;
+      setSignalOk(result.ok);
+      setSignalDetail(result.ok ? "browser socket ok" : result.detail);
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [httpPage, insecure, lkOn]);
 
   const attachRemote = (track: RemoteTrack) => {
     if (track.kind === Track.Kind.Audio && remoteAudioRef.current) {
@@ -436,10 +500,15 @@ export default function App() {
       if (/greenroom|not ready|not accepting|still loading|stages are still/i.test(raw)) {
         autoTriedRef.current = false;
       }
+      if (signalFail) {
+        setNeedGesture(true);
+        autoTriedRef.current = true;
+        setSignalOk(false);
+      }
       const msg = isFailedToFetch(raw)
         ? `Connect failed (Failed to fetch). LiveKit signaling is same-origin wss://${window.location.host}/rtc — accept the self-signed cert, stay on this host (not 127.0.0.1 from a laptop), then Connect again. (${raw})`
         : signalFail
-          ? `${raw}. Browser never reached LiveKit signaling (wss://${window.location.host}/rtc → SFU :8880). Open this page at https://<GPU-LAN>:6173/patient (not the laptop IP). Recreate livekit + frontend after pulling this fix.`
+          ? `${raw}. Chrome never finished wss://${window.location.host}/rtc. LiveKit itself is up — do not recreate it. Reload this tab, Advanced → Proceed, then click Enter.`
           : raw;
       setError(msg);
       setState("idle");
@@ -495,11 +564,11 @@ export default function App() {
   const showGreenroom = !leftOnPurpose && !lkOn;
 
   useEffect(() => {
-    if (!showGreenroom || !admitted || needGesture || insecure || httpPage) return;
+    if (!showGreenroom || !admitted || !signalOk || needGesture || insecure || httpPage) return;
     if (autoTriedRef.current || connectingRef.current || state === "connecting") return;
     autoTriedRef.current = true;
     void connect();
-  }, [showGreenroom, admitted, needGesture, insecure, httpPage, state, connect]);
+  }, [showGreenroom, admitted, signalOk, needGesture, insecure, httpPage, state, connect]);
 
   const picker = (
     <VoicePicker
@@ -536,7 +605,10 @@ export default function App() {
             <button
               type="button"
               onClick={() => void connect()}
-              disabled={state === "connecting" || (!admitted && !lkOn && !leftOnPurpose)}
+              disabled={
+                state === "connecting" ||
+                ((!admitted || !signalOk) && !lkOn && !leftOnPurpose)
+              }
             >
               {connected ? "Reconnect" : "Connect"}
             </button>
@@ -569,6 +641,8 @@ export default function App() {
           error={error}
           connecting={state === "connecting" || connectingRef.current}
           needGesture={needGesture}
+          signalOk={signalOk}
+          signalDetail={signalDetail}
           voicePicker={picker}
           insecure={insecure || httpPage}
           host={host}

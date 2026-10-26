@@ -320,6 +320,10 @@ services:
       CAPTURE_TLS_IP: ${MSE_LAN_IP:-}
       MSE_LAN_IP: ${MSE_LAN_IP:-}
       PORT: "${FRONTEND_PORT:-6173}"
+    volumes:
+      # Survive image rebuilds. A new self-signed cert makes Chrome reject
+      # wss://…/rtc (signal timeout) even after the page itself was allowed.
+      - ./frontend/certs:/app/certs
     depends_on: [agent, livekit]
     healthcheck:
       test:

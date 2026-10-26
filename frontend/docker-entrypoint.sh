@@ -18,6 +18,8 @@ for ip in $IPS; do
   case "$ip" in
     *:*) continue ;;
     127.*) continue ;;
+    172.*) continue ;; # docker bridges; including them rotated the cert on every rebuild
+    169.254.*) continue ;;
     *[0-9]*)
       case "$seen" in
         *" $ip "*) continue ;;
@@ -37,6 +39,8 @@ else
     case "$ip" in
       *:*) continue ;;
       127.*) continue ;;
+      172.*) continue ;;
+      169.254.*) continue ;;
       *[0-9]*)
         echo "$text" | grep -q "IP Address:${ip}" || need_new=1
         ;;

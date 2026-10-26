@@ -18,6 +18,8 @@ type Props = {
   error: string | null;
   connecting: boolean;
   needGesture: boolean;
+  signalOk: boolean;
+  signalDetail: string;
   voicePicker: ReactNode;
   insecure: boolean;
   host: string;
@@ -30,13 +32,14 @@ type Check = {
   done: boolean;
 };
 
-function checks(ready: Admission | null): Check[] {
+function checks(ready: Admission | null, signalOk: boolean): Check[] {
   const modelServing = Boolean(ready?.model_http && ready?.models_ok);
   const engineUp = Boolean(ready?.stream_ok || ready?.engine_ready);
   return [
     { id: "sfu", label: "LiveKit is listening", done: Boolean(ready?.livekit_ok) },
     { id: "model", label: "Model HTTP is serving", done: modelServing },
     { id: "engine", label: "Speech engine accepted a socket", done: engineUp },
+    { id: "signal", label: "Browser completed wss to this page", done: signalOk },
   ];
 }
 
@@ -45,23 +48,31 @@ export default function Greenroom({
   error,
   connecting,
   needGesture,
+  signalOk,
+  signalDetail,
   voicePicker,
   insecure,
   host,
   onEnter,
 }: Props) {
   const admit = Boolean(ready?.admit);
-  const items = checks(ready);
-  const title = admit
+  const items = checks(ready, signalOk);
+  const canEnter = admit && signalOk;
+  const title = canEnter
     ? needGesture
       ? "Engine is ready — click Enter"
       : connecting
         ? "Entering the room"
         : "Engine is ready"
-    : "Waiting for the engine";
-  const detail =
-    ready?.message ||
-    "The model is still loading. Camera, mic, and Connect stay locked until it can hear you.";
+    : admit
+      ? "Waiting for this browser"
+      : "Waiting for the engine";
+  const detail = !admit
+    ? ready?.message ||
+      "The model is still loading. Camera, mic, and Connect stay locked until it can hear you."
+    : signalOk
+      ? "Engine is ready. We will walk you in."
+      : "Chrome has not finished a secure WebSocket to this origin. Reload, Advanced → Proceed, then click Enter. LiveKit is already up.";
 
   return (
     <div className="greenroom" role="dialog" aria-modal="true" aria-labelledby="greenroom-title">
@@ -89,16 +100,18 @@ export default function Greenroom({
           <button
             type="button"
             onClick={onEnter}
-            disabled={!admit || connecting || insecure}
+            disabled={!canEnter || connecting || insecure}
           >
-            {connecting ? "Entering…" : admit ? "Enter" : "Waiting…"}
+            {connecting ? "Entering…" : canEnter ? "Enter" : "Waiting…"}
           </button>
           <span className="status">
-            {admit
+            {canEnter
               ? needGesture
                 ? "browser needs a click for camera/mic"
                 : "admitting automatically"
-              : ready?.phase || "checking"}
+              : signalOk
+                ? ready?.phase || "checking"
+                : signalDetail || "checking browser socket"}
           </span>
         </div>
         {error ? <p className="muted">error: {error}</p> : null}

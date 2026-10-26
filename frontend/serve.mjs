@@ -16,7 +16,8 @@ import https from "node:https";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { httpsLocation } from "./https-location.mjs";
+import crypto from "node:crypto";
+import { httpsLocation, muxLooksLikeHttp } from "./https-location.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 6173);
@@ -78,6 +79,31 @@ function isMediaPath(pathname) {
 
 function isLivekitPath(pathname) {
   return pathname === "/rtc" || pathname.startsWith("/rtc/");
+}
+
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+function acceptProbeUpgrade(req, socket) {
+  const key = req.headers["sec-websocket-key"];
+  if (typeof key !== "string" || !key) {
+    log("ws probe missing key");
+    socket.destroy();
+    return;
+  }
+  const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+  try {
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    socket.end();
+    log("ws probe 101", req.url);
+  } catch (err) {
+    log("ws probe failed", err.message);
+    try { socket.destroy(); } catch {}
+  }
 }
 
 function livekitTarget() {
@@ -426,6 +452,10 @@ async function main() {
   const httpServer = http.createServer(redirectHttps);
   httpsServer.on("upgrade", (req, socket, head) => {
     const pathname = pathnameOf(req.url);
+    if (pathname === "/lk-ws-probe") {
+      acceptProbeUpgrade(req, socket);
+      return;
+    }
     if (isLivekitPath(pathname)) {
       proxyLivekitUpgrade(req, socket, head);
       return;
@@ -451,8 +481,11 @@ async function main() {
         client.destroy();
         return;
       }
-      const tlsHello = first[0] === 0x16 || first[0] === 0x80;
-      const target = tlsHello ? INNER_HTTPS : INNER_HTTP;
+      const httpPlain = muxLooksLikeHttp(first);
+      if (!httpPlain && first[0] !== 0x16 && first[0] !== 0x80) {
+        log("mux tls-ish first=0x" + first[0].toString(16));
+      }
+      const target = httpPlain ? INNER_HTTP : INNER_HTTPS;
       const upstream = net.connect(target, "127.0.0.1");
       upstream.once("error", (err) => {
         log("mux upstream error", err.message);
