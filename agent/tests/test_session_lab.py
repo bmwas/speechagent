@@ -70,6 +70,7 @@ class PlayoutPrebufferTests(unittest.TestCase):
         pcm = array.array("h", [8000] * need).tobytes()
         t = 10.0
         p.push(pcm, WEBRTC_RATE)
+        p.push(pcm, WEBRTC_RATE)
         frame = p.take_frame(t + PLAYOUT_START_MS / 1000.0)
         self.assertIsNotNone(frame)
         stats = p.turn_stats()

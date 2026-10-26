@@ -38,10 +38,13 @@ FRAME_S = 0.020
 PLAYOUT_START_MS = float(os.environ.get("PLAYOUT_START_MS", "150"))
 # Rebuffer after an underrun.  Runtype uses same as start (150).
 PLAYOUT_REBUFFER_MS = float(os.environ.get("PLAYOUT_REBUFFER_MS", "150"))
-# Safety cap: max ms the prebuffer gate can hold before flushing anyway.
-# A short first/final delta may never reach the 150 ms target. Never hold it
-# for seconds while the model is stalled; release after one small jitter span.
+# Safety cap once we have more than the first vocoder blob.
 PLAYOUT_MAX_WAIT_MS = float(os.environ.get("PLAYOUT_MAX_WAIT_MS", "300"))
+# Qwen's first delta is always ~217 ms, then 0.3–1.8 s of vocoder think,
+# then the body. Starting on the preroll guarantees a mid-sentence hole.
+# Hold that first blob until blob 2 arrives (or this timeout).
+PLAYOUT_FIRST_BLOB_WAIT_MS = float(os.environ.get("PLAYOUT_FIRST_BLOB_WAIT_MS", "2500"))
+PLAYOUT_FIRST_BLOB_MIN_MS = float(os.environ.get("PLAYOUT_FIRST_BLOB_MIN_MS", "400"))
 # Briefly keep the LiveKit clock warm after real audio drains. Longer model
 # stalls are not bridgeable with silence and must not count as bot playback.
 HOLD_SILENCE_S = float(os.environ.get("PLAYOUT_HOLD_S", "0.40"))
@@ -149,10 +152,10 @@ class ClockedPlayout:
     which either returns real audio or silence (during prebuffer / underrun
     hold) or None (idle — no audio pending).
 
-    The prebuffer gate holds real audio and feeds silence until the ring
-    reaches the waterline, then releases.  Gaps while the model is still
-    generating are silence, not a rebuffer.  Rebuffer-on-underrun only
-    applies after generation has stopped.
+    The prebuffer gate holds the first vocoder blob until a second packet
+    arrives (Qwen preroll is ~217 ms; starting it guarantees a hole).
+    Gaps after playback has started, while the model is still generating,
+    are silence rather than a rebuffer.
     """
 
     def __init__(self) -> None:
@@ -181,6 +184,13 @@ class ClockedPlayout:
         self._buffering = True
         self._buf_target_ms = PLAYOUT_START_MS
         self._buffering_t0 = 0.0
+        self._turn_pushes = 0
+        self._first_blob_t = 0.0
+        self._first_blob_dur_ms = 0
+        self._logged_first_blob_hold = False
+        self._gen_gap_open = False
+        self._gen_gap_t0 = 0.0
+        self._gen_gap_frames = 0
         # Set each tick by the playback loop: True while the model is producing.
         # When it goes False we flush whatever is buffered (short-reply tail).
         self.source_active = False
@@ -223,9 +233,52 @@ class ClockedPlayout:
         )
         return queued or recent
 
+    def _arm_new_turn(self) -> None:
+        """Reset the jitter gate so a later turn does not inherit stale wait."""
+        now = time.monotonic()
+        if self._last_real_frame:
+            trace_stream(
+                "speech",
+                "playout.turn_gap",
+                since_real_ms=int((now - self._last_real_frame) * 1000),
+            )
+        self._buffering = True
+        self._buf_target_ms = PLAYOUT_START_MS
+        self._buffering_t0 = 0.0
+        self._turn_pushes = 0
+        self._first_blob_t = 0.0
+        self._first_blob_dur_ms = 0
+        self._logged_first_blob_hold = False
+        self._gen_gap_open = False
+        self._gen_gap_t0 = 0.0
+        self._gen_gap_frames = 0
+        self._first_frame = False
+        self._first_push = True
+        self._underrun_open = False
+
+    def _note_gen_gap_close(self, now: float) -> None:
+        if not self._gen_gap_open:
+            return
+        frames = self._gen_gap_frames
+        gap_ms = int((now - self._gen_gap_t0) * 1000) if self._gen_gap_t0 else 0
+        self._gen_gap_open = False
+        self._gen_gap_t0 = 0.0
+        self._gen_gap_frames = 0
+        # One event per hole, and only if it was long enough to hear.
+        if frames >= 5:
+            trace_stream(
+                "speech",
+                "playout.sentence_gap",
+                gap_ms=gap_ms,
+                silence_frames=frames,
+                where="during_generate",
+            )
+
     def push(self, pcm: bytes, sample_rate: int) -> None:
         if not pcm:
             return
+        if not self._active:
+            self._arm_new_turn()
         rate = int(sample_rate) or WEBRTC_RATE
         first = self._first_push
         if self._first_push:
@@ -238,15 +291,33 @@ class ClockedPlayout:
             if not pcm:
                 return
         self._ring.extend(pcm)
-        self._last_push = time.monotonic()
+        now = time.monotonic()
+        self._last_push = now
         self._active = True
         self.push_seq += 1
-        if first or hires_enabled() or self._push_rl.due():
-            dur_ms = int(1000.0 * (len(pcm) / 2.0) / WEBRTC_RATE)
+        self._turn_pushes += 1
+        dur_ms = int(1000.0 * (len(pcm) / 2.0) / WEBRTC_RATE)
+        if self._turn_pushes == 1:
+            self._first_blob_t = now
+            self._first_blob_dur_ms = dur_ms
+        elif self._turn_pushes == 2:
+            gap_ms = int((now - self._first_blob_t) * 1000) if self._first_blob_t else -1
+            trace_stream(
+                "speech",
+                "playout.blob_gap",
+                gap_ms=gap_ms,
+                first_dur_ms=self._first_blob_dur_ms,
+                second_dur_ms=dur_ms,
+                ring_ms=round(self.ring_ms, 1),
+                source_active=self.source_active,
+                buffering=self._buffering,
+            )
+        if first or self._turn_pushes <= 2 or hires_enabled() or self._push_rl.due():
             trace_stream(
                 "speech",
                 "playout.push",
                 packet_seq=self.push_seq,
+                turn_pushes=self._turn_pushes,
                 bytes=len(pcm),
                 rate=rate,
                 ring_ms=round(self.ring_ms, 1),
@@ -355,6 +426,13 @@ class ClockedPlayout:
         self._buffering = True
         self._buf_target_ms = PLAYOUT_START_MS
         self._buffering_t0 = 0.0
+        self._turn_pushes = 0
+        self._first_blob_t = 0.0
+        self._first_blob_dur_ms = 0
+        self._logged_first_blob_hold = False
+        self._gen_gap_open = False
+        self._gen_gap_t0 = 0.0
+        self._gen_gap_frames = 0
         trace_stream("speech", "playout.clear", clears=self.clears)
 
     def take_frame(self, now: float | None = None) -> bytes | None:
@@ -372,32 +450,58 @@ class ClockedPlayout:
                 active=self._active,
             )
 
-        # --- Jitter buffer gate: while buffering, hold real audio and feed
-        # silence until the ring reaches the target (or the source stops, or
-        # we hit the safety cap).  This is what makes playback smooth. ---
+        # --- Jitter buffer gate. Qwen's first delta is ~217 ms; starting it
+        # before blob 2 arrives is the between-sentence hole in Loki. ---
         if self._buffering and self._ring:
             fill_ms = self.ring_ms
             if self._buffering_t0 == 0.0:
                 self._buffering_t0 = now
-            # Track prebuffer wait for session lab
             if not self._prebuffer_waiting:
                 self._prebuffer_waiting = True
                 self._prebuffer_t0 = now
             waited_ms = (now - self._buffering_t0) * 1000.0
-            ready = (
-                fill_ms >= self._buf_target_ms
-                or not self.source_active
-                or waited_ms >= PLAYOUT_MAX_WAIT_MS
+            first_blob = (
+                self._turn_pushes < 2
+                and fill_ms < PLAYOUT_FIRST_BLOB_MIN_MS
+                and self.source_active
             )
+            reason = "prebuffer"
+            if first_blob:
+                ready = waited_ms >= PLAYOUT_FIRST_BLOB_WAIT_MS
+                reason = "first_blob_timeout" if ready else "wait_second_blob"
+            else:
+                ready = (
+                    fill_ms >= self._buf_target_ms
+                    or not self.source_active
+                    or waited_ms >= PLAYOUT_MAX_WAIT_MS
+                )
+                if ready:
+                    if not self.source_active:
+                        reason = "source_done"
+                    elif fill_ms >= self._buf_target_ms:
+                        reason = "fill"
+                    else:
+                        reason = "max_wait"
             if not ready:
                 self.silence_frames += 1
-                if hires_enabled() and self._buffering_rl.due():
+                if reason == "wait_second_blob" and not self._logged_first_blob_hold:
+                    self._logged_first_blob_hold = True
+                    trace_stream(
+                        "speech",
+                        "playout.hold_first_blob",
+                        fill_ms=round(fill_ms, 1),
+                        waited_ms=int(waited_ms),
+                        pushes=self._turn_pushes,
+                        min_ms=int(PLAYOUT_FIRST_BLOB_MIN_MS),
+                    )
+                elif hires_enabled() and self._buffering_rl.due():
                     trace_stream(
                         "speech",
                         "playout.buffering",
                         fill_ms=round(fill_ms, 1),
                         target_ms=int(self._buf_target_ms),
                         waited_ms=int(waited_ms),
+                        reason=reason,
                     )
                 self._trace_frame(
                     "prebuffer_silence",
@@ -409,7 +513,6 @@ class ClockedPlayout:
                 return self._silence
             self._buffering = False
             self._buffering_t0 = 0.0
-            # Record the first prebuffer wait of this turn only.
             if self._prebuffer_waiting:
                 if self._turn_prebuffer_ms < 0:
                     self._turn_prebuffer_ms = (now - self._prebuffer_t0) * 1000.0
@@ -422,6 +525,8 @@ class ClockedPlayout:
                 waited_ms=int(waited_ms),
                 prebuffer_ms=round(self._turn_prebuffer_ms, 1),
                 source_active=self.source_active,
+                reason=reason,
+                turn_pushes=self._turn_pushes,
             )
 
         if len(self._ring) >= need:
@@ -435,6 +540,7 @@ class ClockedPlayout:
             rm = self.ring_ms
             if self._ring_ms_min < 0 or rm < self._ring_ms_min:
                 self._ring_ms_min = rm
+            self._note_gen_gap_close(now)
             if self._underrun_open:
                 self._underrun_open = False
                 episode_ms = (now - self._underrun_t0) * 1000.0 if self._underrun_t0 else 0.0
@@ -450,7 +556,14 @@ class ClockedPlayout:
                 )
             if not self._first_frame:
                 self._first_frame = True
-                trace_stream("speech", "playout.first_frame", bytes=len(frame), ring_ms=round(rm, 1))
+                trace_stream(
+                    "speech",
+                    "playout.first_frame",
+                    bytes=len(frame),
+                    ring_ms=round(rm, 1),
+                    turn_pushes=self._turn_pushes,
+                    prebuffer_ms=round(self._turn_prebuffer_ms, 1),
+                )
             self._trace_frame(
                 "real",
                 frame,
@@ -468,6 +581,7 @@ class ClockedPlayout:
             self._begin_turn()
             self._turn_frames += 1
             self._last_real_frame = now
+            self._note_gen_gap_close(now)
             self._trace_frame(
                 "real_padded",
                 frame[:need],
@@ -484,6 +598,11 @@ class ClockedPlayout:
         if self._active and self.source_active:
             self.silence_frames += 1
             self._turn_silence += 1
+            if not self._gen_gap_open:
+                self._gen_gap_open = True
+                self._gen_gap_t0 = now
+                self._gen_gap_frames = 0
+            self._gen_gap_frames += 1
             self._trace_frame(
                 "gap_silence",
                 self._silence,
@@ -524,6 +643,7 @@ class ClockedPlayout:
             return self._silence
 
         if self._active:
+            self._note_gen_gap_close(now)
             trace_stream(
                 "speech",
                 "playout.idle",
@@ -540,10 +660,9 @@ class ClockedPlayout:
         if now - self._stats_t < STATS_EVERY_S:
             return
         self._stats_t = now
-        underrun = self.silence_frames > 0
         trace_stream(
             "speech",
-            "playout.underrun" if underrun else "playout.stats",
+            "playout.stats",
             frames=self.frames,
             silence_frames=self.silence_frames,
             idle_ticks=self.idle_ticks,
@@ -551,8 +670,10 @@ class ClockedPlayout:
             capture_timeouts=self.capture_timeouts,
             clock_slips=self.clock_slips,
             clears=self.clears,
-            underrun=underrun,
             underrun_episodes=self._underrun_episodes,
+            gen_gap_open=self._gen_gap_open,
+            buffering=self._buffering,
+            turn_pushes=self._turn_pushes,
             slip_max_ms=int(self._slip_max_ms),
             late_ticks=self._late_ticks,
         )

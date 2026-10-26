@@ -592,14 +592,18 @@ class PlayoutGapTests(unittest.TestCase):
 
         p = ClockedPlayout()
         p.source_active = True
-        p._buffering = False
         pcm = array.array("h", [8000] * (WEBRTC_RATE // 5)).tobytes()  # 200 ms
         t = 1000.0
         p.push(pcm, WEBRTC_RATE)
+        p.push(pcm, WEBRTC_RATE)
         p._last_push = t
+        started = False
         for i in range(12):
             frame = p.take_frame(t + i * 0.02)
             self.assertIsNotNone(frame)
+            if not p._buffering:
+                started = True
+        self.assertTrue(started)
         gap = p.take_frame(t + 0.50)
         self.assertIsNotNone(gap)
         self.assertFalse(p._buffering)
@@ -609,6 +613,46 @@ class PlayoutGapTests(unittest.TestCase):
         self.assertIsNotNone(nxt)
         self.assertFalse(p._buffering)
         self.assertEqual(p.underruns_total, 0)
+
+    def test_holds_qwen_preroll_until_second_blob(self) -> None:
+        import array
+
+        from audio import WEBRTC_RATE, ClockedPlayout
+
+        p = ClockedPlayout()
+        p.source_active = True
+        preroll = array.array("h", [8000] * (WEBRTC_RATE // 5)).tobytes()  # 200 ms
+        body = array.array("h", [8000] * (WEBRTC_RATE // 2)).tobytes()  # 500 ms
+        t = 50.0
+        p.push(preroll, WEBRTC_RATE)
+        held = p.take_frame(t)
+        self.assertIsNotNone(held)
+        self.assertTrue(p._buffering)
+        self.assertEqual(p._turn_pushes, 1)
+        p.push(body, WEBRTC_RATE)
+        played = p.take_frame(t + 0.02)
+        self.assertIsNotNone(played)
+        self.assertFalse(p._buffering)
+        self.assertEqual(p._turn_pushes, 2)
+
+    def test_new_turn_does_not_inherit_stale_buffer_wait(self) -> None:
+        import array
+
+        from audio import PLAYOUT_START_MS, WEBRTC_RATE, ClockedPlayout
+
+        p = ClockedPlayout()
+        p.source_active = False
+        pcm = array.array("h", [8000] * (int(WEBRTC_RATE * PLAYOUT_START_MS / 1000) + 480)).tobytes()
+        p.push(pcm, WEBRTC_RATE)
+        self.assertIsNotNone(p.take_frame(10.0))
+        p._active = False
+        p._buffering_t0 = 1.0  # leftover from the previous turn's underrun hold
+        p.source_active = True
+        preroll = array.array("h", [8000] * (WEBRTC_RATE // 5)).tobytes()
+        p.push(preroll, WEBRTC_RATE)
+        self.assertTrue(p._buffering)
+        self.assertEqual(p._buffering_t0, 0.0)
+        self.assertEqual(p._turn_pushes, 1)
 
 
 if __name__ == "__main__":
